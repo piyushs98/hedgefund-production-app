@@ -1,3 +1,6 @@
+from keep_alive import keep_alive
+keep_alive()
+
 import os
 import time
 import yfinance as yf
