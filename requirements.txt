@@ -4,3 +4,4 @@ certifi==2024.7.2
 google-generativeai
 groq
 yfinance
+flask

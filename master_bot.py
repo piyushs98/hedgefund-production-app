@@ -1,3 +1,5 @@
+from keep_alive import keep_alive
+keep_alive()
 """
 master_bot.py — Primary orchestrator (refactored).
 
