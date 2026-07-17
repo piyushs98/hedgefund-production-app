@@ -1,0 +1,14 @@
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Python cache and operational garbage
+__pycache__/
+*.pyc
+.DS_Store
+
+# Local application logs
+*.log
+mac_ssl_fix.sh
+patcher.py
