@@ -1,24 +1,19 @@
-from keep_alive import keep_alive
-keep_alive()
 """
-master_bot.py — Primary orchestrator (refactored).
+master_bot.py — Macro trading loop only (no web server).
 
-Key changes vs. the previous version:
-  * The trading loop existed TWICE (developer-bypass copy + live copy,
-    ~250 duplicated lines). It is now a single run_portfolio_scan() used
-    by both paths — one place to fix, one place to extend.
-  * Scoring no longer substring-matches LLM prose. scoring_engine.py
-    computes graded pillar scores from raw chain/pivot/news numbers and
-    applies the dynamic weights persisted by saturday_audit.
-  * CEO output enforces the strict per-ticker Markdown schema and is fed
-    an exact-numbers metrics snapshot; if Gemini fails, a deterministic
-    formatter emits the same schema from real numbers (no generic prose).
-  * CircuitBreaker suspends scans after successive data-extraction
-    failures (Task 3b). telemetry.py logs every indicator + score into
-    hedge_fund.db:backtest_telemetry (Task 3c). strike_selector.py picks
-    the concrete contract on EXECUTE (Task 3a).
-  * All secrets are env-only (config.assert_secrets crashes early with a
-    clear message instead of dying mid-session).
+This module is pure trading logic: portfolio scans, CEO synthesis, and
+`run_macro_loop()`. Flask / keep_alive / PORT binding live exclusively in
+`main.py` (the Render orchestrator). Do not reintroduce app.run() here or
+in modules imported at the top level of this file.
+
+Key design notes:
+  * Single run_portfolio_scan() shared by developer-bypass and live paths.
+  * scoring_engine.py grades pillars from raw numbers + dynamic weights.
+  * CEO output uses a strict per-ticker Markdown schema; Gemini failure
+    falls back to a deterministic numeric formatter.
+  * CircuitBreaker, telemetry, and strike_selector handle resilience,
+    backtest logging, and contract selection on EXECUTE.
+  * Secrets are env-only (config.assert_secrets crashes early).
 """
 
 import json
@@ -422,7 +417,13 @@ def run_portfolio_scan(morning_macro_context, breaker, inter_ticker_sleep=10):
 # 🚀 MISSION CONTROL (24-HOUR TIME ENGINE)
 # ==========================================
 
-if __name__ == "__main__":
+def run_macro_loop():
+    """
+    24-hour mission-control loop (night harvest / pre-market / 30-min scans).
+
+    Safe to call from main.py as a daemon thread. Network / API failures are
+    logged and the loop continues after a short backoff — they never escape.
+    """
     print("\n--- INITIATING HIERARCHICAL MULTI-AGENT TRADING BOT (v2) ---")
     print(f"Loaded Tickers: {TICKERS}")
     config.assert_secrets(require_discord=False)   # Gemini mandatory; webhook warns via broadcaster
@@ -438,87 +439,101 @@ if __name__ == "__main__":
     morning_macro_context = ""
     last_briefing_date = None
     scan_interval = 1800  # 30-minute active loop
+    error_backoff = 30    # seconds after an unexpected cycle failure
 
     while True:
-        now = datetime.now(est_tz)
-        current_time = now.time()
+        try:
+            now = datetime.now(est_tz)
+            current_time = now.time()
 
-        # Developer test sequence: night harvest -> briefing -> one scan -> exit
-        if BYPASS_MARKET_HOURS:
-            print("\n🔬 DEVELOPER BYPASS RUN: Simulating 24-Hour Cycle")
-            print("\n[System State] 🌙 [Bypass Sim] NIGHT MODE...")
-            run_night_harvest()
-            time.sleep(2)
-            print("\n[System State] 📊 [Bypass Sim] PREP MEETING...")
-            try:
-                morning_macro_context = generate_morning_briefing(GEMINI_API_KEY)
-            except Exception as err:
-                print(f"❌ [Bypass Sim] Briefing error: {err}")
-            time.sleep(2)
-            print("\n[System State] 📈 [Bypass Sim] ACTIVE TRADING MODE...")
-            run_portfolio_scan(morning_macro_context, breaker, inter_ticker_sleep=5)
-            print("\n🔬 DEVELOPER BYPASS RUN: Completed. Exiting loop.")
-            break
-
-        night_start_1 = datetime.strptime("16:00:00", "%H:%M:%S").time()
-        night_end_1 = datetime.strptime("23:59:59", "%H:%M:%S").time()
-        night_start_2 = datetime.strptime("00:00:00", "%H:%M:%S").time()
-        night_end_2 = datetime.strptime("09:14:59", "%H:%M:%S").time()
-        meeting_start = datetime.strptime("09:15:00", "%H:%M:%S").time()
-        meeting_end = datetime.strptime("09:29:59", "%H:%M:%S").time()
-        trading_start = datetime.strptime("09:30:00", "%H:%M:%S").time()
-        trading_end = datetime.strptime("15:59:59", "%H:%M:%S").time()
-        is_weekend = now.weekday() > 4
-
-        is_night_mode = (is_weekend
-                         or (night_start_1 <= current_time <= night_end_1)
-                         or (night_start_2 <= current_time <= night_end_2))
-        is_prep_meeting = (not is_weekend and meeting_start <= current_time <= meeting_end)
-        is_trading_mode = (not is_weekend and trading_start <= current_time <= trading_end)
-
-        if is_night_mode:
-            print(f"\n[System State] 🌙 NIGHT MODE (EST {now.strftime('%Y-%m-%d %H:%M:%S')})")
-            run_night_harvest()
-            print("[System State] Overnight harvest complete. Sleeping until next state check...")
-            for _ in range(45):
-                time.sleep(60)
-                if datetime.now(est_tz).time() >= meeting_start and datetime.now(est_tz).weekday() <= 4:
-                    break
-            continue
-
-        elif is_prep_meeting:
-            print(f"\n[System State] 📊 PRE-MARKET PREP MEETING (EST {now.strftime('%H:%M:%S')})")
-            if last_briefing_date != now.date():
+            # Developer test sequence: night harvest -> briefing -> one scan -> exit
+            if BYPASS_MARKET_HOURS:
+                print("\n🔬 DEVELOPER BYPASS RUN: Simulating 24-Hour Cycle")
+                print("\n[System State] 🌙 [Bypass Sim] NIGHT MODE...")
+                run_night_harvest()
+                time.sleep(2)
+                print("\n[System State] 📊 [Bypass Sim] PREP MEETING...")
                 try:
                     morning_macro_context = generate_morning_briefing(GEMINI_API_KEY)
-                    last_briefing_date = now.date()
-                    print("[System State] Pre-market briefing generated and cached.")
-                except Exception as brief_err:
-                    print(f"❌ Error generating pre-market briefing: {brief_err}")
+                except Exception as err:
+                    print(f"❌ [Bypass Sim] Briefing error: {err}")
+                time.sleep(2)
+                print("\n[System State] 📈 [Bypass Sim] ACTIVE TRADING MODE...")
+                run_portfolio_scan(morning_macro_context, breaker, inter_ticker_sleep=5)
+                print("\n🔬 DEVELOPER BYPASS RUN: Completed. Exiting loop.")
+                break
+
+            night_start_1 = datetime.strptime("16:00:00", "%H:%M:%S").time()
+            night_end_1 = datetime.strptime("23:59:59", "%H:%M:%S").time()
+            night_start_2 = datetime.strptime("00:00:00", "%H:%M:%S").time()
+            night_end_2 = datetime.strptime("09:14:59", "%H:%M:%S").time()
+            meeting_start = datetime.strptime("09:15:00", "%H:%M:%S").time()
+            meeting_end = datetime.strptime("09:29:59", "%H:%M:%S").time()
+            trading_start = datetime.strptime("09:30:00", "%H:%M:%S").time()
+            trading_end = datetime.strptime("15:59:59", "%H:%M:%S").time()
+            is_weekend = now.weekday() > 4
+
+            is_night_mode = (is_weekend
+                             or (night_start_1 <= current_time <= night_end_1)
+                             or (night_start_2 <= current_time <= night_end_2))
+            is_prep_meeting = (not is_weekend and meeting_start <= current_time <= meeting_end)
+            is_trading_mode = (not is_weekend and trading_start <= current_time <= trading_end)
+
+            if is_night_mode:
+                print(f"\n[System State] 🌙 NIGHT MODE (EST {now.strftime('%Y-%m-%d %H:%M:%S')})")
+                run_night_harvest()
+                print("[System State] Overnight harvest complete. Sleeping until next state check...")
+                for _ in range(45):
+                    time.sleep(60)
+                    if datetime.now(est_tz).time() >= meeting_start and datetime.now(est_tz).weekday() <= 4:
+                        break
+                continue
+
+            elif is_prep_meeting:
+                print(f"\n[System State] 📊 PRE-MARKET PREP MEETING (EST {now.strftime('%H:%M:%S')})")
+                if last_briefing_date != now.date():
+                    try:
+                        morning_macro_context = generate_morning_briefing(GEMINI_API_KEY)
+                        last_briefing_date = now.date()
+                        print("[System State] Pre-market briefing generated and cached.")
+                    except Exception as brief_err:
+                        print(f"❌ Error generating pre-market briefing: {brief_err}")
+                else:
+                    print("[System State] Briefing already broadcast today; waiting for the open...")
+                time.sleep(60)
+                continue
+
+            elif is_trading_mode:
+                print(f"\n[System State] 📈 ACTIVE TRADING MODE (EST {now.strftime('%H:%M:%S')})")
+                if not morning_macro_context:
+                    print("[System State] Missing pre-market briefing context. Generating now...")
+                    try:
+                        morning_macro_context = generate_morning_briefing(GEMINI_API_KEY)
+                        last_briefing_date = now.date()
+                    except Exception as brief_err:
+                        print(f"❌ Fallback briefing error: {brief_err}")
+                        morning_macro_context = "No morning briefing context available."
+
+                run_portfolio_scan(morning_macro_context, breaker)
+
+                print(f"Sleeping up to {scan_interval // 60} minutes before next scan...")
+                for _ in range(scan_interval // 60):
+                    time.sleep(60)
+                    if datetime.now(est_tz).time() >= trading_end:
+                        break
+                continue
+
             else:
-                print("[System State] Briefing already broadcast today; waiting for the open...")
-            time.sleep(60)
-            continue
+                time.sleep(5)
 
-        elif is_trading_mode:
-            print(f"\n[System State] 📈 ACTIVE TRADING MODE (EST {now.strftime('%H:%M:%S')})")
-            if not morning_macro_context:
-                print("[System State] Missing pre-market briefing context. Generating now...")
-                try:
-                    morning_macro_context = generate_morning_briefing(GEMINI_API_KEY)
-                    last_briefing_date = now.date()
-                except Exception as brief_err:
-                    print(f"❌ Fallback briefing error: {brief_err}")
-                    morning_macro_context = "No morning briefing context available."
+        except Exception as cycle_err:
+            # Network drops, API throttling, scraper crashes — never kill the process
+            print(f"❌ [Macro Loop] Cycle error (will retry in {error_backoff}s): {cycle_err}")
+            time.sleep(error_backoff)
 
-            run_portfolio_scan(morning_macro_context, breaker)
 
-            print(f"Sleeping up to {scan_interval // 60} minutes before next scan...")
-            for _ in range(scan_interval // 60):
-                time.sleep(60)
-                if datetime.now(est_tz).time() >= trading_end:
-                    break
-            continue
-
-        else:
-            time.sleep(5)
+if __name__ == "__main__":
+    # Trading-only entrypoint. Web/health server lives exclusively in main.py
+    # (Render orchestrator). Do NOT start Flask / keep_alive here — that binds
+    # PORT and collides with main.py ("Address already in use").
+    run_macro_loop()
