@@ -3,11 +3,13 @@ import re
 import sqlite3
 import traceback
 
-from google import genai
+import requests
 import broadcaster
 
 # Centralized API Key loading
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = "deepseek-chat"
 
 # Prefer shared config path when available; fall back to script-relative DB.
 try:
@@ -19,7 +21,7 @@ except Exception:
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 NEWS_DB_PATH = _DEFAULT_DB or os.path.join(_SCRIPT_DIR, "data", "news_room.db")
 
-# Cap overnight context so Gemini is not overloaded (token / request limits).
+# Cap overnight context so the model is not overloaded (token / request limits).
 MAX_OVERNIGHT_CHARS = 24000
 MAX_HEADLINE_ROWS = 120
 
@@ -72,48 +74,8 @@ def get_overnight_data(hours_ago=15):
 
     text = "\n".join(entries)
     if len(text) > MAX_OVERNIGHT_CHARS:
-        text = text[:MAX_OVERNIGHT_CHARS] + "\n...[truncated for Gemini context limit]"
+        text = text[:MAX_OVERNIGHT_CHARS] + "\n...[truncated for model context limit]"
     return text
-
-
-def _extract_gemini_text(response) -> str:
-    """
-    Safely extract model text from a google-genai GenerateContentResponse.
-
-    response.text raises ValueError when candidates have no Parts (safety block,
-    empty completion). Walk candidates/parts manually as a fallback.
-    """
-    try:
-        text = getattr(response, "text", None)
-        if text is not None and str(text).strip():
-            return str(text).strip()
-    except Exception as e:
-        print(
-            f"[Chief of Staff] response.text accessor failed: "
-            f"{type(e).__name__}: {e}"
-        )
-
-    chunks = []
-    try:
-        candidates = getattr(response, "candidates", None) or []
-        for i, cand in enumerate(candidates):
-            finish = getattr(cand, "finish_reason", None)
-            if finish is not None:
-                print(f"[Chief of Staff] candidate[{i}] finish_reason={finish}")
-            content = getattr(cand, "content", None)
-            parts = getattr(content, "parts", None) or []
-            for part in parts:
-                part_text = getattr(part, "text", None)
-                if part_text:
-                    chunks.append(str(part_text))
-    except Exception as e:
-        print(
-            f"[Chief of Staff] candidate/parts walk failed: "
-            f"{type(e).__name__}: {e}"
-        )
-        traceback.print_exc()
-
-    return "\n".join(chunks).strip()
 
 
 def _parse_futures_from_context(overnight_context: str) -> dict:
@@ -148,7 +110,7 @@ def _gap_label(pct: float | None) -> str:
 def _build_live_data_briefing(overnight_context: str) -> str:
     """
     Live briefing from overnight DB rows (not hardcoded market numbers).
-    Used only when Gemini returns no usable text after a successful API call path,
+    Used only when DeepSeek returns no usable text after a successful API call path,
     or as a last-resort structured summary when the API hard-fails.
     """
     futures = _parse_futures_from_context(overnight_context)
@@ -214,16 +176,116 @@ def _build_live_data_briefing(overnight_context: str) -> str:
     )
 
 
+def _extract_deepseek_text(payload: dict) -> str:
+    """
+    Safely extract assistant content from a DeepSeek chat completions JSON body.
+    """
+    try:
+        choices = payload.get("choices") or []
+        if not choices:
+            return ""
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if content is None:
+            return ""
+        return str(content).strip()
+    except Exception as e:
+        print(
+            f"[Chief of Staff] DeepSeek response parse failed: "
+            f"{type(e).__name__}: {e}"
+        )
+        traceback.print_exc()
+        return ""
+
+
+def _call_deepseek(api_key: str, overnight_context: str) -> str:
+    """
+    Call DeepSeek chat completions and return briefing text, or raise on hard failure.
+    """
+    system_instruction = (
+        "You are the Chief of Staff (CoS) of a quantitative hedge fund. "
+        "This morning briefing is designed to warn the CEO trading bot of potential "
+        "liquidity vacuums and whipsaws around scheduled macro event windows. "
+        "The CEO bot MUST know exact times so it can halt trading around those windows. "
+        "Be precise, structured, and operational — not narrative fluff."
+    )
+
+    user_prompt = (
+        "Analyze the overnight news headlines and pre-market futures data "
+        "collected in the database.\n\n"
+        "Overnight Database Context:\n"
+        f"{overnight_context}\n\n"
+        "Your Task:\n"
+        "Synthesize a high-level executive morning briefing. Your briefing MUST "
+        "be formatted beautifully for Discord and include:\n"
+        "1. **📊 MORNING HEDGE FUND BRIEFING** (Header)\n"
+        "2. **Global Market Sentiment**: Summarize overnight activity and macro "
+        "direction (Europe/Asia sentiment summary).\n"
+        "3. **US Pre-Market Futures Status**: Detail the current S&P 500 (ES=F) "
+        "and Nasdaq (NQ=F) futures percentage changes, explicitly indicating if "
+        "we have a \"Gap Up\", \"Gap Down\", or \"Flat\" market. Use the exact "
+        "percentages from the Overnight Database Context when present.\n"
+        "4. **Top 3 Critical News Alerts**: Select the 3 most important news "
+        "headlines impacting our portfolio tickers (SPY, QQQ, IWM, AAPL, MSFT, "
+        "NVDA, AMZN, META, GOOGL, TSLA). List them clearly.\n"
+        "5. **⚠️ Scheduled Macro / Liquidity Risk Windows**: Critically analyze "
+        "the provided news/headlines and highlight ANY upcoming economic data "
+        "releases (CPI, PPI, NFP, GDP, jobless claims, retail sales, etc.), Fed "
+        "speeches / FOMC speakers, central bank decisions, or other macro events. "
+        "For each event, extract the EXACT TIMINGS (e.g., 8:30 AM EST, 10:00 AM EST). "
+        "If a time is stated without a timezone, assume US Eastern and label it EST. "
+        "If no timed macro events are found, explicitly say so. Frame each window "
+        "as a halt-trading advisory for the CEO bot due to liquidity vacuums and "
+        "whipsaw risk.\n\n"
+        "Keep the entire briefing concise, structured, and under 5 sentences per "
+        "section so it is quickly readable on a phone.\n"
+        "Do NOT invent futures percentages that are not in the database context.\n"
+        "Do NOT invent event times that are not supported by the headlines; if "
+        "timing is ambiguous, say so clearly.\n"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.3,
+        "stream": False,
+    }
+
+    response = requests.post(
+        DEEPSEEK_API_URL,
+        headers=headers,
+        json=body,
+        timeout=90,
+    )
+    # Raise for non-2xx so callers hit the except fallback path
+    if not response.ok:
+        # Include a short body snippet for diagnosis without dumping secrets
+        snippet = (response.text or "")[:500]
+        raise RuntimeError(
+            f"DeepSeek HTTP {response.status_code}: {snippet}"
+        )
+
+    payload = response.json()
+    return _extract_deepseek_text(payload)
+
+
 def generate_morning_briefing(api_key=None):
     """
     Chief of Staff (CoS) Agent - Executive Tier:
     Queries SQLite for overnight data, synthesizes an executive summary briefing
-    using Gemini, and broadcasts the formatted alert to Discord.
+    using DeepSeek, and broadcasts the formatted alert to Discord.
 
     Returns:
         str: Synthesized briefing text for caching.
     """
-    key = (api_key or GEMINI_API_KEY or "").strip()
+    key = (api_key or DEEPSEEK_API_KEY or "").strip()
     print("[Chief of Staff] 📋 CoS Agent (AI): Querying database for overnight data...")
 
     # 1. Fetch overnight news and futures
@@ -233,60 +295,24 @@ def generate_morning_briefing(api_key=None):
         f"from {NEWS_DB_PATH}"
     )
 
-    print("[Chief of Staff] 📋 CoS Agent (AI): Synthesizing Morning Briefing with Gemini...")
+    print("[Chief of Staff] 📋 CoS Agent (AI): Synthesizing Morning Briefing with DeepSeek...")
     briefing_text = None
 
     if not key:
         print(
-            "[Chief of Staff] ERROR: GEMINI_API_KEY is empty — cannot call Gemini. "
+            "[Chief of Staff] ERROR: DEEPSEEK_API_KEY is empty — cannot call DeepSeek. "
             "Building live data-driven briefing from overnight DB instead."
         )
         briefing_text = _build_live_data_briefing(overnight_context)
     else:
-        # Build prompt without embedding untrusted braces into nested f-expression issues.
-        # (Variable interpolation is already complete before the API sees the string.)
-        prompt = (
-            "You are the Chief of Staff (CoS) of a quantitative hedge fund. "
-            "Analyze the overnight news headlines and pre-market futures data "
-            "collected in the database.\n\n"
-            "Overnight Database Context:\n"
-            f"{overnight_context}\n\n"
-            "Your Task:\n"
-            "Synthesize a high-level executive morning briefing. Your briefing MUST "
-            "be formatted beautifully for Discord and include:\n"
-            "1. **📊 MORNING HEDGE FUND BRIEFING** (Header)\n"
-            "2. **Global Market Sentiment**: Summarize overnight activity and macro "
-            "direction (Europe/Asia sentiment summary).\n"
-            "3. **US Pre-Market Futures Status**: Detail the current S&P 500 (ES=F) "
-            "and Nasdaq (NQ=F) futures percentage changes, explicitly indicating if "
-            "we have a \"Gap Up\", \"Gap Down\", or \"Flat\" market. Use the exact "
-            "percentages from the Overnight Database Context when present.\n"
-            "4. **Top 3 Critical News Alerts**: Select the 3 most important news "
-            "headlines impacting our portfolio tickers (SPY, QQQ, IWM, AAPL, MSFT, "
-            "NVDA, AMZN, META, GOOGL, TSLA). List them clearly.\n\n"
-            "Keep the entire briefing concise, structured, and under 5 sentences per "
-            "section so it is quickly readable on a phone.\n"
-            "Do NOT invent futures percentages that are not in the database context.\n"
-        )
-
         try:
-            client = genai.Client(api_key=key)
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-            )
-            briefing_text = _extract_gemini_text(response)
+            briefing_text = _call_deepseek(key, overnight_context)
             if not briefing_text:
-                # Log response shape so silent empty replies are diagnosable
+                # Log so silent empty replies are diagnosable
                 print(
-                    "[Chief of Staff] ERROR: Gemini returned empty text after "
-                    f"successful call. raw_response_type={type(response).__name__}"
+                    "[Chief of Staff] ERROR: DeepSeek returned empty text after "
+                    "successful call."
                 )
-                try:
-                    # Best-effort debug dump (may not always be serializable)
-                    print(f"[Chief of Staff] response repr (truncated): {repr(response)[:800]}")
-                except Exception:
-                    pass
                 print(
                     "[Chief of Staff] Falling back to live overnight-data briefing "
                     "(not the hardcoded template)."
@@ -294,12 +320,12 @@ def generate_morning_briefing(api_key=None):
                 briefing_text = _build_live_data_briefing(overnight_context)
             else:
                 print(
-                    f"[Chief of Staff] Gemini briefing OK ({len(briefing_text)} chars)."
+                    f"[Chief of Staff] DeepSeek briefing OK ({len(briefing_text)} chars)."
                 )
         except Exception as e:
             # Never fail silently — log type, message, and full traceback
             print(
-                f"[Chief of Staff] Warning: Gemini API call failed: "
+                f"[Chief of Staff] Warning: DeepSeek API call failed: "
                 f"{type(e).__name__}: {e}"
             )
             traceback.print_exc()
