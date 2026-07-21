@@ -2,6 +2,7 @@ import os
 import time
 import yfinance as yf
 from news_memory import save_headline, clear_expired_news
+from yf_client import SESSION, TICKER_PACING_SECONDS
 
 # Configuration variables
 BYPASS_SCRAPER_WAIT = os.environ.get("BYPASS_SCRAPER_WAIT", "false").lower() == "true"
@@ -39,9 +40,9 @@ def scrape_tech_sector():
     print("[Employee] Tech Scraper: Scanning tech sector news...")
     
     count = 0
-    for ticker in tickers:
+    for i, ticker in enumerate(tickers):
         try:
-            stock = yf.Ticker(ticker)
+            stock = yf.Ticker(ticker, session=SESSION)
             articles = stock.news
             if articles:
                 for article in articles:
@@ -52,6 +53,8 @@ def scrape_tech_sector():
                             count += 1
         except Exception as e:
             print(f"❌ [Employee] Tech Scraper: Error scraping {ticker} ({e})")
+        if i < len(tickers) - 1:
+            time.sleep(TICKER_PACING_SECONDS)
             
     print(f"[Employee] Tech Scraper: Saved {count} new tech headlines.")
 
@@ -64,9 +67,9 @@ def scrape_macro_finance():
     print("[Employee] Macro Scraper: Scanning macroeconomic index news...")
     
     count = 0
-    for ticker in tickers:
+    for i, ticker in enumerate(tickers):
         try:
-            stock = yf.Ticker(ticker)
+            stock = yf.Ticker(ticker, session=SESSION)
             articles = stock.news
             if articles:
                 for article in articles:
@@ -77,6 +80,8 @@ def scrape_macro_finance():
                             count += 1
         except Exception as e:
             print(f"❌ [Employee] Macro Scraper: Error scraping {ticker} ({e})")
+        if i < len(tickers) - 1:
+            time.sleep(TICKER_PACING_SECONDS)
             
     print(f"[Employee] Macro Scraper: Saved {count} new macro headlines.")
 
@@ -91,9 +96,9 @@ def scrape_politics_government():
     keywords = ["fed", "federal reserve", "powell", "yellen", "tariff", "policy", "rate", "inflation", "economic", "treasury", "government", "white house", "congress"]
     
     count = 0
-    for source in source_tickers:
+    for i, source in enumerate(source_tickers):
         try:
-            stock = yf.Ticker(source)
+            stock = yf.Ticker(source, session=SESSION)
             articles = stock.news
             if articles:
                 for article in articles:
@@ -108,6 +113,8 @@ def scrape_politics_government():
                                 count += 1
         except Exception as e:
             print(f"❌ [Employee] Politics Scraper: Error scraping macro source {source} ({e})")
+        if i < len(source_tickers) - 1:
+            time.sleep(TICKER_PACING_SECONDS)
             
     print(f"[Employee] Politics Scraper: Saved {count} new economic policy headlines.")
 
@@ -125,9 +132,10 @@ def fetch_overnight_futures():
     }
     
     count = 0
-    for symbol, name in futures.items():
+    futures_items = list(futures.items())
+    for i, (symbol, name) in enumerate(futures_items):
         try:
-            ticker = yf.Ticker(symbol)
+            ticker = yf.Ticker(symbol, session=SESSION)
             info = ticker.info
             pct_change = info.get("regularMarketChangePercent")
             current_price = info.get("regularMarketPrice")
@@ -161,6 +169,8 @@ def fetch_overnight_futures():
                 print(f"[Employee] Futures Scraper: Saved {name} pre-market headline.")
         except Exception as e:
             print(f"❌ [Employee] Futures Scraper: Error scraping {symbol} ({e})")
+        if i < len(futures_items) - 1:
+            time.sleep(TICKER_PACING_SECONDS)
             
     print(f"[Employee] Futures Scraper: Saved {count} futures data points.")
 

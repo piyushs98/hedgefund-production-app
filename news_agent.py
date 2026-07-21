@@ -1,8 +1,9 @@
 import yfinance as yf
+from yf_client import SESSION
 
 def fetch_news(ticker_symbol):
     print(f"[{ticker_symbol}] News Agent: Scanning the internet for headlines...")
-    stock = yf.Ticker(ticker_symbol)
+    stock = yf.Ticker(ticker_symbol, session=SESSION)
     
     # yfinance returns a list of dictionaries containing recent articles
     news_data = stock.news

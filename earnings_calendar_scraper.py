@@ -1,14 +1,16 @@
+import time
 import yfinance as yf
 from datetime import datetime
 from news_memory import save_innovation_data
+from yf_client import SESSION, TICKER_PACING_SECONDS
 
 def scrape_earnings_calendar(tickers):
     print("[Innovation Hub] 📅 Scraping Corporate Earnings Calendar...")
-    for ticker in tickers:
-        if ticker in ["SPY", "QQQ", "IWM"]:
-            continue
+    # Filter out index ETFs before pacing so sleeps match real Yahoo calls
+    work_tickers = [t for t in tickers if t not in ("SPY", "QQQ", "IWM")]
+    for i, ticker in enumerate(work_tickers):
         try:
-            stock = yf.Ticker(ticker)
+            stock = yf.Ticker(ticker, session=SESSION)
             cal = stock.calendar
             dates = []
             if isinstance(cal, dict):
@@ -32,6 +34,8 @@ def scrape_earnings_calendar(tickers):
                     pass
         except Exception as e:
             print(f"  -> Failed to fetch earnings calendar for {ticker}: {e}")
+        if i < len(work_tickers) - 1:
+            time.sleep(TICKER_PACING_SECONDS)
 
 if __name__ == "__main__":
     test_tickers = ["NVDA", "SPY"]

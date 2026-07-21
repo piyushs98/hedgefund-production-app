@@ -1,10 +1,11 @@
 import os
 import json
 import yfinance as yf
+from yf_client import SESSION
 
 def fetch_options_data(ticker_symbol):
     print(f"Fetching options data for {ticker_symbol}...")
-    stock = yf.Ticker(ticker_symbol)
+    stock = yf.Ticker(ticker_symbol, session=SESSION)
     
     # 1. Get available expiration dates
     expirations = stock.options

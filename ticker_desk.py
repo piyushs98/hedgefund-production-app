@@ -1,7 +1,9 @@
 import os
+import time
 import sqlite3
 import yfinance as yf
 from news_memory import get_historical_context
+from yf_client import SESSION, TICKER_PACING_SECONDS
 
 # CENTRALIZED GROQ CONFIGURATION
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
@@ -21,7 +23,7 @@ def fetch_pivot_data(ticker):
     Includes robust defaults if yfinance fails.
     """
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker, session=SESSION)
         # Fetch 5 days to ensure we have completed trading sessions
         hist = stock.history(period="5d")
         if hist.empty:
@@ -135,8 +137,9 @@ def get_aggregated_briefings(tickers):
     """
     print("\n--- OPERATING TICKER SPECIALIST DESK ---")
     payload = {}
+    tickers_list = list(tickers)
     
-    for ticker in tickers:
+    for i, ticker in enumerate(tickers_list):
         print(f"[Specialist Desk] Running micro-agent for {ticker}...")
         
         # 1. Fetch pricing/pivot metrics
@@ -150,6 +153,9 @@ def get_aggregated_briefings(tickers):
         # 3. Formulate specialist briefing
         briefing = get_specialist_briefing(ticker, pivot_data, news_headlines)
         payload[ticker] = briefing
+
+        if i < len(tickers_list) - 1:
+            time.sleep(TICKER_PACING_SECONDS)
         
     return payload
 

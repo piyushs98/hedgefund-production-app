@@ -2,6 +2,7 @@ import time
 import sqlite3
 import yfinance as yf
 import broadcaster
+from yf_client import SESSION, TICKER_PACING_SECONDS
 
 DB_PATH = "data/news_room.db"
 
@@ -11,7 +12,7 @@ def get_live_option_value(ticker, option_type, strike, contract_id):
     Returns None when no reliable quote exists — callers must treat None as
     'do not act', never as zero."""
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker, session=SESSION)
         # contract_id convention: "<TICKER>-<EXP:YYYY-MM-DD>-<TYPE>-<STRIKE>"
         parts = (contract_id or "").split("-")
         exp = "-".join(parts[1:4]) if len(parts) >= 4 else None
@@ -55,7 +56,7 @@ def run_risk_sentinel():
                 
             # If positions exist, check VIX for Intraday Matrix Triggers
             try:
-                vix = yf.Ticker("^VIX")
+                vix = yf.Ticker("^VIX", session=SESSION)
                 vix_hist = vix.history(period="1d", interval="5m")
                 # Simulated z-score check
                 if len(vix_hist) >= 2:
@@ -69,7 +70,7 @@ def run_risk_sentinel():
                 pass
                 
             # Check The 95% Stop Guard for each position
-            for pos in open_positions:
+            for i, pos in enumerate(open_positions):
                 ticker, entry_price, option_type, strike, contract_id = pos
 
                 # BUG FIX: the previous build hardcoded a simulated 96% loss
@@ -79,6 +80,8 @@ def run_risk_sentinel():
                 # rather than fabricate a valuation.
                 current_value = get_live_option_value(ticker, option_type, strike, contract_id)
                 if current_value is None:
+                    if i < len(open_positions) - 1:
+                        time.sleep(TICKER_PACING_SECONDS)
                     continue  # no live price available — do not act on fake data
 
                 if current_value <= (entry_price * 0.05):
@@ -91,6 +94,9 @@ def run_risk_sentinel():
                     alert_msg = f"[RISK LEVEL RED] 🚨 95% Stop Guard Breached for {ticker} ({option_type} @ {strike}). Contract {contract_id} status updated to FORCE_EXIT_TRIGGERED."
                     print(alert_msg)
                     broadcaster.send_discord_alert(alert_msg)
+
+                if i < len(open_positions) - 1:
+                    time.sleep(TICKER_PACING_SECONDS)
                     
             time.sleep(60)
             
