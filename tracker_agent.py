@@ -29,6 +29,8 @@ import requests
 import yfinance as yf
 from flask import Flask
 
+from yf_client import SESSION, TICKER_PACING_SECONDS
+
 # ---------------------------------------------------------------------------
 # Configuration (env-only secrets — same pattern as config.py / broadcaster)
 # ---------------------------------------------------------------------------
@@ -46,8 +48,11 @@ MAX_RETRIES = 3
 MAX_DISCORD_CHUNK = 1900
 
 # Swap ACTIVE_TRADES_PATH (or the two state functions) when moving to a DB.
+# Always resolve relative to this file so cwd/Render workdir cannot desync
+# master_bot.py and tracker_agent.py.
+_DEFAULT_ACTIVE_TRADES = os.path.join(os.path.dirname(__file__), "active_trades.json")
 ACTIVE_TRADES_PATH = Path(
-    os.environ.get("ACTIVE_TRADES_PATH", "active_trades.json")
+    os.environ.get("ACTIVE_TRADES_PATH", _DEFAULT_ACTIVE_TRADES)
 )
 
 VALID_DECISIONS = (
@@ -260,7 +265,7 @@ def fetch_micro_bars(ticker: str, minutes: int = 5) -> list[dict[str, Any]]:
     try:
         # yfinance 1m data requires a short lookback window; pull a day of
         # 1m bars then slice the tail so we only hand Gemini ~5 candles.
-        hist = yf.Ticker(symbol).history(period="1d", interval="1m")
+        hist = yf.Ticker(symbol, session=SESSION).history(period="1d", interval="1m")
         if hist is None or hist.empty:
             print(f"[Tracker] [{symbol}] No 1m history returned (market closed?).")
             return []
@@ -718,7 +723,7 @@ def run_cycle() -> None:
             except Exception:
                 pass
         # Brief pause between tickers to stay friendly to yfinance / Gemini
-        time.sleep(1.0)
+        time.sleep(TICKER_PACING_SECONDS)
 
 
 def assert_runtime_config() -> None:
@@ -748,6 +753,20 @@ def run_micro_loop() -> None:
             print(f"[Tracker] Seeded empty state {{}} at {ACTIVE_TRADES_PATH}")
         except OSError as e:
             print(f"[Tracker] Could not seed state file: {e}")
+
+    # Boot heartbeat — confirms webhook connectivity even with 0 open trades
+    try:
+        trade_count = len(load_active_trades())
+    except Exception:
+        trade_count = 0
+    boot_msg = (
+        "Tracker Agent Online - Monitoring Active Trades"
+        f"\nState file: `{ACTIVE_TRADES_PATH}`"
+        f"\nOpen positions at boot: **{trade_count}**"
+        f"\nUTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    print("[Tracker] Posting boot heartbeat to Discord...")
+    send_tracker_alert(boot_msg)
 
     error_backoff = 30
     while True:

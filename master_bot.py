@@ -17,6 +17,7 @@ Key design notes:
 """
 
 import json
+import os
 import time
 import uuid
 from datetime import datetime
@@ -31,6 +32,7 @@ import telemetry
 import scoring_engine
 import strike_selector
 from circuit_breaker import CircuitBreaker
+from yf_client import SESSION
 
 # Employee tier
 from data_engineer import fetch_options_data
@@ -61,7 +63,11 @@ from adversarial_agent import DevilsAdvocate
 
 TICKERS = config.TICKERS
 GEMINI_API_KEY = config.GEMINI_API_KEY
-BYPASS_MARKET_HOURS = __import__("os").environ.get("BYPASS_MARKET_HOURS", "false").lower() == "true"
+BYPASS_MARKET_HOURS = os.environ.get("BYPASS_MARKET_HOURS", "false").lower() == "true"
+
+# Shared with tracker_agent.py — resolve next to this file so cwd cannot desync paths.
+_DEFAULT_ACTIVE_TRADES = os.path.join(os.path.dirname(__file__), "active_trades.json")
+ACTIVE_TRADES_PATH = os.environ.get("ACTIVE_TRADES_PATH", _DEFAULT_ACTIVE_TRADES)
 
 broadcaster.WEBHOOK_URL = config.DISCORD_WEBHOOK or broadcaster.WEBHOOK_URL
 
@@ -90,7 +96,7 @@ def get_latest_futures_pct(symbol="ES=F"):
 def fetch_atr(ticker, breaker=None):
     """ATR(14) via 1-month daily history. Returns (atr_abs, atr_pct)."""
     try:
-        hist = yf.Ticker(ticker).history(period="1mo")
+        hist = yf.Ticker(ticker, session=SESSION).history(period="1mo")
         atr_abs, atr_pct = strike_selector.compute_atr(hist)
         if breaker and atr_abs is not None:
             breaker.record_success(f"atr:{ticker}")
@@ -109,7 +115,7 @@ def ensure_news_context(ticker, breaker=None):
         return news_string
     print(f"[{ticker}] 👷 No news in database. Running live yfinance fallback...")
     try:
-        articles = yf.Ticker(ticker).news
+        articles = yf.Ticker(ticker, session=SESSION).news
         for article in articles or []:
             title, publisher = extract_article_info(article)
             if title and title != "Unknown Title":
