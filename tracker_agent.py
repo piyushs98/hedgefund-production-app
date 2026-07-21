@@ -473,28 +473,68 @@ def _extract_gemini_text(payload: dict[str, Any]) -> str:
 
 
 def _parse_decision(text: str) -> str:
-    upper = text.upper()
-    # Prefer the first occurrence of a valid tag (prompt requires first line)
-    for tag in VALID_DECISIONS:
-        if tag in text or tag in upper:
-            # normalize to canonical casing from VALID_DECISIONS
-            return tag
-    # Soft match without brackets
-    soft = {
-        "TAKE PROFIT": "[TAKE PROFIT]",
-        "TRAILING STOP ADJUSTED": "[TRAILING STOP ADJUSTED]",
-        "EXIT NOW": "[EXIT NOW]",
-        "HOLD": "[HOLD]",
+    """
+    Strict bracket-tag extraction for tactical decisions.
+
+    Uses regex ``\\[(.*?)\\]`` (first-match oriented) instead of brittle
+    substring soft-matches like ``"HOLD" in text.upper()``.
+
+    Rules:
+      * Only approved tags in VALID_DECISIONS are accepted.
+      * The first bracketed tag in the response must be an approved tag.
+      * If multiple distinct approved tags appear (conflicting), default [HOLD].
+      * Missing / unparseable / unapproved first tag → [HOLD].
+    """
+    if not text or not str(text).strip():
+        print("[Tracker] Could not parse decision tag; defaulting to [HOLD].")
+        return "[HOLD]"
+
+    # Canonical lookup: "[HOLD]" etc. (whitespace-normalized, case-insensitive)
+    valid_lookup = {
+        re.sub(r"\s+", " ", tag.strip().upper()): tag for tag in VALID_DECISIONS
     }
-    for needle, tag in soft.items():
-        if needle in upper:
-            return tag
-    print("[Tracker] Could not parse decision tag; defaulting to [HOLD].")
-    return "[HOLD]"
+
+    # Extract every bracketed segment in document order
+    raw_inners = re.findall(r"\[(.*?)\]", str(text), flags=re.DOTALL)
+    if not raw_inners:
+        print("[Tracker] Could not parse decision tag; defaulting to [HOLD].")
+        return "[HOLD]"
+
+    normalized_tags: list[str] = []
+    for inner in raw_inners:
+        norm = "[" + re.sub(r"\s+", " ", inner.strip().upper()) + "]"
+        normalized_tags.append(norm)
+
+    # First bracketed tag must be on the approved list
+    first = normalized_tags[0]
+    if first not in valid_lookup:
+        print(f"[Tracker] First tag {first!r} not approved; defaulting to [HOLD].")
+        return "[HOLD]"
+
+    # Any later approved tags that disagree with the first → conflict → HOLD
+    approved_seen = {
+        valid_lookup[t] for t in normalized_tags if t in valid_lookup
+    }
+    if len(approved_seen) > 1:
+        print(f"[Tracker] Conflicting decision tags {sorted(approved_seen)}; "
+              f"defaulting to [HOLD].")
+        return "[HOLD]"
+
+    return valid_lookup[first]
 
 
 def _parse_trailing_stop(text: str) -> float | None:
-    m = re.search(r"NEW_TRAILING_STOP\s*=\s*([0-9]+(?:\.[0-9]+)?)", text, re.I)
+    """
+    Parse NEW_TRAILING_STOP=X with optional spaces and optional leading $.
+
+    Accepts e.g. NEW_TRAILING_STOP=1.50, NEW_TRAILING_STOP = $1.50,
+    NEW_TRAILING_STOP=$ 1.50
+    """
+    m = re.search(
+        r"NEW_TRAILING_STOP\s*=\s*\$?\s*([0-9]+(?:\.[0-9]+)?)",
+        text or "",
+        re.I,
+    )
     if not m:
         return None
     try:

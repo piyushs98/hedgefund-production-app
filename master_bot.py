@@ -61,6 +61,9 @@ from managers import generate_risk_report, generate_sentiment_report, generate_t
 from ticker_desk import get_aggregated_briefings, fetch_pivot_data
 from adversarial_agent import DevilsAdvocate
 
+# Shared durable state with the micro Tracker (atomic load/append/write)
+from tracker_agent import save_active_trade
+
 TICKERS = config.TICKERS
 GEMINI_API_KEY = config.GEMINI_API_KEY
 BYPASS_MARKET_HOURS = os.environ.get("BYPASS_MARKET_HOURS", "false").lower() == "true"
@@ -69,7 +72,98 @@ BYPASS_MARKET_HOURS = os.environ.get("BYPASS_MARKET_HOURS", "false").lower() == 
 _DEFAULT_ACTIVE_TRADES = os.path.join(os.path.dirname(__file__), "active_trades.json")
 ACTIVE_TRADES_PATH = os.environ.get("ACTIVE_TRADES_PATH", _DEFAULT_ACTIVE_TRADES)
 
+# Full-day NYSE closures (observed dates). Early-close days are NOT included —
+# those still run the normal trading window with thinner liquidity.
+# Source: NYSE Holidays & Trading Hours calendar (2026–2027).
+NYSE_HOLIDAYS = {
+    # ---- 2026 ----
+    "2026-01-01",  # New Year's Day
+    "2026-01-19",  # Martin Luther King, Jr. Day
+    "2026-02-16",  # Washington's Birthday (Presidents' Day)
+    "2026-04-03",  # Good Friday
+    "2026-05-25",  # Memorial Day
+    "2026-06-19",  # Juneteenth National Independence Day
+    "2026-07-03",  # Independence Day (observed; July 4 is Saturday)
+    "2026-09-07",  # Labor Day
+    "2026-11-26",  # Thanksgiving Day
+    "2026-12-25",  # Christmas Day
+    # ---- 2027 ----
+    "2027-01-01",  # New Year's Day
+    "2027-01-18",  # Martin Luther King, Jr. Day
+    "2027-02-15",  # Washington's Birthday (Presidents' Day)
+    "2027-03-26",  # Good Friday
+    "2027-05-31",  # Memorial Day
+    "2027-06-18",  # Juneteenth (observed; June 19 is Saturday)
+    "2027-07-05",  # Independence Day (observed; July 4 is Sunday)
+    "2027-09-06",  # Labor Day
+    "2027-11-25",  # Thanksgiving Day
+    "2027-12-24",  # Christmas Day (observed; Dec 25 is Saturday)
+}
+
 broadcaster.WEBHOOK_URL = config.DISCORD_WEBHOOK or broadcaster.WEBHOOK_URL
+
+
+# ==========================================
+# 📁 ACTIVE TRADE PERSISTENCE (Tracker handoff)
+# ==========================================
+
+def record_executed_trade(ticker, contract, scan_id=None, card=None):
+    """
+    Append a confirmed EXECUTE position to active_trades.json via the
+    Tracker agent's atomic save helper (temp file + os.replace).
+
+    Does not alter scoring or execution criteria — persistence only.
+    Returns True on successful write.
+    """
+    if not contract or "error" in contract:
+        return False
+
+    entry_time = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    entry_price = contract.get("entry_premium")
+    target_price = contract.get("take_profit")
+    stop_loss = contract.get("stop_loss")
+
+    option_contract = {
+        "direction": contract.get("direction"),
+        "strike": contract.get("strike"),
+        "expiration": contract.get("expiration"),
+        "days_to_expiration": contract.get("days_to_expiration"),
+        "implied_volatility": contract.get("implied_volatility"),
+        "bid_ask_spread_pct": contract.get("bid_ask_spread_pct"),
+    }
+
+    notes_parts = [f"scan_id={scan_id}"] if scan_id else []
+    if card is not None:
+        notes_parts.append(f"score={getattr(card, 'total_score', None)}")
+        notes_parts.append(f"flag={getattr(card, 'action_flag', None)}")
+    if contract.get("rationale"):
+        notes_parts.append(str(contract["rationale"])[:240])
+
+    trade_payload = {
+        # Tracker-compatible core fields
+        "trade_id": str(uuid.uuid4()),
+        "ticker": ticker,
+        "direction": contract.get("direction"),
+        "entry_price": entry_price,
+        "entry_premium": entry_price,
+        "entry_timestamp": entry_time,
+        "entry_time": entry_time,
+        "strike": contract.get("strike"),
+        "expiration": contract.get("expiration"),
+        "stop_loss": stop_loss,
+        "take_profit": target_price,
+        "target_price": target_price,
+        "trailing_stop": None,
+        "option_contract": option_contract,
+        "notes": "; ".join(notes_parts),
+    }
+
+    ok = save_active_trade(trade_payload, path=ACTIVE_TRADES_PATH)
+    if ok:
+        print("[CEO] Successfully recorded new position to active_trades.json")
+    else:
+        print(f"[CEO] WARNING: failed to record {ticker} to {ACTIVE_TRADES_PATH}")
+    return ok
 
 
 # ==========================================
@@ -411,6 +505,18 @@ def run_portfolio_scan(morning_macro_context, breaker, inter_ticker_sleep=10):
             )
             broadcaster.send_discord_alert(trade_decision)
 
+            # ---- Persist confirmed EXECUTE for Tracker micro-loop ----
+            # Scoring / strike selection already decided action_flag; this only
+            # hands the open position to active_trades.json (atomic append).
+            if card.action_flag == "EXECUTE" and contract and "error" not in contract:
+                try:
+                    record_executed_trade(
+                        ticker, contract, scan_id=scan_id, card=card)
+                except Exception as persist_err:
+                    # Never let state I/O kill the portfolio scan
+                    print(f"[CEO] WARNING: active_trades persistence failed "
+                          f"for {ticker}: {persist_err}")
+
             if idx < len(TICKERS) - 1:
                 time.sleep(inter_ticker_sleep)
         except Exception as ticker_err:
@@ -460,7 +566,7 @@ def run_macro_loop():
                 time.sleep(2)
                 print("\n[System State] 📊 [Bypass Sim] PREP MEETING...")
                 try:
-                    morning_macro_context = generate_morning_briefing(GEMINI_API_KEY)
+                    morning_macro_context = generate_morning_briefing()
                 except Exception as err:
                     print(f"❌ [Bypass Sim] Briefing error: {err}")
                 time.sleep(2)
@@ -478,12 +584,17 @@ def run_macro_loop():
             trading_start = datetime.strptime("09:30:00", "%H:%M:%S").time()
             trading_end = datetime.strptime("15:59:59", "%H:%M:%S").time()
             is_weekend = now.weekday() > 4
+            is_holiday = now.strftime("%Y-%m-%d") in NYSE_HOLIDAYS
+            # Holidays are treated exactly like weekends: no prep, no trading.
+            is_market_closed = is_weekend or is_holiday
+            if is_holiday:
+                print("[System] Market closed today for NYSE holiday.")
 
-            is_night_mode = (is_weekend
+            is_night_mode = (is_market_closed
                              or (night_start_1 <= current_time <= night_end_1)
                              or (night_start_2 <= current_time <= night_end_2))
-            is_prep_meeting = (not is_weekend and meeting_start <= current_time <= meeting_end)
-            is_trading_mode = (not is_weekend and trading_start <= current_time <= trading_end)
+            is_prep_meeting = (not is_market_closed and meeting_start <= current_time <= meeting_end)
+            is_trading_mode = (not is_market_closed and trading_start <= current_time <= trading_end)
 
             if is_night_mode:
                 print(f"\n[System State] 🌙 NIGHT MODE (EST {now.strftime('%Y-%m-%d %H:%M:%S')})")
@@ -491,7 +602,11 @@ def run_macro_loop():
                 print("[System State] Overnight harvest complete. Sleeping until next state check...")
                 for _ in range(45):
                     time.sleep(60)
-                    if datetime.now(est_tz).time() >= meeting_start and datetime.now(est_tz).weekday() <= 4:
+                    nxt = datetime.now(est_tz)
+                    # Only break toward prep on a true trading day (weekday + not holiday)
+                    if (nxt.time() >= meeting_start
+                            and nxt.weekday() <= 4
+                            and nxt.strftime("%Y-%m-%d") not in NYSE_HOLIDAYS):
                         break
                 continue
 
@@ -499,7 +614,7 @@ def run_macro_loop():
                 print(f"\n[System State] 📊 PRE-MARKET PREP MEETING (EST {now.strftime('%H:%M:%S')})")
                 if last_briefing_date != now.date():
                     try:
-                        morning_macro_context = generate_morning_briefing(GEMINI_API_KEY)
+                        morning_macro_context = generate_morning_briefing()
                         last_briefing_date = now.date()
                         print("[System State] Pre-market briefing generated and cached.")
                     except Exception as brief_err:
@@ -514,7 +629,7 @@ def run_macro_loop():
                 if not morning_macro_context:
                     print("[System State] Missing pre-market briefing context. Generating now...")
                     try:
-                        morning_macro_context = generate_morning_briefing(GEMINI_API_KEY)
+                        morning_macro_context = generate_morning_briefing()
                         last_briefing_date = now.date()
                     except Exception as brief_err:
                         print(f"❌ Fallback briefing error: {brief_err}")
