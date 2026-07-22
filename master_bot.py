@@ -31,6 +31,7 @@ import broadcaster
 import telemetry
 import scoring_engine
 import strike_selector
+import virtual_broker
 from circuit_breaker import CircuitBreaker
 from yf_client import SESSION
 
@@ -61,16 +62,19 @@ from managers import generate_risk_report, generate_sentiment_report, generate_t
 from ticker_desk import get_aggregated_briefings, fetch_pivot_data
 from adversarial_agent import DevilsAdvocate
 
-# Shared durable state with the micro Tracker (atomic load/append/write)
+# Shared durable state with the micro Tracker (atomic load/append/write).
+# save_active_trade dual-writes JSON + SQLite active_trades_store (news_room.db).
 from tracker_agent import save_active_trade
 
 TICKERS = config.TICKERS
 GEMINI_API_KEY = config.GEMINI_API_KEY
 BYPASS_MARKET_HOURS = os.environ.get("BYPASS_MARKET_HOURS", "false").lower() == "true"
 
-# Shared with tracker_agent.py — resolve next to this file so cwd cannot desync paths.
-_DEFAULT_ACTIVE_TRADES = os.path.join(os.path.dirname(__file__), "active_trades.json")
-ACTIVE_TRADES_PATH = os.environ.get("ACTIVE_TRADES_PATH", _DEFAULT_ACTIVE_TRADES)
+# Shared with main.py / tracker_agent.py — absolute path so cwd cannot desync.
+ACTIVE_TRADES_PATH = os.environ.get(
+    "ACTIVE_TRADES_PATH",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "active_trades.json")),
+)
 
 # Full-day NYSE closures (observed dates). Early-close days are NOT included —
 # those still run the normal trading window with thinner liquidity.
@@ -111,6 +115,10 @@ def record_executed_trade(ticker, contract, scan_id=None, card=None):
     """
     Append a confirmed EXECUTE position to active_trades.json via the
     Tracker agent's atomic save helper (temp file + os.replace).
+
+    Also mirrors the position into SQLite `active_trades_store` inside
+    news_room.db (via save_active_trade) so open trades survive restarts
+    when the JSON file is empty.
 
     Does not alter scoring or execution criteria — persistence only.
     Returns True on successful write.
@@ -158,9 +166,13 @@ def record_executed_trade(ticker, contract, scan_id=None, card=None):
         "notes": "; ".join(notes_parts),
     }
 
+    # Dual-write: active_trades.json + news_room.db active_trades_store
     ok = save_active_trade(trade_payload, path=ACTIVE_TRADES_PATH)
     if ok:
-        print("[CEO] Successfully recorded new position to active_trades.json")
+        print(
+            "[CEO] Successfully recorded new position to active_trades.json "
+            "and SQLite active_trades_store"
+        )
     else:
         print(f"[CEO] WARNING: failed to record {ticker} to {ACTIVE_TRADES_PATH}")
     return ok
@@ -241,7 +253,11 @@ Data:
 {options_json}
 """
     try:
-        response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            request_options={"timeout": 30},
+        )
         return response.text.strip()
     except Exception as e:
         print(f"[{ticker_symbol}] 💼 Quant Manager: Gemini call failed ({e}); using fallback note.")
@@ -281,7 +297,11 @@ Structure the brief as:
 - **CoS Direct Recommendation**: your advice with the deciding metrics named.
 """
     try:
-        response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            request_options={"timeout": 30},
+        )
         return response.text.strip()
     except Exception as e:
         print(f"[{ticker_symbol}] 👔 CoS: Gemini call failed ({e}); using structural fallback.")
@@ -360,7 +380,11 @@ OUTPUT RULES (strict):
 4. Do not truncate, summarize away, or omit any of the four bullets.
 """
     try:
-        response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            request_options={"timeout": 30},
+        )
         text = response.text.strip()
         # Schema guard: if the model drifted, fall back to deterministic format
         required = ["### ", "* **Market Context & Gap**", "* **Quantitative Liquidity Metric**",
@@ -510,6 +534,16 @@ def run_portfolio_scan(morning_macro_context, breaker, inter_ticker_sleep=10):
             # hands the open position to active_trades.json (atomic append).
             if card.action_flag == "EXECUTE" and contract and "error" not in contract:
                 try:
+                    # Virtual paper ledger: debit premium * 100 from buying power.
+                    # Does not alter scoring / AI / execution criteria.
+                    entry_px = contract.get("entry_premium")
+                    buy_payload = dict(contract)
+                    buy_payload.setdefault("ticker", ticker)
+                    try:
+                        virtual_broker.paper_buy(buy_payload, entry_px)
+                    except Exception as broker_err:
+                        print(f"[CEO] WARNING: virtual paper_buy failed "
+                              f"for {ticker}: {broker_err}")
                     record_executed_trade(
                         ticker, contract, scan_id=scan_id, card=card)
                 except Exception as persist_err:

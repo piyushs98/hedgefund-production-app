@@ -17,19 +17,23 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import tempfile
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timezone
 from pathlib import Path
 from threading import Thread
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 import yfinance as yf
 from flask import Flask
 
 from yf_client import SESSION, TICKER_PACING_SECONDS
+
+import virtual_broker
 
 # ---------------------------------------------------------------------------
 # Configuration (env-only secrets — same pattern as config.py / broadcaster)
@@ -47,12 +51,32 @@ REQUEST_TIMEOUT = 15
 MAX_RETRIES = 3
 MAX_DISCORD_CHUNK = 1900
 
+# US equity/options session window used to skip overnight 1m bar polls.
+# 9:15 AM – 4:15 PM Eastern covers RTH + a short post-close cushion for 1m data.
+_ET = ZoneInfo("America/New_York")
+_OPTIONS_SESSION_OPEN = dt_time(9, 15)
+_OPTIONS_SESSION_CLOSE = dt_time(16, 15)
+
 # Swap ACTIVE_TRADES_PATH (or the two state functions) when moving to a DB.
-# Always resolve relative to this file so cwd/Render workdir cannot desync
-# master_bot.py and tracker_agent.py.
-_DEFAULT_ACTIVE_TRADES = os.path.join(os.path.dirname(__file__), "active_trades.json")
+# Absolute default next to this file — same formula as main.py / master_bot.py.
 ACTIVE_TRADES_PATH = Path(
-    os.environ.get("ACTIVE_TRADES_PATH", _DEFAULT_ACTIVE_TRADES)
+    os.environ.get(
+        "ACTIVE_TRADES_PATH",
+        os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "active_trades.json")
+        ),
+    )
+)
+
+# SQLite durable mirror of open trades (survives empty/wiped JSON on restart).
+try:
+    import config as _config
+    _DEFAULT_NEWS_DB = getattr(_config, "NEWS_DB_PATH", None)
+except Exception:
+    _DEFAULT_NEWS_DB = None
+NEWS_DB_PATH = os.environ.get(
+    "NEWS_DB_PATH",
+    _DEFAULT_NEWS_DB or os.path.join(os.path.dirname(__file__), "data", "news_room.db"),
 )
 
 VALID_DECISIONS = (
@@ -60,10 +84,66 @@ VALID_DECISIONS = (
     "[TAKE PROFIT]",
     "[TRAILING STOP ADJUSTED]",
     "[EXIT NOW]",
+    "[STOP LOSS]",
+    "[STOP LOSS TRIGGERED]",
 )
 
 # Decisions that close the position and drop it from state
-CLOSING_DECISIONS = {"[TAKE PROFIT]", "[EXIT NOW]"}
+CLOSING_DECISIONS = {
+    "[TAKE PROFIT]",
+    "[EXIT NOW]",
+    "[STOP LOSS]",
+    "[STOP LOSS TRIGGERED]",
+}
+
+
+def _resolve_exit_price(
+    trade: dict[str, Any],
+    decision: str,
+    micro_bars: list[dict[str, Any]] | None = None,
+) -> float:
+    """
+    Best-effort premium exit for the virtual ledger.
+
+    Prefer explicit TP / SL / trailing levels (stored as option premium).
+    Fall back to entry (flat) if nothing else is usable — never use
+    underlying 1m closes as premium substitutes.
+    """
+    entry = trade.get("entry_price") or trade.get("entry_premium") or 0.0
+    try:
+        entry_f = float(entry)
+    except (TypeError, ValueError):
+        entry_f = 0.0
+
+    candidates: list[Any] = []
+    if decision == "[TAKE PROFIT]":
+        candidates.append(trade.get("take_profit") or trade.get("target_price"))
+    elif decision in ("[STOP LOSS]", "[STOP LOSS TRIGGERED]"):
+        candidates.append(trade.get("stop_loss"))
+        if trade.get("trailing_stop") is not None:
+            candidates.append(trade.get("trailing_stop"))
+    elif decision == "[EXIT NOW]":
+        if trade.get("trailing_stop") is not None:
+            candidates.append(trade.get("trailing_stop"))
+        candidates.append(trade.get("stop_loss"))
+        # Mid between entry and TP as a soft estimate when no stop set
+        tp = trade.get("take_profit") or trade.get("target_price")
+        if tp is not None and entry_f:
+            try:
+                candidates.append((entry_f + float(tp)) / 2.0)
+            except (TypeError, ValueError):
+                pass
+
+    for c in candidates:
+        if c is None:
+            continue
+        try:
+            v = float(c)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            continue
+    return entry_f
 
 
 # ===========================================================================
@@ -132,6 +212,7 @@ def save_active_trade(
 
     Match key order: trade_id → (ticker + entry_timestamp) → ticker alone
     (last-resort overwrite of first matching ticker).
+    SQLite `active_trades_store` is full-synced via `_write_trades`.
     Returns True on successful write.
     """
     if not isinstance(trade, dict) or not trade.get("ticker"):
@@ -142,11 +223,12 @@ def save_active_trade(
     trades = load_active_trades(store)
     idx = _find_trade_index(trades, trade)
     if idx is None:
-        trades.append(trade)
+        saved = dict(trade)
+        trades.append(saved)
     else:
         # Preserve unknown fields from the previous record
-        merged = {**trades[idx], **trade}
-        trades[idx] = merged
+        saved = {**trades[idx], **trade}
+        trades[idx] = saved
 
     return _write_trades(trades, store)
 
@@ -155,7 +237,12 @@ def remove_active_trade(
     trade: dict[str, Any],
     path: Path | str | None = None,
 ) -> bool:
-    """Drop a closed trade from state. Isolated for the same backend swap."""
+    """
+    Drop a closed trade from JSON state.
+
+    SQLite `active_trades_store` is full-synced to the remaining list via
+    `_write_trades` (absolute parity — no selective DELETE).
+    """
     store = Path(path) if path else ACTIVE_TRADES_PATH
     trades = load_active_trades(store)
     idx = _find_trade_index(trades, trade)
@@ -188,7 +275,12 @@ def _find_trade_index(
 
 
 def _write_trades(trades: list[dict[str, Any]], store: Path) -> bool:
-    """Atomic write (temp file + replace) so a crash mid-write cannot corrupt state."""
+    """
+    Atomic write (temp file + replace) so a crash mid-write cannot corrupt state.
+
+    On success, full-syncs SQLite `active_trades_store` to match the JSON list
+    exactly (absolute parity — no selective upsert/delete).
+    """
     try:
         store.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(trades, indent=2, default=str)
@@ -207,10 +299,151 @@ def _write_trades(trades: list[dict[str, Any]], store: Path) -> bool:
             except OSError:
                 pass
             raise
+        # JSON is source of truth for this write; mirror entire open set to SQLite
+        _sync_sqlite_to_json(trades)
         return True
     except OSError as e:
         print(f"[Tracker] Failed to write state to {store}: {e}")
         return False
+
+
+# ===========================================================================
+# SQLITE MIRROR (active_trades_store in news_room.db)
+# ---------------------------------------------------------------------------
+# Survives process restarts when active_trades.json is empty / wiped by the
+# orchestrator. JSON remains the hot path; every successful JSON write
+# full-replaces the SQLite table so zombie/ghost trades are impossible.
+# ===========================================================================
+
+def _trade_store_key(trade: dict[str, Any]) -> str:
+    """Stable primary key for active_trades_store."""
+    tid = trade.get("trade_id")
+    if tid:
+        return str(tid)
+    ticker = str(trade.get("ticker") or "UNKNOWN").upper()
+    ts = trade.get("entry_timestamp") or trade.get("entry_time") or ""
+    return f"{ticker}|{ts}"
+
+
+def _ensure_active_trades_store(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS active_trades_store (
+            trade_id TEXT PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            entry_timestamp TEXT,
+            payload TEXT NOT NULL,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+
+
+def _sync_sqlite_to_json(current_trades_list: list[dict[str, Any]]) -> bool:
+    """
+    Absolute state sync: wipe active_trades_store and re-insert the current
+    open-trades list so SQLite always matches JSON after a successful write.
+
+    Called from `_write_trades` only after the JSON file has been updated.
+    """
+    trades = current_trades_list if isinstance(current_trades_list, list) else []
+    try:
+        db_path = NEWS_DB_PATH
+        parent = os.path.dirname(db_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with sqlite3.connect(db_path, timeout=30.0) as conn:
+            _ensure_active_trades_store(conn)
+            conn.execute("DELETE FROM active_trades_store")
+            for trade in trades:
+                if not isinstance(trade, dict) or not trade.get("ticker"):
+                    continue
+                trade_id = _trade_store_key(trade)
+                ticker = str(trade.get("ticker", "")).upper()
+                entry_ts = trade.get("entry_timestamp") or trade.get("entry_time")
+                payload_obj = dict(trade)
+                if not payload_obj.get("trade_id"):
+                    payload_obj["trade_id"] = trade_id
+                conn.execute(
+                    """
+                    INSERT INTO active_trades_store
+                        (trade_id, ticker, entry_timestamp, payload, updated_at)
+                    VALUES (?, ?, ?, ?, datetime('now'))
+                    """,
+                    (
+                        trade_id,
+                        ticker,
+                        str(entry_ts) if entry_ts is not None else None,
+                        json.dumps(payload_obj, default=str),
+                    ),
+                )
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"[Tracker] SQLite full-sync failed: {e}")
+        traceback.print_exc()
+        return False
+
+
+def _sqlite_load_all_trades() -> list[dict[str, Any]]:
+    """Load all open trades mirrored in active_trades_store."""
+    if not os.path.exists(NEWS_DB_PATH):
+        return []
+    try:
+        with sqlite3.connect(NEWS_DB_PATH, timeout=30.0) as conn:
+            _ensure_active_trades_store(conn)
+            rows = conn.execute(
+                "SELECT payload FROM active_trades_store ORDER BY updated_at ASC"
+            ).fetchall()
+        trades: list[dict[str, Any]] = []
+        for (payload,) in rows:
+            try:
+                obj = json.loads(payload) if isinstance(payload, str) else payload
+                if isinstance(obj, dict) and obj.get("ticker"):
+                    trades.append(obj)
+            except (TypeError, json.JSONDecodeError) as e:
+                print(f"[Tracker] Skipping corrupt SQLite trade payload: {e}")
+        return trades
+    except Exception as e:
+        print(f"[Tracker] SQLite load of active_trades_store failed: {e}")
+        traceback.print_exc()
+        return []
+
+
+def restore_active_trades_from_sqlite_if_empty(
+    path: Path | str | None = None,
+) -> int:
+    """
+    If active_trades.json has no open trades, reload from SQLite mirror.
+
+    Returns the number of trades restored (0 if nothing to do).
+    """
+    store = Path(path) if path else ACTIVE_TRADES_PATH
+    existing = load_active_trades(store)
+    if existing:
+        return 0
+    restored = _sqlite_load_all_trades()
+    if not restored:
+        return 0
+    if _write_trades(restored, store):
+        print("[Tracker] Restored active trades from SQLite database")
+        return len(restored)
+    print("[Tracker] WARNING: SQLite restore loaded trades but JSON write failed.")
+    return 0
+
+
+def is_options_session_open(now: datetime | None = None) -> bool:
+    """
+    True on weekdays between 9:15 AM and 4:15 PM US/Eastern.
+
+    Outside this window (overnight / weekends) 1m option bars are unavailable
+    or stale — skip fetches to avoid noisy DATA GAP alerts.
+    """
+    now_et = (now or datetime.now(timezone.utc)).astimezone(_ET)
+    if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    t = now_et.time()
+    return _OPTIONS_SESSION_OPEN <= t <= _OPTIONS_SESSION_CLOSE
 
 
 # ===========================================================================
@@ -551,7 +784,9 @@ def _strip_decision_line(text: str) -> str:
     first = lines[0].strip().upper()
     if any(tag in first for tag in VALID_DECISIONS) or first in {
         "HOLD", "TAKE PROFIT", "TRAILING STOP ADJUSTED", "EXIT NOW",
+        "STOP LOSS", "STOP LOSS TRIGGERED",
         "[HOLD]", "[TAKE PROFIT]", "[TRAILING STOP ADJUSTED]", "[EXIT NOW]",
+        "[STOP LOSS]", "[STOP LOSS TRIGGERED]",
     }:
         lines = lines[1:]
     # Drop NEW_TRAILING_STOP assignment from rationale body
@@ -664,6 +899,8 @@ def _format_alert(
         "[TAKE PROFIT]": "💰",
         "[TRAILING STOP ADJUSTED]": "📈",
         "[EXIT NOW]": "🚨",
+        "[STOP LOSS]": "🛑",
+        "[STOP LOSS TRIGGERED]": "🛑",
     }.get(decision, "📡")
 
     lines = [
@@ -697,9 +934,18 @@ def process_trade(trade: dict[str, Any]) -> None:
     print(f"\n[Tracker] Evaluating {ticker} "
           f"(id={trade.get('trade_id', 'n/a')})...")
 
+    # Skip 1m option bar polls outside regular session (weekends / overnight)
+    if not is_options_session_open():
+        print(
+            f"[Tracker] [{ticker}] Market closed (outside 9:15–16:15 ET or weekend) "
+            f"— skipping 1m bar fetch."
+        )
+        return
+
     micro_bars = fetch_micro_bars(ticker, minutes=5)
     if not micro_bars:
         # Still surface a soft alert so silent data outages are visible
+        # (only during session hours — off-hours already returned above)
         send_tracker_alert(
             f"⚠️ **TRACKER DATA GAP** — `{ticker}`\n"
             f"No 1m bars available this cycle (market closed or network). "
@@ -727,6 +973,16 @@ def process_trade(trade: dict[str, Any]) -> None:
     elif decision in CLOSING_DECISIONS:
         trade["last_decision"] = decision
         trade["closed_at"] = datetime.now(timezone.utc).isoformat()
+        # Virtual paper ledger: credit exit premium * 100, log realized PnL.
+        # Runs before remove so the open trade still has entry metadata.
+        try:
+            entry_px = trade.get("entry_price") or trade.get("entry_premium")
+            exit_px = _resolve_exit_price(trade, decision, micro_bars)
+            direction = trade.get("direction")
+            virtual_broker.paper_sell(trade, exit_px, direction, entry_px)
+        except Exception as broker_err:
+            print(f"[Tracker] WARNING: virtual paper_sell failed "
+                  f"for {ticker}: {broker_err}")
         remove_active_trade(trade)
         print(f"[Tracker] [{ticker}] removed from active trades ({decision})")
     else:
@@ -746,6 +1002,13 @@ def run_cycle() -> None:
 
     if not trades:
         print("[Tracker] No active trades — sleeping until next cycle.")
+        return
+
+    if not is_options_session_open():
+        print(
+            f"[Tracker] Market closed (outside 9:15–16:15 ET or weekend) — "
+            f"skipping 1m option bar fetches for {len(trades)} trade(s)."
+        )
         return
 
     print(f"[Tracker] {len(trades)} active trade(s) this cycle.")
@@ -793,6 +1056,13 @@ def run_micro_loop() -> None:
             print(f"[Tracker] Seeded empty state {{}} at {ACTIVE_TRADES_PATH}")
         except OSError as e:
             print(f"[Tracker] Could not seed state file: {e}")
+
+    # If JSON is empty ([] / {}), reload open trades from SQLite durable mirror
+    try:
+        restore_active_trades_from_sqlite_if_empty()
+    except Exception as e:
+        print(f"[Tracker] SQLite restore check failed: {e}")
+        traceback.print_exc()
 
     # Boot heartbeat — confirms webhook connectivity even with 0 open trades
     try:

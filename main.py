@@ -2,7 +2,7 @@
 main.py — Render master orchestrator.
 
 Single process that:
-  1. Serves a Flask health endpoint for Render free-tier pings / health checks.
+  1. Serves a Flask health endpoint + Virtual Hedge Fund dashboard/API.
   2. Runs the macro CEO loop (master_bot, ~30-min trading cadence) on a daemon thread.
   3. Runs the micro tracker loop (tracker_agent, 5-min cadence) on a daemon thread.
 
@@ -16,15 +16,27 @@ import json
 import os
 import time
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
 
-from flask import Flask
+from flask import Flask, jsonify, render_template
+
+import virtual_broker
 
 # ---------------------------------------------------------------------------
 # Paths / config
 # ---------------------------------------------------------------------------
-ACTIVE_TRADES_PATH = Path(os.environ.get("ACTIVE_TRADES_PATH", "active_trades.json"))
+# Absolute default next to this file so cwd / Render workdir cannot desync
+# master_bot.py and tracker_agent.py (same formula in all three).
+ACTIVE_TRADES_PATH = Path(
+    os.environ.get(
+        "ACTIVE_TRADES_PATH",
+        os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "active_trades.json")
+        ),
+    )
+)
 MACRO_RESTART_SLEEP = int(os.environ.get("MACRO_RESTART_SLEEP", "60"))
 MICRO_RESTART_SLEEP = int(os.environ.get("MICRO_RESTART_SLEEP", "30"))
 
@@ -52,6 +64,29 @@ def ensure_active_trades_file(path: Path | None = None) -> None:
     except OSError as e:
         # Non-fatal: tracker will also attempt a seed / return []
         print(f"[main] WARNING: could not initialize {store}: {e}")
+
+
+def _load_active_trades_raw() -> list | dict:
+    """Best-effort parse of active_trades.json for API responses."""
+    if not ACTIVE_TRADES_PATH.exists():
+        return []
+    try:
+        raw = json.loads(ACTIVE_TRADES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        if not raw:
+            return []
+        if "trades" in raw and isinstance(raw["trades"], list):
+            return raw["trades"]
+        if raw.get("ticker"):
+            return [raw]
+        return []
+    return []
 
 
 # ===========================================================================
@@ -113,12 +148,42 @@ def start_background_loops() -> None:
 
 
 # ===========================================================================
-# WEB SERVICE (Render health checks)
+# WEB SERVICE (dashboard + Render health checks)
 # ===========================================================================
 
 @app.route("/")
 def index():
-    return "Hedge fund orchestrator online (macro + micro agents)."
+    """Mobile-first Virtual Hedge Fund dashboard."""
+    return render_template("index.html")
+
+
+@app.route("/api/portfolio")
+def api_portfolio():
+    """Buying power + realized PnL from the virtual SQLite ledger."""
+    try:
+        portfolio = virtual_broker.get_portfolio()
+        return jsonify(portfolio)
+    except Exception as e:
+        return jsonify({"error": str(e), "buying_power": None, "total_realized_pnl": None}), 500
+
+
+@app.route("/api/active_trades")
+def api_active_trades():
+    """Open positions from active_trades.json."""
+    try:
+        trades = _load_active_trades_raw()
+        return jsonify(trades)
+    except Exception as e:
+        return jsonify({"error": str(e), "trades": []}), 500
+
+
+@app.route("/api/status")
+def api_status():
+    """Live heartbeat for the dashboard status pill."""
+    return jsonify({
+        "status": "live",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
 
 
 @app.route("/health")
@@ -156,6 +221,11 @@ def status():
 def main() -> None:
     print("\n=== RENDER ORCHESTRATOR (main.py) ===")
     ensure_active_trades_file()
+    try:
+        virtual_broker.ensure_ledger()
+        print("[main] Virtual broker ledger ready")
+    except Exception as e:
+        print(f"[main] WARNING: virtual broker init failed: {e}")
     start_background_loops()
 
     port = int(os.environ.get("PORT", 10000))
