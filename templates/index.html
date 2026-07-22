@@ -3,23 +3,42 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0A0A0A" />
-  <title>JARVIS // Command Center</title>
+  <meta name="theme-color" content="#0f172a" />
+  <title>JARVIS · Command Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
   <style>
     :root {
-      --bg: #0A0A0A;
-      --glass: rgba(18, 22, 28, 0.55);
-      --glass-border: rgba(0, 229, 255, 0.12);
-      --cyan: #00E5FF;
-      --cyan-dim: rgba(0, 229, 255, 0.35);
-      --green: #39FF14;
-      --gold: #FFD700;
-      --text: #E8EEF5;
-      --muted: #6B7A8F;
+      --bg: #0f172a;
+      --bg-elevated: #1e293b;
+      --surface: #1e293b;
+      --surface-soft: rgba(30, 41, 59, 0.92);
+      --border: rgba(148, 163, 184, 0.12);
+      --border-soft: rgba(148, 163, 184, 0.08);
+      --text: #f1f5f9;
+      --text-secondary: #cbd5e1;
+      --muted: #94a3b8;
+      --muted-dim: #64748b;
+      --accent: #94a3b8;
+      --accent-blue: #7dd3fc;
+      --mint: #6ee7b7;
+      --mint-soft: rgba(110, 231, 183, 0.12);
+      --mint-border: rgba(110, 231, 183, 0.28);
+      --rose: #fda4af;
+      --rose-soft: rgba(253, 164, 175, 0.1);
+      --rose-border: rgba(253, 164, 175, 0.28);
+      --silver: #cbd5e1;
+      --amber: #fcd34d;
+      --amber-soft: rgba(252, 211, 77, 0.1);
       --discord: #5865F2;
-      --grave-red: #ff4d6a;
-      --grave-glass: rgba(40, 8, 12, 0.55);
+      --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.24);
+      --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.22), 0 1px 3px rgba(0, 0, 0, 0.16);
+      --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.28), 0 2px 8px rgba(0, 0, 0, 0.18);
+      --radius: 14px;
+      --radius-sm: 10px;
       --footer-h: 42px;
+      --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -28,15 +47,16 @@
       height: 100%;
       background: var(--bg);
       color: var(--text);
-      font-family: "SF Pro Display", "Segoe UI", system-ui, -apple-system, sans-serif;
+      font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
       overflow-x: hidden;
     }
 
     body {
       background:
-        radial-gradient(ellipse 80% 50% at 50% 0%, rgba(0, 229, 255, 0.06), transparent 55%),
-        radial-gradient(ellipse 40% 40% at 15% 80%, rgba(88, 101, 242, 0.05), transparent 50%),
-        radial-gradient(ellipse 35% 35% at 90% 70%, rgba(57, 255, 20, 0.03), transparent 50%),
+        radial-gradient(ellipse 70% 45% at 50% -10%, rgba(125, 211, 252, 0.04), transparent 55%),
+        radial-gradient(ellipse 40% 30% at 100% 100%, rgba(110, 231, 183, 0.03), transparent 50%),
         var(--bg);
       min-height: 100vh;
       padding-bottom: calc(var(--footer-h) + 1rem);
@@ -69,46 +89,32 @@
     }
 
     .panel {
-      background: var(--glass);
-      border: 1px solid var(--glass-border);
-      border-radius: 20px;
-      backdrop-filter: blur(18px);
-      -webkit-backdrop-filter: blur(18px);
-      box-shadow:
-        0 0 0 1px rgba(255, 255, 255, 0.03) inset,
-        0 20px 50px rgba(0, 0, 0, 0.45);
-      padding: 1.5rem;
+      background: var(--surface-soft);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow-md);
+      padding: 1.35rem 1.4rem;
       position: relative;
       overflow: hidden;
     }
 
-    .panel::before {
-      content: "";
-      position: absolute;
-      inset: 0;
-      background: linear-gradient(135deg, rgba(0, 229, 255, 0.04), transparent 40%);
-      pointer-events: none;
-    }
-
     .panel-label {
-      font-size: 0.65rem;
-      letter-spacing: 0.28em;
+      font-size: 0.68rem;
+      letter-spacing: 0.14em;
       text-transform: uppercase;
       color: var(--muted);
       font-weight: 600;
-      margin-bottom: 1.25rem;
+      margin-bottom: 1.15rem;
       display: flex;
       align-items: center;
-      gap: 0.5rem;
-      position: relative;
-      z-index: 1;
+      gap: 0.6rem;
     }
 
     .panel-label::after {
       content: "";
       flex: 1;
       height: 1px;
-      background: linear-gradient(90deg, var(--cyan-dim), transparent);
+      background: linear-gradient(90deg, var(--border), transparent);
     }
 
     /* ── Header strip ─────────────────────────────────── */
@@ -117,19 +123,23 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding: 0.25rem 0.5rem 0.5rem;
+      padding: 0.15rem 0.25rem 0.35rem;
     }
 
     .brand {
-      font-size: 0.7rem;
-      letter-spacing: 0.35em;
+      font-size: 0.72rem;
+      letter-spacing: 0.18em;
       text-transform: uppercase;
-      color: var(--cyan);
+      color: var(--silver);
       font-weight: 600;
-      text-shadow: 0 0 20px var(--cyan-dim);
     }
 
-    .brand span { color: var(--muted); letter-spacing: 0.15em; font-weight: 400; }
+    .brand span {
+      color: var(--muted-dim);
+      letter-spacing: 0.08em;
+      font-weight: 400;
+      margin-left: 0.35rem;
+    }
 
     .status-pill {
       display: flex;
@@ -137,173 +147,119 @@
       gap: 0.5rem;
       padding: 0.4rem 0.85rem;
       border-radius: 999px;
-      border: 1px solid rgba(57, 255, 20, 0.25);
-      background: rgba(57, 255, 20, 0.06);
-      font-size: 0.7rem;
-      letter-spacing: 0.12em;
+      border: 1px solid var(--mint-border);
+      background: var(--mint-soft);
+      font-size: 0.68rem;
+      letter-spacing: 0.08em;
       text-transform: uppercase;
-      color: var(--green);
+      color: var(--mint);
+      font-weight: 500;
     }
 
     .status-dot {
-      width: 8px;
-      height: 8px;
+      width: 7px;
+      height: 7px;
       border-radius: 50%;
-      background: var(--green);
-      box-shadow: 0 0 10px var(--green); /* static glow — never animated */
+      background: var(--mint);
       position: relative;
-      transform: translate3d(0, 0, 0);
-      will-change: transform, opacity;
-      animation: pulse-dot 1.8s ease-in-out infinite;
+      flex-shrink: 0;
     }
 
     .status-dot::after {
       content: "";
       position: absolute;
-      inset: 0;
+      inset: -3px;
       border-radius: 50%;
-      background: var(--green);
-      opacity: 0.5;
-      transform: translate3d(0, 0, 0) scale(1);
-      will-change: transform, opacity;
-      animation: pulse-ring 1.8s ease-in-out infinite;
-      pointer-events: none;
+      border: 1px solid rgba(110, 231, 183, 0.35);
+      opacity: 0.7;
+      animation: soft-ring 2.4s ease-in-out infinite;
     }
 
-    /* GPU-only: transform + opacity (no box-shadow / layout props) */
-    @keyframes pulse-dot {
-      0%, 100% { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
-      50% { opacity: 0.75; transform: translate3d(0, 0, 0) scale(0.92); }
+    @keyframes soft-ring {
+      0%, 100% { opacity: 0.55; transform: scale(1); }
+      50% { opacity: 0.15; transform: scale(1.35); }
     }
 
-    @keyframes pulse-ring {
-      0% { opacity: 0.55; transform: translate3d(0, 0, 0) scale(1); }
-      70% { opacity: 0; transform: translate3d(0, 0, 0) scale(2.4); }
-      100% { opacity: 0; transform: translate3d(0, 0, 0) scale(2.4); }
-    }
-
-    /* ── Left: Sensory Inputs ─────────────────────────── */
-    .orbs {
+    /* ── Left: Data Pipelines ─────────────────────────── */
+    .pipeline-list {
       display: flex;
       flex-direction: column;
-      gap: 1.25rem;
-      align-items: center;
-      justify-content: center;
-      min-height: 200px;
-      padding: 0.5rem 0 0.25rem;
-      position: relative;
-      z-index: 1;
+      gap: 0.15rem;
     }
 
-    .orb-row {
+    .pipeline-row {
       display: flex;
-      gap: 1.5rem;
-      flex-wrap: wrap;
-      justify-content: center;
-    }
-
-    .orb-wrap {
-      display: flex;
-      flex-direction: column;
       align-items: center;
-      gap: 0.55rem;
+      gap: 0.75rem;
+      padding: 0.7rem 0.55rem;
+      border-radius: var(--radius-sm);
+      transition: background 0.2s ease;
     }
 
-    .orb {
-      width: 56px;
-      height: 56px;
+    .pipeline-row:hover {
+      background: rgba(148, 163, 184, 0.05);
+    }
+
+    .pipeline-dot {
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
-      background:
-        radial-gradient(circle at 35% 30%, rgba(255, 255, 255, 0.45), transparent 35%),
-        radial-gradient(circle at 50% 50%, var(--cyan), rgba(0, 80, 120, 0.4));
-      /* static glow only — animation uses transform/opacity exclusively */
-      box-shadow:
-        0 0 20px rgba(0, 229, 255, 0.55),
-        0 0 50px rgba(0, 229, 255, 0.2),
-        inset 0 0 20px rgba(255, 255, 255, 0.15);
-      animation: orb-breathe 3.2s ease-in-out infinite;
-      position: relative;
-      transform: translate3d(0, 0, 0);
-      will-change: transform, opacity;
-      backface-visibility: hidden;
+      background: var(--mint);
+      flex-shrink: 0;
     }
 
-    .orb::after {
-      content: "";
-      position: absolute;
-      inset: -6px;
-      border-radius: 50%;
-      border: 1px solid rgba(0, 229, 255, 0.25);
-      animation: orb-ring 3.2s ease-in-out infinite;
-      transform: translate3d(0, 0, 0);
-      will-change: transform, opacity;
-      pointer-events: none;
+    .pipeline-dot.sync { background: var(--mint); }
+    .pipeline-dot.idle { background: var(--muted-dim); }
+    .pipeline-dot.warn { background: var(--amber); }
+
+    .pipeline-name {
+      font-size: 0.875rem;
+      font-weight: 500;
+      color: var(--text-secondary);
+      flex: 1;
+      min-width: 0;
     }
 
-    .orb-wrap:nth-child(2) .orb { animation-delay: 0.4s; }
-    .orb-wrap:nth-child(2) .orb::after { animation-delay: 0.4s; }
-    .orb-wrap:nth-child(3) .orb { animation-delay: 0.8s; }
-    .orb-wrap:nth-child(3) .orb::after { animation-delay: 0.8s; }
-    .orb-wrap:nth-child(4) .orb { animation-delay: 1.2s; }
-    .orb-wrap:nth-child(4) .orb::after { animation-delay: 1.2s; }
-
-    .orb-label {
-      font-size: 0.58rem;
-      letter-spacing: 0.18em;
-      text-transform: uppercase;
+    .pipeline-status {
+      font-size: 0.72rem;
       color: var(--muted);
-      text-align: center;
+      font-weight: 400;
+      letter-spacing: 0.01em;
     }
 
-    @keyframes orb-breathe {
-      0%, 100% { transform: translate3d(0, 0, 0) scale(1); opacity: 0.92; }
-      50% { transform: translate3d(0, 0, 0) scale(1.08); opacity: 1; }
-    }
-
-    @keyframes orb-ring {
-      0%, 100% { opacity: 0.4; transform: translate3d(0, 0, 0) scale(1); }
-      50% { opacity: 0.9; transform: translate3d(0, 0, 0) scale(1.12); }
-    }
-
-    /* ── Graveyard ────────────────────────────────────── */
+    /* ── Veto Ledger ──────────────────────────────────── */
     .panel-graveyard {
-      background: var(--grave-glass);
-      border-color: rgba(255, 77, 106, 0.22);
       flex: 1;
       min-height: 180px;
-    }
-
-    .panel-graveyard::before {
-      background: linear-gradient(135deg, rgba(255, 77, 106, 0.08), transparent 45%);
+      border-color: rgba(253, 164, 175, 0.14);
     }
 
     .panel-graveyard .panel-label {
-      color: rgba(255, 150, 160, 0.75);
+      color: rgba(253, 164, 175, 0.75);
     }
 
     .panel-graveyard .panel-label::after {
-      background: linear-gradient(90deg, rgba(255, 77, 106, 0.35), transparent);
+      background: linear-gradient(90deg, rgba(253, 164, 175, 0.22), transparent);
     }
 
     .graveyard-list {
       display: flex;
       flex-direction: column;
       gap: 0.55rem;
-      position: relative;
-      z-index: 1;
       max-height: 280px;
       overflow-y: auto;
       scrollbar-width: thin;
-      scrollbar-color: rgba(255, 77, 106, 0.3) transparent;
+      scrollbar-color: rgba(253, 164, 175, 0.25) transparent;
     }
 
     .grave-card {
-      padding: 0.7rem 0.85rem;
-      border-radius: 10px;
-      background: rgba(0, 0, 0, 0.35);
-      border: 1px solid rgba(255, 77, 106, 0.15);
-      border-left: 3px solid var(--grave-red);
-      box-shadow: 0 0 18px rgba(255, 77, 106, 0.06);
+      padding: 0.75rem 0.9rem;
+      border-radius: var(--radius-sm);
+      background: rgba(15, 23, 42, 0.45);
+      border: 1px solid rgba(253, 164, 175, 0.12);
+      border-left: 3px solid var(--rose);
+      box-shadow: var(--shadow-sm);
+      animation: card-enter 0.5s var(--ease-out) both;
     }
 
     .grave-top {
@@ -317,42 +273,42 @@
     .grave-ticker {
       font-size: 0.9rem;
       font-weight: 600;
-      letter-spacing: 0.04em;
-      color: #ffb3bc;
-      text-shadow: 0 0 12px rgba(255, 77, 106, 0.35);
+      letter-spacing: 0.02em;
+      color: var(--rose);
     }
 
     .grave-flag {
-      font-size: 0.55rem;
-      letter-spacing: 0.14em;
+      font-size: 0.58rem;
+      letter-spacing: 0.1em;
       text-transform: uppercase;
-      color: rgba(255, 120, 130, 0.8);
+      color: rgba(253, 164, 175, 0.7);
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-weight: 500;
     }
 
     .grave-reason {
-      font-size: 0.72rem;
-      line-height: 1.35;
-      color: rgba(230, 200, 205, 0.85);
+      font-size: 0.75rem;
+      line-height: 1.4;
+      color: rgba(241, 245, 249, 0.72);
     }
 
     .grave-meta {
-      margin-top: 0.3rem;
-      font-size: 0.55rem;
-      color: rgba(140, 100, 105, 0.9);
+      margin-top: 0.35rem;
+      font-size: 0.58rem;
+      color: var(--muted-dim);
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     }
 
     .grave-empty {
       text-align: center;
       padding: 1.5rem 0.75rem;
-      color: rgba(160, 110, 120, 0.7);
-      font-size: 0.75rem;
-      border: 1px dashed rgba(255, 77, 106, 0.18);
-      border-radius: 10px;
+      color: var(--muted-dim);
+      font-size: 0.78rem;
+      border: 1px dashed rgba(253, 164, 175, 0.16);
+      border-radius: var(--radius-sm);
     }
 
-    /* ── Center: The Cortex ───────────────────────────── */
+    /* ── Center: Execution Engine ─────────────────────── */
     .cortex-stage {
       display: flex;
       flex-direction: column;
@@ -363,258 +319,223 @@
     }
 
     .cortex {
-      width: 140px;
-      height: 140px;
+      width: 120px;
+      height: 120px;
       border-radius: 50%;
       position: relative;
       background:
-        radial-gradient(circle at 40% 35%, rgba(255, 255, 255, 0.35), transparent 40%),
-        radial-gradient(circle at 50% 50%, rgba(0, 229, 255, 0.9), rgba(0, 40, 60, 0.85) 70%);
+        radial-gradient(circle at 38% 32%, rgba(255, 255, 255, 0.12), transparent 42%),
+        radial-gradient(circle at 50% 50%, #334155 0%, #1e293b 70%, #0f172a 100%);
+      border: 1px solid rgba(148, 163, 184, 0.22);
       box-shadow:
-        0 0 40px rgba(0, 229, 255, 0.55),
-        0 0 90px rgba(0, 229, 255, 0.25),
-        inset 0 0 30px rgba(255, 255, 255, 0.12);
+        var(--shadow-md),
+        0 0 0 1px rgba(255, 255, 255, 0.03) inset;
       z-index: 2;
-      transform: translate3d(0, 0, 0);
-      will-change: transform, opacity;
-      backface-visibility: hidden;
       overflow: visible;
     }
 
-    /* Flash overlays: static colors; only opacity/scale animate (GPU compositing) */
-    .cortex::before,
+    /* Soft halo — idle breath */
+    .cortex::before {
+      content: "";
+      position: absolute;
+      inset: -14px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(125, 211, 252, 0.1) 0%, transparent 68%);
+      opacity: 0.65;
+      pointer-events: none;
+      animation: halo-breathe 3.6s ease-in-out infinite;
+      z-index: -1;
+    }
+
+    /* Processing halo overlay (execute / close) */
     .cortex::after {
       content: "";
       position: absolute;
-      inset: -18%;
+      inset: -22px;
       border-radius: 50%;
       opacity: 0;
       pointer-events: none;
-      transform: translate3d(0, 0, 0) scale(0.9);
-      will-change: transform, opacity;
+      z-index: -1;
+      background: radial-gradient(circle, rgba(110, 231, 183, 0.22) 0%, transparent 70%);
     }
 
-    .cortex::before {
-      background: radial-gradient(circle at 50% 50%, rgba(57, 255, 20, 0.95), rgba(57, 255, 20, 0.2) 45%, transparent 70%);
-    }
-
-    .cortex::after {
-      background: radial-gradient(circle at 50% 50%, rgba(255, 215, 0, 0.95), rgba(255, 215, 0, 0.2) 45%, transparent 70%);
-    }
-
-    .cortex.flash-execute::before {
-      animation: flash-pulse 0.9s ease-out forwards;
+    .cortex.flash-execute::after {
+      background: radial-gradient(circle, rgba(110, 231, 183, 0.28) 0%, transparent 70%);
+      animation: halo-process 1.4s var(--ease-out) forwards;
     }
 
     .cortex.flash-close::after {
-      animation: flash-pulse 0.9s ease-out forwards;
+      background: radial-gradient(circle, rgba(252, 211, 77, 0.22) 0%, transparent 70%);
+      animation: halo-process 1.4s var(--ease-out) forwards;
     }
 
     .cortex.flash-execute,
     .cortex.flash-close {
-      animation: cortex-kick 0.9s ease-out;
+      animation: engine-soft 1.4s var(--ease-out);
     }
 
     .cortex-ring {
       position: absolute;
       border-radius: 50%;
-      border: 1px solid rgba(0, 229, 255, 0.2);
+      border: 1px solid rgba(148, 163, 184, 0.1);
       pointer-events: none;
-      transform: translate3d(0, 0, 0);
-      will-change: transform;
-      backface-visibility: hidden;
     }
 
     .cortex-ring.r1 {
-      width: 180px;
-      height: 180px;
-      animation: spin 12s linear infinite;
-      border-style: dashed;
+      width: 160px;
+      height: 160px;
+      border-style: solid;
+      border-color: rgba(148, 163, 184, 0.12);
     }
 
     .cortex-ring.r2 {
-      width: 230px;
-      height: 230px;
-      animation: spin 20s linear infinite reverse;
-      border-color: rgba(0, 229, 255, 0.12);
+      width: 200px;
+      height: 200px;
+      border-color: rgba(148, 163, 184, 0.07);
     }
 
     .cortex-core-label {
-      margin-top: 2.5rem;
-      font-size: 0.75rem;
-      letter-spacing: 0.3em;
+      margin-top: 2.25rem;
+      font-size: 0.78rem;
+      letter-spacing: 0.16em;
       text-transform: uppercase;
-      color: var(--cyan);
-      text-shadow: 0 0 12px var(--cyan-dim);
+      color: var(--silver);
+      font-weight: 600;
       z-index: 2;
     }
 
     .cortex-sub {
       margin-top: 0.4rem;
-      font-size: 0.65rem;
+      font-size: 0.72rem;
       color: var(--muted);
-      letter-spacing: 0.12em;
+      letter-spacing: 0.02em;
       z-index: 2;
     }
 
-    @keyframes spin {
-      from { transform: translate3d(0, 0, 0) rotate(0deg); }
-      to { transform: translate3d(0, 0, 0) rotate(360deg); }
+    @keyframes halo-breathe {
+      0%, 100% { opacity: 0.45; transform: scale(1); }
+      50% { opacity: 0.85; transform: scale(1.04); }
     }
 
-    @keyframes flash-pulse {
-      0% { opacity: 1; transform: translate3d(0, 0, 0) scale(1.2); }
-      100% { opacity: 0; transform: translate3d(0, 0, 0) scale(0.85); }
+    @keyframes halo-process {
+      0% { opacity: 0; transform: scale(0.92); }
+      25% { opacity: 1; transform: scale(1.05); }
+      100% { opacity: 0; transform: scale(1.12); }
     }
 
-    @keyframes cortex-kick {
-      0% { transform: translate3d(0, 0, 0) scale(1.08); opacity: 1; }
-      100% { transform: translate3d(0, 0, 0) scale(1); opacity: 1; }
-    }
-
-    #beam-layer {
-      position: fixed;
-      inset: 0;
-      width: 100%;
-      height: 100%;
-      pointer-events: none;
-      z-index: 50;
-      overflow: visible;
-    }
-
-    #beam-path {
-      fill: none;
-      stroke: url(#beam-grad);
-      stroke-width: 2.5;
-      stroke-linecap: round;
-      /* static filter — not animated */
-      filter: drop-shadow(0 0 6px #00E5FF) drop-shadow(0 0 14px #39FF14);
-      stroke-dasharray: 8 6;
-      opacity: 0;
-      /* SVG transform box for compositable scale if needed */
-      transform-box: fill-box;
-      transform-origin: center;
-      will-change: opacity;
-    }
-
-    #beam-path.shoot {
-      animation: beam-shoot 0.55s ease-out forwards;
-    }
-
-    /* No stroke-dashoffset (paint thrash) — opacity-only beam flash */
-    @keyframes beam-shoot {
-      0% { opacity: 0; }
-      18% { opacity: 1; }
-      72% { opacity: 1; }
-      100% { opacity: 0; }
+    @keyframes engine-soft {
+      0% { box-shadow: var(--shadow-md), 0 0 0 0 rgba(110, 231, 183, 0); }
+      30% {
+        box-shadow:
+          var(--shadow-md),
+          0 0 28px 4px rgba(110, 231, 183, 0.14),
+          0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+      }
+      100% { box-shadow: var(--shadow-md), 0 0 0 1px rgba(255, 255, 255, 0.03) inset; }
     }
 
     /* ── Right: The Ledger ────────────────────────────── */
     .portfolio-value {
-      font-size: clamp(2rem, 4vw, 2.75rem);
+      font-size: clamp(2rem, 4vw, 2.65rem);
       font-weight: 300;
-      letter-spacing: -0.02em;
+      letter-spacing: -0.03em;
       line-height: 1.1;
       font-variant-numeric: tabular-nums;
-      text-shadow: 0 0 30px rgba(0, 229, 255, 0.25);
+      color: var(--text);
       position: relative;
-      z-index: 1;
     }
 
     .metric-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 0.75rem;
-      margin: 1.25rem 0 1.5rem;
-      position: relative;
-      z-index: 1;
+      margin: 1.2rem 0 1.4rem;
     }
 
     .metric {
-      padding: 0.75rem 0.9rem;
-      border-radius: 12px;
-      background: rgba(0, 0, 0, 0.35);
-      border: 1px solid rgba(0, 229, 255, 0.08);
+      padding: 0.8rem 0.95rem;
+      border-radius: var(--radius-sm);
+      background: rgba(15, 23, 42, 0.4);
+      border: 1px solid var(--border-soft);
+      box-shadow: var(--shadow-sm);
     }
 
     .metric-label {
-      font-size: 0.55rem;
-      letter-spacing: 0.2em;
+      font-size: 0.58rem;
+      letter-spacing: 0.12em;
       text-transform: uppercase;
       color: var(--muted);
-      margin-bottom: 0.3rem;
+      margin-bottom: 0.35rem;
+      font-weight: 500;
     }
 
     .metric-value {
       font-size: 1.05rem;
       font-variant-numeric: tabular-nums;
       font-weight: 500;
+      color: var(--text-secondary);
     }
 
-    .metric-value.pos { color: var(--green); }
-    .metric-value.neg { color: #ff4d6a; }
+    .metric-value.pos { color: var(--mint); }
+    .metric-value.neg { color: var(--rose); }
 
     .feed-header {
-      font-size: 0.6rem;
-      letter-spacing: 0.22em;
+      font-size: 0.62rem;
+      letter-spacing: 0.12em;
       text-transform: uppercase;
       color: var(--muted);
       margin-bottom: 0.75rem;
-      position: relative;
-      z-index: 1;
+      font-weight: 600;
     }
 
     .trade-feed {
       display: flex;
       flex-direction: column;
-      gap: 0.6rem;
+      gap: 0.55rem;
       max-height: 340px;
       overflow-y: auto;
-      padding-right: 0.25rem;
+      padding-right: 0.2rem;
       scrollbar-width: thin;
-      scrollbar-color: rgba(0, 229, 255, 0.25) transparent;
-      position: relative;
-      z-index: 1;
+      scrollbar-color: rgba(148, 163, 184, 0.25) transparent;
     }
 
     .trade-card {
       padding: 0.85rem 1rem;
-      border-radius: 12px;
-      background: rgba(0, 0, 0, 0.4);
-      border: 1px solid rgba(0, 229, 255, 0.1);
-      border-left: 3px solid var(--cyan);
-      animation: slide-in 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
-      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3); /* static */
-      transform: translate3d(0, 0, 0);
-      will-change: transform, opacity;
-      backface-visibility: hidden;
+      border-radius: var(--radius-sm);
+      background: rgba(15, 23, 42, 0.45);
+      border: 1px solid var(--border-soft);
+      border-left: 3px solid var(--accent-blue);
+      box-shadow: var(--shadow-sm);
+      animation: card-enter 0.55s var(--ease-out) both;
     }
 
-    .trade-card.close { border-left-color: var(--gold); }
-    .trade-card.execute { border-left-color: var(--green); }
+    .trade-card.close { border-left-color: var(--amber); }
+    .trade-card.execute { border-left-color: var(--mint); }
 
     .trade-type {
-      font-size: 0.55rem;
-      letter-spacing: 0.2em;
+      font-size: 0.58rem;
+      letter-spacing: 0.12em;
       text-transform: uppercase;
       color: var(--muted);
       margin-bottom: 0.25rem;
+      font-weight: 600;
     }
 
-    .trade-card.execute .trade-type { color: var(--green); }
-    .trade-card.close .trade-type { color: var(--gold); }
+    .trade-card.execute .trade-type { color: var(--mint); }
+    .trade-card.close .trade-type { color: var(--amber); }
 
     .trade-msg {
-      font-size: 0.85rem;
+      font-size: 0.875rem;
       font-weight: 500;
-      letter-spacing: 0.02em;
-      line-height: 1.35;
+      letter-spacing: -0.01em;
+      line-height: 1.4;
+      color: var(--text-secondary);
     }
 
     .trade-time {
-      font-size: 0.6rem;
-      color: var(--muted);
-      margin-top: 0.35rem;
+      font-size: 0.62rem;
+      color: var(--muted-dim);
+      margin-top: 0.4rem;
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     }
 
@@ -623,25 +544,23 @@
       margin-top: 0.45rem;
       padding: 0.2rem 0.5rem;
       border-radius: 999px;
-      font-size: 0.6rem;
+      font-size: 0.62rem;
       font-weight: 600;
-      letter-spacing: 0.04em;
+      letter-spacing: 0.02em;
       font-variant-numeric: tabular-nums;
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     }
 
     .slippage-badge.bad {
-      color: #ff8a9a;
-      background: rgba(255, 77, 106, 0.12);
-      border: 1px solid rgba(255, 77, 106, 0.35);
-      box-shadow: 0 0 12px rgba(255, 77, 106, 0.15);
+      color: var(--rose);
+      background: var(--rose-soft);
+      border: 1px solid var(--rose-border);
     }
 
     .slippage-badge.good {
-      color: #7dff9a;
-      background: rgba(57, 255, 20, 0.1);
-      border: 1px solid rgba(57, 255, 20, 0.35);
-      box-shadow: 0 0 12px rgba(57, 255, 20, 0.12);
+      color: var(--mint);
+      background: var(--mint-soft);
+      border: 1px solid var(--mint-border);
     }
 
     .feed-empty {
@@ -649,16 +568,23 @@
       padding: 2rem 1rem;
       color: var(--muted);
       font-size: 0.8rem;
-      border: 1px dashed rgba(0, 229, 255, 0.12);
-      border-radius: 12px;
+      border: 1px dashed var(--border);
+      border-radius: var(--radius-sm);
     }
 
-    @keyframes slide-in {
-      from { opacity: 0; transform: translate3d(40px, 0, 0); }
-      to { opacity: 1; transform: translate3d(0, 0, 0); }
+    /* Apple-style: slide up + soft fade */
+    @keyframes card-enter {
+      from {
+        opacity: 0;
+        transform: translate3d(0, 12px, 0);
+      }
+      to {
+        opacity: 1;
+        transform: translate3d(0, 0, 0);
+      }
     }
 
-    /* ── Telemetry footer ─────────────────────────────── */
+    /* ── System footer ────────────────────────────────── */
     .sys-footer {
       position: fixed;
       left: 0;
@@ -671,12 +597,12 @@
       justify-content: center;
       gap: 0.75rem;
       padding: 0 4.5rem 0 1rem;
-      background: rgba(8, 8, 10, 0.88);
-      border-top: 1px solid rgba(0, 229, 255, 0.1);
-      backdrop-filter: blur(14px);
-      -webkit-backdrop-filter: blur(14px);
+      background: rgba(15, 23, 42, 0.92);
+      border-top: 1px solid var(--border);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
       font-size: 0.65rem;
-      letter-spacing: 0.08em;
+      letter-spacing: 0.04em;
       color: var(--muted);
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       flex-wrap: wrap;
@@ -690,31 +616,28 @@
     }
 
     .sys-indicator .glow {
-      color: var(--cyan);
-      text-shadow: 0 0 10px var(--cyan-dim);
+      color: var(--accent-blue);
+      font-weight: 500;
     }
 
     .sys-dot {
-      width: 7px;
-      height: 7px;
+      width: 6px;
+      height: 6px;
       border-radius: 50%;
-      background: var(--green);
-      box-shadow: 0 0 8px var(--green);
+      background: var(--mint);
       flex-shrink: 0;
     }
 
     .sys-dot.warn {
-      background: var(--gold);
-      box-shadow: 0 0 8px var(--gold);
+      background: var(--amber);
     }
 
     .sys-dot.bad {
-      background: var(--grave-red);
-      box-shadow: 0 0 8px var(--grave-red);
+      background: var(--rose);
     }
 
     .sys-sep {
-      color: rgba(107, 122, 143, 0.4);
+      color: rgba(100, 116, 139, 0.5);
       user-select: none;
     }
 
@@ -724,118 +647,111 @@
       right: 1.25rem;
       bottom: calc(var(--footer-h) + 0.75rem);
       z-index: 60;
-      width: 56px;
-      height: 56px;
+      width: 52px;
+      height: 52px;
       border-radius: 50%;
       background: var(--discord);
       display: flex;
       align-items: center;
       justify-content: center;
-      box-shadow:
-        0 0 20px rgba(88, 101, 242, 0.55),
-        0 8px 24px rgba(0, 0, 0, 0.45);
-      transition: transform 0.2s ease; /* transform only — GPU */
+      box-shadow: var(--shadow-lg);
+      transition: transform 0.2s var(--ease-out), box-shadow 0.2s ease;
       text-decoration: none;
-      transform: translate3d(0, 0, 0);
-      will-change: transform;
-      backface-visibility: hidden;
     }
 
     .discord-fab:hover {
-      transform: translate3d(0, 0, 0) scale(1.08);
+      transform: scale(1.05);
+      box-shadow: 0 14px 36px rgba(88, 101, 242, 0.28), var(--shadow-md);
     }
 
     .discord-fab.pulse-hit {
-      animation: discord-hit 0.5s ease-out;
+      animation: discord-soft 0.55s var(--ease-out);
     }
 
-    @keyframes discord-hit {
-      0% { transform: translate3d(0, 0, 0) scale(1.15); opacity: 1; }
-      100% { transform: translate3d(0, 0, 0) scale(1); opacity: 1; }
+    @keyframes discord-soft {
+      0% { transform: scale(1.06); }
+      100% { transform: scale(1); }
     }
 
     .discord-fab svg {
-      width: 28px;
-      height: 28px;
+      width: 26px;
+      height: 26px;
       fill: #fff;
     }
 
     .sse-status {
-      font-size: 0.6rem;
-      letter-spacing: 0.1em;
-      color: var(--muted);
+      font-size: 0.62rem;
+      letter-spacing: 0.04em;
+      color: var(--muted-dim);
       margin-top: 1rem;
-      font-family: ui-monospace, monospace;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .section-caption {
+      font-size: 0.6rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 0.4rem;
+      font-weight: 500;
     }
   </style>
 </head>
 <body>
-  <!-- Optical beam canvas -->
-  <svg id="beam-layer" aria-hidden="true">
-    <defs>
-      <linearGradient id="beam-grad" x1="0%" y1="0%" x2="100%" y2="100%">
-        <stop offset="0%" stop-color="#00E5FF" />
-        <stop offset="50%" stop-color="#39FF14" />
-        <stop offset="100%" stop-color="#5865F2" />
-      </linearGradient>
-    </defs>
-    <path id="beam-path" d="" />
-  </svg>
-
   <div class="hud">
     <div class="topbar">
-      <div class="brand">JARVIS <span>// Virtual Hedge Fund Command Center</span></div>
+      <div class="brand">JARVIS <span>· Virtual Hedge Fund</span></div>
       <div class="status-pill" id="status-pill">
         <span class="status-dot"></span>
         <span id="status-label">Stream Live</span>
       </div>
     </div>
 
-    <!-- LEFT column: Sensory Inputs + Graveyard -->
+    <!-- LEFT: Data Pipelines + Veto Ledger -->
     <div class="left-col">
       <section class="panel" id="panel-sensory">
-        <div class="panel-label">Sensory Inputs</div>
-        <div class="orbs">
-          <div class="orb-row">
-            <div class="orb-wrap">
-              <div class="orb" aria-hidden="true"></div>
-              <span class="orb-label">News</span>
-            </div>
-            <div class="orb-wrap">
-              <div class="orb" aria-hidden="true"></div>
-              <span class="orb-label">Gov Policy</span>
-            </div>
+        <div class="panel-label">Data Pipelines</div>
+        <div class="pipeline-list" role="list">
+          <div class="pipeline-row" role="listitem">
+            <span class="pipeline-dot sync" aria-hidden="true"></span>
+            <span class="pipeline-name">News</span>
+            <span class="pipeline-status">Synchronized</span>
           </div>
-          <div class="orb-row">
-            <div class="orb-wrap">
-              <div class="orb" aria-hidden="true"></div>
-              <span class="orb-label">China Macro</span>
-            </div>
-            <div class="orb-wrap">
-              <div class="orb" aria-hidden="true"></div>
-              <span class="orb-label">Earnings</span>
-            </div>
+          <div class="pipeline-row" role="listitem">
+            <span class="pipeline-dot sync" aria-hidden="true"></span>
+            <span class="pipeline-name">Gov Policy</span>
+            <span class="pipeline-status">Synchronized</span>
+          </div>
+          <div class="pipeline-row" role="listitem">
+            <span class="pipeline-dot sync" aria-hidden="true"></span>
+            <span class="pipeline-name">China Macro</span>
+            <span class="pipeline-status">Synchronized</span>
+          </div>
+          <div class="pipeline-row" role="listitem">
+            <span class="pipeline-dot sync" aria-hidden="true"></span>
+            <span class="pipeline-name">Earnings</span>
+            <span class="pipeline-status">Synchronized</span>
           </div>
         </div>
       </section>
 
       <section class="panel panel-graveyard" id="panel-graveyard">
-        <div class="panel-label">The Graveyard</div>
+        <div class="panel-label">Veto Ledger</div>
         <div class="graveyard-list" id="graveyard-list">
           <div class="grave-empty" id="grave-empty">No vetoes yet · clean slate</div>
         </div>
       </section>
     </div>
 
-    <!-- CENTER: The Cortex -->
+    <!-- CENTER: Execution Engine -->
     <section class="panel" id="panel-cortex">
-      <div class="panel-label">The Cortex</div>
+      <div class="panel-label">Execution Engine</div>
       <div class="cortex-stage">
-        <div class="cortex-ring r2"></div>
-        <div class="cortex-ring r1"></div>
-        <div class="cortex" id="cortex" title="Master Bot"></div>
+        <div class="cortex-ring r2" aria-hidden="true"></div>
+        <div class="cortex-ring r1" aria-hidden="true"></div>
+        <div class="cortex" id="cortex" title="Master Bot" role="img" aria-label="Execution engine"></div>
         <div class="cortex-core-label">Master Bot</div>
-        <div class="cortex-sub">Decision Core · Awaiting Signal</div>
+        <div class="cortex-sub">Decision core · awaiting signal</div>
         <p class="sse-status" id="sse-status">SSE: connecting…</p>
       </div>
     </section>
@@ -843,9 +759,7 @@
     <!-- RIGHT: The Ledger -->
     <section class="panel" id="panel-ledger">
       <div class="panel-label">The Ledger</div>
-      <p style="font-size:0.6rem;letter-spacing:0.2em;text-transform:uppercase;color:var(--muted);margin-bottom:0.35rem;position:relative;z-index:1;">
-        Portfolio Value
-      </p>
+      <p class="section-caption">Portfolio Value</p>
       <div class="portfolio-value" id="portfolio-value">$—</div>
 
       <div class="metric-grid">
@@ -868,7 +782,6 @@
     </section>
   </div>
 
-  <!-- System health footer -->
   <footer class="sys-footer" id="sys-footer" aria-label="System telemetry">
     <span class="sys-indicator">
       <span class="sys-dot" id="uptime-dot"></span>
@@ -886,7 +799,6 @@
     </span>
   </footer>
 
-  <!-- Floating Discord -->
   <a class="discord-fab" id="discord-fab"
      href="https://discord.com"
      target="_blank"
@@ -966,7 +878,7 @@
       }
     }
 
-    /* ── Graveyard (vetoes) ───────────────────────────── */
+    /* ── Veto Ledger ──────────────────────────────────── */
     async function refreshGraveyard() {
       const list = document.getElementById('graveyard-list');
       if (!list) return;
@@ -997,7 +909,7 @@
         }).join('');
       } catch (err) {
         console.error('Graveyard refresh failed', err);
-        list.innerHTML = '<div class="grave-empty">Graveyard offline · retrying…</div>';
+        list.innerHTML = '<div class="grave-empty">Veto ledger offline · retrying…</div>';
       }
     }
 
@@ -1048,7 +960,7 @@
       }
     }
 
-    /* ── Cortex / beam / ledger cards ─────────────────── */
+    /* ── Engine pulse + ledger cards ──────────────────── */
     function flashCortex(type) {
       const cortex = document.getElementById('cortex');
       if (!cortex) return;
@@ -1057,33 +969,16 @@
       cortex.classList.add(type === 'CLOSE' ? 'flash-close' : 'flash-execute');
       setTimeout(() => {
         cortex.classList.remove('flash-execute', 'flash-close');
-      }, 950);
+      }, 1450);
     }
 
-    function shootBeamToDiscord() {
-      const cortex = document.getElementById('cortex');
+    function notifyDiscordSoft() {
       const discord = document.getElementById('discord-fab');
-      const path = document.getElementById('beam-path');
-      if (!cortex || !discord || !path) return;
-
-      const c = cortex.getBoundingClientRect();
-      const d = discord.getBoundingClientRect();
-      const x1 = c.left + c.width / 2;
-      const y1 = c.top + c.height / 2;
-      const x2 = d.left + d.width / 2;
-      const y2 = d.top + d.height / 2;
-
-      const mx = (x1 + x2) / 2;
-      const my = Math.max(y1, y2) + 40;
-      path.setAttribute('d', `M ${x1} ${y1} Q ${mx} ${my} ${x2} ${y2}`);
-      path.classList.remove('shoot');
-      void path.getBoundingClientRect();
-      path.classList.add('shoot');
-
-      setTimeout(() => {
-        discord.classList.add('pulse-hit');
-        setTimeout(() => discord.classList.remove('pulse-hit'), 500);
-      }, 350);
+      if (!discord) return;
+      discord.classList.remove('pulse-hit');
+      void discord.offsetWidth;
+      discord.classList.add('pulse-hit');
+      setTimeout(() => discord.classList.remove('pulse-hit'), 550);
     }
 
     function slippageBadgeHtml(slippage) {
@@ -1123,15 +1018,16 @@
       if (event.type !== 'EXECUTE' && event.type !== 'CLOSE') return;
 
       flashCortex(event.type);
-      shootBeamToDiscord();
+      notifyDiscordSoft();
 
+      // Gentle delay so engine halo leads the card entrance
       setTimeout(() => {
         pushTradeCard(event);
         refreshPortfolio();
-      }, 300);
+      }, 180);
     }
 
-    /* ── SSE: single connection, backoff reconnect, no sleep zombies ── */
+    /* ── SSE: single connection, backoff reconnect ────── */
     let eventSource = null;
     let sseReconnectTimer = null;
     let sseBackoffMs = 1000;
@@ -1156,7 +1052,7 @@
 
     function scheduleSSEReconnect() {
       if (pageUnloading || document.hidden) return;
-      if (sseReconnectTimer) return; // one pending reconnect only
+      if (sseReconnectTimer) return;
       const delay = sseBackoffMs;
       sseBackoffMs = Math.min(sseBackoffMs * 1.6, SSE_BACKOFF_MAX);
       sseReconnectTimer = setTimeout(() => {
@@ -1168,7 +1064,6 @@
     function connectSSE() {
       if (pageUnloading || document.hidden) return;
 
-      // Tear down any prior socket so sleep/wake cannot stack zombies
       closeSSE();
 
       const statusEl = document.getElementById('sse-status');
@@ -1184,7 +1079,7 @@
       eventSource = es;
 
       es.onopen = () => {
-        sseBackoffMs = 1000; // reset backoff on healthy open
+        sseBackoffMs = 1000;
         if (statusEl) statusEl.textContent = 'SSE: connected';
         if (labelEl) labelEl.textContent = 'Stream Live';
       };
@@ -1201,8 +1096,6 @@
       es.onerror = () => {
         if (statusEl) statusEl.textContent = 'SSE: reconnecting…';
         if (labelEl) labelEl.textContent = 'Reconnecting';
-        // Explicit close disables browser auto-reconnect (avoids stacked sockets
-        // after laptop sleep). We own reconnect with exponential backoff.
         try {
           es.onopen = null;
           es.onmessage = null;
@@ -1216,7 +1109,6 @@
       return es;
     }
 
-    // Suspend stream while tab is backgrounded; resume on foreground
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
         closeSSE();
@@ -1238,7 +1130,6 @@
       closeSSE();
     });
 
-    // Boot: portfolio + graveyard + telemetry; live trades via SSE
     refreshPortfolio();
     refreshGraveyard();
     refreshTelemetry();
