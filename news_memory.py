@@ -2,15 +2,19 @@ import sqlite3
 import os
 from datetime import datetime
 
-# Centralized DB File Path
-DB_PATH = "data/news_room.db"
+import config
+
+# Shared with master_bot / pre_market / tracker — never hardcode a second path
+DB_PATH = config.NEWS_DB_PATH
 
 def init_db():
     """
     Initializes the SQLite database and creates the headlines table 
     with a UNIQUE constraint to automatically prevent duplicate headlines.
     """
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    parent = os.path.dirname(DB_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         # Enable Write-Ahead Logging (WAL) for concurrency
         conn.execute('PRAGMA journal_mode=WAL;')

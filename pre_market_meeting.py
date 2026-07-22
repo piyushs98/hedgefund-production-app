@@ -24,12 +24,19 @@ NEWS_DB_PATH = _DEFAULT_DB or os.path.join(_SCRIPT_DIR, "data", "news_room.db")
 # Cap overnight context so the model is not overloaded (token / request limits).
 MAX_OVERNIGHT_CHARS = 24000
 MAX_HEADLINE_ROWS = 120
+MAX_INNOVATION_ROWS = 80
+
+
+def _sanitize_db_text(value) -> str:
+    """Strip control chars for prompt-safe database text."""
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(value or "")).strip()
 
 
 def get_overnight_data(hours_ago=15):
     """
-    Helper to query the headlines database for news and futures data
-    collected over the last N hours (overnight).
+    Query overnight headlines (news/futures) AND innovation_data (China macro,
+    gov policy, earnings scrapes) from the last N hours. Returns a single
+    labeled context string for DeepSeek / fallback briefings.
     """
     db_path = NEWS_DB_PATH
     if not os.path.exists(db_path):
@@ -39,6 +46,8 @@ def get_overnight_data(hours_ago=15):
     cursor = conn.cursor()
 
     time_offset = f"-{hours_ago} hours"
+    headline_rows = []
+    innovation_rows = []
 
     try:
         cursor.execute("""
@@ -48,31 +57,75 @@ def get_overnight_data(hours_ago=15):
         ORDER BY timestamp DESC
         LIMIT ?
         """, (time_offset, MAX_HEADLINE_ROWS))
-        rows = cursor.fetchall()
+        headline_rows = cursor.fetchall()
     except sqlite3.Error as e:
-        print(f"[Chief of Staff] SQLite error reading overnight data: {type(e).__name__}: {e}")
+        print(
+            f"[Chief of Staff] SQLite error reading overnight headlines: "
+            f"{type(e).__name__}: {e}"
+        )
         traceback.print_exc()
-        rows = []
+
+    try:
+        cursor.execute("""
+        SELECT timestamp, ticker, source_tag, content
+        FROM innovation_data
+        WHERE timestamp >= datetime('now', ?)
+        ORDER BY timestamp DESC
+        LIMIT ?
+        """, (time_offset, MAX_INNOVATION_ROWS))
+        innovation_rows = cursor.fetchall()
+    except sqlite3.Error as e:
+        print(
+            f"[Chief of Staff] SQLite error reading overnight innovation_data: "
+            f"{type(e).__name__}: {e}"
+        )
+        traceback.print_exc()
     finally:
         conn.close()
 
-    if not rows:
-        return "No news headlines or futures data were collected overnight."
+    # --- Headlines / futures section ---
+    if headline_rows:
+        headline_entries = []
+        for row in headline_rows:
+            timestamp, ticker, sector, publisher, title = row
+            title_clean = _sanitize_db_text(title)
+            ticker_clean = _sanitize_db_text(ticker) or "N/A"
+            sector_clean = _sanitize_db_text(sector) or "N/A"
+            publisher_clean = _sanitize_db_text(publisher) or "N/A"
+            ts_clean = _sanitize_db_text(timestamp)
+            headline_entries.append(
+                f"[{ts_clean}] [{ticker_clean}] ({sector_clean}) "
+                f"{title_clean} ({publisher_clean})"
+            )
+        headlines_text = "\n".join(headline_entries)
+    else:
+        headlines_text = "No news headlines or futures data were collected overnight."
 
-    entries = []
-    for row in rows:
-        timestamp, ticker, sector, publisher, title = row
-        # Sanitize for prompt safety (strip control chars, normalize whitespace)
-        title_clean = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(title or "")).strip()
-        ticker_clean = str(ticker or "N/A").strip()
-        sector_clean = str(sector or "N/A").strip()
-        publisher_clean = str(publisher or "N/A").strip()
-        ts_clean = str(timestamp or "").strip()
-        entries.append(
-            f"[{ts_clean}] [{ticker_clean}] ({sector_clean}) {title_clean} ({publisher_clean})"
+    # --- Innovation hub: China macro / gov policy / earnings ---
+    if innovation_rows:
+        innovation_entries = []
+        for row in innovation_rows:
+            timestamp, ticker, source_tag, content = row
+            ts_clean = _sanitize_db_text(timestamp)
+            ticker_clean = _sanitize_db_text(ticker) or "N/A"
+            tag_clean = _sanitize_db_text(source_tag) or "UNKNOWN"
+            content_clean = _sanitize_db_text(content)
+            innovation_entries.append(
+                f"[{ts_clean}] [{ticker_clean}] [{tag_clean}] {content_clean}"
+            )
+        innovation_text = "\n".join(innovation_entries)
+    else:
+        innovation_text = (
+            "No China macro, government policy, or earnings innovation rows "
+            "were collected overnight."
         )
 
-    text = "\n".join(entries)
+    text = (
+        "=== OVERNIGHT HEADLINES & FUTURES ===\n"
+        f"{headlines_text}\n\n"
+        "=== INNOVATION HUB (CHINA MACRO / GOV POLICY / EARNINGS) ===\n"
+        f"{innovation_text}"
+    )
     if len(text) > MAX_OVERNIGHT_CHARS:
         text = text[:MAX_OVERNIGHT_CHARS] + "\n...[truncated for model context limit]"
     return text
@@ -201,6 +254,9 @@ def _extract_deepseek_text(payload: dict) -> str:
 def _call_deepseek(api_key: str, overnight_context: str) -> str:
     """
     Call DeepSeek chat completions and return briefing text, or raise on hard failure.
+
+    `overnight_context` includes both headlines/futures and innovation_data
+    (China macro, gov policy, earnings) from get_overnight_data().
     """
     system_instruction = (
         "You are the Chief of Staff (CoS) of a quantitative hedge fund. "
@@ -211,8 +267,10 @@ def _call_deepseek(api_key: str, overnight_context: str) -> str:
     )
 
     user_prompt = (
-        "Analyze the overnight news headlines and pre-market futures data "
-        "collected in the database.\n\n"
+        "Analyze the overnight news headlines, pre-market futures data, AND the "
+        "Innovation Hub rows (China Macro scrapes tagged CHINA_MACRO, Government "
+        "Policy scrapes tagged GOV_POLICY, and EARNINGS calendar notes) collected "
+        "in the database.\n\n"
         "Overnight Database Context:\n"
         f"{overnight_context}\n\n"
         "Your Task:\n"
@@ -228,10 +286,16 @@ def _call_deepseek(api_key: str, overnight_context: str) -> str:
         "4. **Top 3 Critical News Alerts**: Select the 3 most important news "
         "headlines impacting our portfolio tickers (SPY, QQQ, IWM, AAPL, MSFT, "
         "NVDA, AMZN, META, GOOGL, TSLA). List them clearly.\n"
-        "5. **⚠️ Scheduled Macro / Liquidity Risk Windows**: Critically analyze "
-        "the provided news/headlines and highlight ANY upcoming economic data "
-        "releases (CPI, PPI, NFP, GDP, jobless claims, retail sales, etc.), Fed "
-        "speeches / FOMC speakers, central bank decisions, or other macro events. "
+        "5. **🌏 Critical Macro / Policy Shifts (Innovation Hub)**: Highlight ANY "
+        "material China supply-chain, hardware, tariff, or government-policy "
+        "signals from the INNOVATION HUB section (source tags CHINA_MACRO, "
+        "GOV_POLICY, EARNINGS). Call out ticker-level impact for our book. "
+        "If the Innovation Hub has no actionable rows, say so explicitly.\n"
+        "6. **⚠️ Scheduled Macro / Liquidity Risk Windows**: Critically analyze "
+        "the provided news/headlines AND innovation rows and highlight ANY "
+        "upcoming economic data releases (CPI, PPI, NFP, GDP, jobless claims, "
+        "retail sales, etc.), Fed speeches / FOMC speakers, central bank "
+        "decisions, earnings windows, or other macro events. "
         "For each event, extract the EXACT TIMINGS (e.g., 8:30 AM EST, 10:00 AM EST). "
         "If a time is stated without a timezone, assume US Eastern and label it EST. "
         "If no timed macro events are found, explicitly say so. Frame each window "
@@ -240,12 +304,18 @@ def _call_deepseek(api_key: str, overnight_context: str) -> str:
         "Keep the entire briefing concise, structured, and under 5 sentences per "
         "section so it is quickly readable on a phone.\n"
         "Do NOT invent futures percentages that are not in the database context.\n"
-        "Do NOT invent event times that are not supported by the headlines; if "
+        "Do NOT invent China/gov/earnings events that are not in the Innovation Hub "
+        "or headline sections.\n"
+        "Do NOT invent event times that are not supported by the data; if "
         "timing is ambiguous, say so clearly.\n"
     )
 
+    # Strict Bearer formatting: strip key and never double-prefix "Bearer "
+    key = (api_key or "").strip()
+    if key.lower().startswith("bearer "):
+        key = key[7:].strip()
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
     body = {
@@ -268,9 +338,12 @@ def _call_deepseek(api_key: str, overnight_context: str) -> str:
     if not response.ok:
         # Include a short body snippet for diagnosis without dumping secrets
         snippet = (response.text or "")[:500]
-        raise RuntimeError(
+        err = RuntimeError(
             f"DeepSeek HTTP {response.status_code}: {snippet}"
         )
+        # Attach status for verbose except logging in generate_morning_briefing
+        err.http_status = response.status_code  # type: ignore[attr-defined]
+        raise err
 
     payload = response.json()
     return _extract_deepseek_text(payload)
@@ -323,11 +396,18 @@ def generate_morning_briefing(api_key=None):
                     f"[Chief of Staff] DeepSeek briefing OK ({len(briefing_text)} chars)."
                 )
         except Exception as e:
-            # Never fail silently — log type, message, and full traceback
-            print(
-                f"[Chief of Staff] Warning: DeepSeek API call failed: "
-                f"{type(e).__name__}: {e}"
+            # Verbose production diagnostics: full traceback + HTTP status when present
+            http_status = getattr(e, "http_status", None)
+            if http_status is None:
+                resp = getattr(e, "response", None)
+                if resp is not None:
+                    http_status = getattr(resp, "status_code", None)
+            status_suffix = (
+                f" | HTTP status code: {http_status}"
+                if http_status is not None
+                else ""
             )
+            print(f"[Pre-Market] DeepSeek Call Failed: {e}{status_suffix}")
             traceback.print_exc()
             print(
                 "[Chief of Staff] Generating live data-driven briefing from overnight "
