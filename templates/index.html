@@ -39,8 +39,6 @@
       --amber: #d97706;          /* amber-600 */
       --amber-soft: rgba(217, 119, 6, 0.1);
       --amber-border: rgba(217, 119, 6, 0.22);
-      --discord: #5865F2;
-      --discord-soft: #6e7af5;
       --shadow-sm: 0 1px 2px rgba(41, 37, 36, 0.04), 0 1px 3px rgba(41, 37, 36, 0.03);
       --shadow-md: 0 4px 16px rgba(41, 37, 36, 0.06), 0 1px 4px rgba(41, 37, 36, 0.04);
       --shadow-lg: 0 12px 32px rgba(41, 37, 36, 0.08), 0 2px 8px rgba(41, 37, 36, 0.04);
@@ -316,7 +314,7 @@
       background: rgba(225, 29, 72, 0.02);
     }
 
-    /* ── Center: Execution Engine (Siri-style particle core) ── */
+    /* ── Center: Execution Engine (Robot Heartbeat) ───── */
     .cortex-stage {
       display: flex;
       flex-direction: column;
@@ -326,10 +324,10 @@
       position: relative;
     }
 
-    /* Outer stage for the orbital system */
+    /* Heartbeat field — clean, modern AI cardiac core */
     .cortex {
-      width: 200px;
-      height: 200px;
+      width: 280px;
+      height: 220px;
       position: relative;
       display: flex;
       align-items: center;
@@ -338,53 +336,163 @@
       transition: transform 0.4s var(--ease-out);
     }
 
-    /* Soft glowing central sphere */
-    .cortex-core {
-      width: 88px;
-      height: 88px;
-      border-radius: 50%;
+    .heartbeat-field {
       position: relative;
-      z-index: 3;
-      background:
-        radial-gradient(circle at 35% 28%, rgba(255, 255, 255, 0.7), transparent 48%),
-        radial-gradient(circle at 50% 55%, #3CB043 0%, #2ecc71 45%, #27ae60 100%);
-      box-shadow:
-        0 0 28px rgba(46, 204, 113, 0.35),
-        0 0 60px rgba(46, 204, 113, 0.18),
-        0 6px 24px rgba(39, 174, 96, 0.2),
-        inset 0 -6px 16px rgba(0, 0, 0, 0.06),
-        inset 0 4px 12px rgba(255, 255, 255, 0.35);
-      animation: core-breathe 3.6s ease-in-out infinite;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
 
-    /* Soft ambient halo behind the core */
+    /* Soft ambient glow well behind the core */
+    .heartbeat-field::before {
+      content: "";
+      position: absolute;
+      width: 160px;
+      height: 160px;
+      border-radius: 50%;
+      background: radial-gradient(
+        circle,
+        rgba(46, 204, 113, 0.18) 0%,
+        rgba(46, 204, 113, 0.06) 45%,
+        transparent 72%
+      );
+      filter: blur(8px);
+      pointer-events: none;
+      z-index: 0;
+      animation: ambient-glow 2.4s ease-in-out infinite;
+    }
+
+    /* Expanding translucent pulse rings */
+    .pulse-ring {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 72px;
+      height: 72px;
+      margin: -36px 0 0 -36px;
+      border-radius: 50%;
+      border: 1.5px solid rgba(46, 204, 113, 0.55);
+      box-shadow: 0 0 12px rgba(46, 204, 113, 0.15);
+      pointer-events: none;
+      z-index: 1;
+      opacity: 0;
+      animation: ring-expand 2.4s cubic-bezier(0.22, 0.8, 0.36, 1) infinite;
+    }
+
+    .pulse-ring.r2 {
+      animation-delay: 0.18s;
+      border-color: rgba(46, 204, 113, 0.4);
+    }
+
+    .pulse-ring.r3 {
+      animation-delay: 0.36s;
+      border-color: rgba(46, 204, 113, 0.28);
+    }
+
+    /* Central glowing core — mechanical double-pulse */
+    .cortex-core {
+      width: 72px;
+      height: 72px;
+      border-radius: 50%;
+      position: relative;
+      z-index: 4;
+      background:
+        radial-gradient(circle at 35% 28%, rgba(255, 255, 255, 0.75), transparent 48%),
+        radial-gradient(circle at 50% 55%, #3CB043 0%, #2ecc71 45%, #27ae60 100%);
+      box-shadow:
+        0 0 24px rgba(46, 204, 113, 0.4),
+        0 0 56px rgba(46, 204, 113, 0.2),
+        0 6px 20px rgba(39, 174, 96, 0.18),
+        inset 0 -5px 14px rgba(0, 0, 0, 0.06),
+        inset 0 4px 12px rgba(255, 255, 255, 0.35);
+      animation: robot-heartbeat 2.4s ease-in-out infinite;
+      will-change: transform, box-shadow;
+    }
+
+    /* Inner highlight node */
+    .cortex-core::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 14px;
+      height: 14px;
+      margin: -7px 0 0 -7px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 40% 35%, #fff 0%, rgba(255, 255, 255, 0.7) 40%, transparent 70%);
+      opacity: 0.85;
+      pointer-events: none;
+    }
+
+    /* Soft ambient halo on core */
     .cortex-core::before {
       content: "";
       position: absolute;
-      inset: -28px;
+      inset: -22px;
       border-radius: 50%;
-      background: radial-gradient(circle, rgba(46, 204, 113, 0.22) 0%, rgba(60, 176, 67, 0.08) 42%, transparent 70%);
-      filter: blur(6px);
-      opacity: 0.9;
+      background: radial-gradient(
+        circle,
+        rgba(46, 204, 113, 0.28) 0%,
+        rgba(46, 204, 113, 0.08) 50%,
+        transparent 72%
+      );
+      filter: blur(4px);
+      opacity: 0.85;
       pointer-events: none;
       z-index: -1;
-      animation: halo-breathe 4s ease-in-out infinite;
+      animation: core-halo 2.4s ease-in-out infinite;
+    }
+
+    /* ECG-style heartbeat wave through the core */
+    .heartbeat-wave {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 260px;
+      height: 64px;
+      margin: -32px 0 0 -130px;
+      z-index: 3;
+      overflow: visible;
+      pointer-events: none;
+    }
+
+    .heartbeat-wave path {
+      fill: none;
+      stroke: #2ecc71;
+      stroke-width: 2.25;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      filter: drop-shadow(0 0 6px rgba(46, 204, 113, 0.55));
+      stroke-dasharray: 320;
+      stroke-dashoffset: 320;
+      animation: wave-draw 2.4s ease-in-out infinite;
+    }
+
+    .heartbeat-wave .wave-ghost {
+      stroke: rgba(46, 204, 113, 0.18);
+      stroke-width: 1.5;
+      filter: none;
+      stroke-dasharray: none;
+      stroke-dashoffset: 0;
+      animation: none;
     }
 
     /* Flash ring for execute/close events */
     .cortex::after {
       content: "";
       position: absolute;
-      inset: 20px;
+      inset: 28px;
       border-radius: 50%;
       opacity: 0;
       pointer-events: none;
-      z-index: 1;
+      z-index: 5;
       background: radial-gradient(circle, rgba(46, 204, 113, 0.28) 0%, transparent 72%);
     }
 
     .cortex.flash-execute::after {
-      background: radial-gradient(circle, rgba(46, 204, 113, 0.32) 0%, transparent 72%);
+      background: radial-gradient(circle, rgba(46, 204, 113, 0.36) 0%, transparent 72%);
       animation: halo-process 1.2s var(--ease-out) forwards;
     }
 
@@ -396,125 +504,6 @@
     .cortex.flash-execute,
     .cortex.flash-close {
       animation: engine-soft 1.2s var(--ease-out);
-    }
-
-    /* Orbiting particles — Siri / Apple Watch setup energy */
-    .particle {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      border-radius: 50%;
-      pointer-events: none;
-      will-change: transform, opacity;
-      /* anchor so translate orbits from center */
-      margin: 0;
-    }
-
-    /* Particle sizes, colors, blur — organic variety */
-    .particle.p1 {
-      width: 18px;
-      height: 18px;
-      margin: -9px 0 0 -9px;
-      background: radial-gradient(circle at 35% 30%, rgba(255, 255, 255, 0.85), #2ecc71 55%, #27ae60);
-      box-shadow: 0 0 14px rgba(46, 204, 113, 0.55);
-      filter: blur(0.4px);
-      opacity: 0.92;
-      animation: orbit-1 7s linear infinite;
-    }
-
-    .particle.p2 {
-      width: 12px;
-      height: 12px;
-      margin: -6px 0 0 -6px;
-      background: radial-gradient(circle at 40% 35%, rgba(255, 255, 255, 0.7), #3CB043 60%, #2ecc71);
-      box-shadow: 0 0 12px rgba(60, 176, 67, 0.45);
-      filter: blur(1px);
-      opacity: 0.75;
-      animation: orbit-2 9.5s linear infinite;
-    }
-
-    .particle.p3 {
-      width: 22px;
-      height: 22px;
-      margin: -11px 0 0 -11px;
-      background: radial-gradient(circle at 30% 30%, rgba(255, 255, 255, 0.55), rgba(46, 204, 113, 0.85) 50%, rgba(39, 174, 96, 0.6));
-      box-shadow: 0 0 18px rgba(46, 204, 113, 0.4);
-      filter: blur(2.5px);
-      opacity: 0.55;
-      animation: orbit-3 11s linear infinite;
-    }
-
-    .particle.p4 {
-      width: 10px;
-      height: 10px;
-      margin: -5px 0 0 -5px;
-      background: radial-gradient(circle at 40% 30%, #fff, #2ecc71 70%);
-      box-shadow: 0 0 10px rgba(46, 204, 113, 0.6);
-      filter: blur(0.6px);
-      opacity: 0.88;
-      animation: orbit-4 6.2s linear infinite;
-    }
-
-    .particle.p5 {
-      width: 15px;
-      height: 15px;
-      margin: -7.5px 0 0 -7.5px;
-      background: radial-gradient(circle at 35% 35%, rgba(255, 255, 255, 0.65), #3CB043 55%, #27ae60);
-      box-shadow: 0 0 16px rgba(60, 176, 67, 0.4);
-      filter: blur(1.4px);
-      opacity: 0.65;
-      animation: orbit-5 13s linear infinite;
-    }
-
-    .particle.p6 {
-      width: 8px;
-      height: 8px;
-      margin: -4px 0 0 -4px;
-      background: radial-gradient(circle at 40% 30%, #fff, #2ecc71);
-      box-shadow: 0 0 8px rgba(46, 204, 113, 0.55);
-      filter: blur(0.8px);
-      opacity: 0.7;
-      animation: orbit-6 8.4s linear infinite reverse;
-    }
-
-    /* Overlapping, offset orbital paths — fluid & alive */
-    @keyframes orbit-1 {
-      0%   { transform: rotate(0deg)   translateX(72px) rotate(0deg)   scale(1);    opacity: 0.9; }
-      25%  { transform: rotate(90deg)  translateX(78px) rotate(-90deg) scale(1.12); opacity: 0.7; }
-      50%  { transform: rotate(180deg) translateX(70px) rotate(-180deg) scale(0.92); opacity: 0.95; }
-      75%  { transform: rotate(270deg) translateX(76px) rotate(-270deg) scale(1.08); opacity: 0.65; }
-      100% { transform: rotate(360deg) translateX(72px) rotate(-360deg) scale(1);    opacity: 0.9; }
-    }
-
-    @keyframes orbit-2 {
-      0%   { transform: rotate(40deg)  translateX(58px) rotate(-40deg)  scale(1);    opacity: 0.75; }
-      33%  { transform: rotate(160deg) translateX(64px) rotate(-160deg) scale(1.2);  opacity: 0.5; }
-      66%  { transform: rotate(280deg) translateX(54px) rotate(-280deg) scale(0.85); opacity: 0.85; }
-      100% { transform: rotate(400deg) translateX(58px) rotate(-400deg) scale(1);    opacity: 0.75; }
-    }
-
-    @keyframes orbit-3 {
-      0%   { transform: rotate(120deg) translateX(84px) rotate(-120deg) scale(1);    opacity: 0.5; }
-      50%  { transform: rotate(300deg) translateX(90px) rotate(-300deg) scale(1.15); opacity: 0.7; }
-      100% { transform: rotate(480deg) translateX(84px) rotate(-480deg) scale(1);    opacity: 0.5; }
-    }
-
-    @keyframes orbit-4 {
-      0%   { transform: rotate(200deg) translateX(50px) rotate(-200deg) scale(1);    opacity: 0.9; }
-      40%  { transform: rotate(344deg) translateX(56px) rotate(-344deg) scale(1.25); opacity: 0.55; }
-      100% { transform: rotate(560deg) translateX(50px) rotate(-560deg) scale(1);    opacity: 0.9; }
-    }
-
-    @keyframes orbit-5 {
-      0%   { transform: rotate(280deg) translateX(66px) rotate(-280deg) scale(1);    opacity: 0.6; }
-      50%  { transform: rotate(460deg) translateX(72px) rotate(-460deg) scale(1.18); opacity: 0.85; }
-      100% { transform: rotate(640deg) translateX(66px) rotate(-640deg) scale(1);    opacity: 0.6; }
-    }
-
-    @keyframes orbit-6 {
-      0%   { transform: rotate(0deg)   translateX(92px) rotate(0deg)   scale(1);    opacity: 0.65; }
-      50%  { transform: rotate(180deg) translateX(88px) rotate(-180deg) scale(1.3);  opacity: 0.4; }
-      100% { transform: rotate(360deg) translateX(92px) rotate(-360deg) scale(1);    opacity: 0.65; }
     }
 
     .cortex-core-label {
@@ -536,25 +525,124 @@
       z-index: 2;
     }
 
-    @keyframes core-breathe {
-      0%, 100% { transform: scale(1);    box-shadow: 0 0 28px rgba(46, 204, 113, 0.35), 0 0 60px rgba(46, 204, 113, 0.18), 0 6px 24px rgba(39, 174, 96, 0.2), inset 0 -6px 16px rgba(0, 0, 0, 0.06), inset 0 4px 12px rgba(255, 255, 255, 0.35); }
-      50%      { transform: scale(1.04); box-shadow: 0 0 36px rgba(46, 204, 113, 0.45), 0 0 72px rgba(46, 204, 113, 0.24), 0 8px 28px rgba(39, 174, 96, 0.25), inset 0 -6px 16px rgba(0, 0, 0, 0.06), inset 0 4px 12px rgba(255, 255, 255, 0.4); }
+    /* Mechanical cardiac double-pulse (lub-dub) */
+    @keyframes robot-heartbeat {
+      0%, 100% {
+        transform: scale(1);
+        box-shadow:
+          0 0 24px rgba(46, 204, 113, 0.4),
+          0 0 56px rgba(46, 204, 113, 0.2),
+          0 6px 20px rgba(39, 174, 96, 0.18),
+          inset 0 -5px 14px rgba(0, 0, 0, 0.06),
+          inset 0 4px 12px rgba(255, 255, 255, 0.35);
+      }
+      /* Lub — strong first contraction */
+      8% {
+        transform: scale(1.14);
+        box-shadow:
+          0 0 36px rgba(46, 204, 113, 0.55),
+          0 0 72px rgba(46, 204, 113, 0.3),
+          0 8px 28px rgba(39, 174, 96, 0.28),
+          inset 0 -5px 14px rgba(0, 0, 0, 0.06),
+          inset 0 4px 12px rgba(255, 255, 255, 0.45);
+      }
+      16% {
+        transform: scale(0.96);
+        box-shadow:
+          0 0 20px rgba(46, 204, 113, 0.32),
+          0 0 48px rgba(46, 204, 113, 0.16),
+          0 5px 16px rgba(39, 174, 96, 0.14),
+          inset 0 -5px 14px rgba(0, 0, 0, 0.06),
+          inset 0 4px 12px rgba(255, 255, 255, 0.32);
+      }
+      /* Dub — softer second contraction */
+      24% {
+        transform: scale(1.08);
+        box-shadow:
+          0 0 30px rgba(46, 204, 113, 0.48),
+          0 0 64px rgba(46, 204, 113, 0.24),
+          0 7px 24px rgba(39, 174, 96, 0.22),
+          inset 0 -5px 14px rgba(0, 0, 0, 0.06),
+          inset 0 4px 12px rgba(255, 255, 255, 0.4);
+      }
+      34% {
+        transform: scale(1);
+        box-shadow:
+          0 0 24px rgba(46, 204, 113, 0.4),
+          0 0 56px rgba(46, 204, 113, 0.2),
+          0 6px 20px rgba(39, 174, 96, 0.18),
+          inset 0 -5px 14px rgba(0, 0, 0, 0.06),
+          inset 0 4px 12px rgba(255, 255, 255, 0.35);
+      }
     }
 
-    @keyframes halo-breathe {
+    @keyframes core-halo {
       0%, 100% { opacity: 0.55; transform: scale(1); }
-      50%      { opacity: 0.95; transform: scale(1.06); }
+      8%       { opacity: 1;    transform: scale(1.12); }
+      16%      { opacity: 0.5;  transform: scale(0.98); }
+      24%      { opacity: 0.9;  transform: scale(1.08); }
+      34%      { opacity: 0.55; transform: scale(1); }
+    }
+
+    @keyframes ambient-glow {
+      0%, 100% { opacity: 0.65; transform: scale(1); }
+      8%       { opacity: 1;    transform: scale(1.06); }
+      24%      { opacity: 0.85; transform: scale(1.03); }
+      34%, 70% { opacity: 0.6;  transform: scale(1); }
+    }
+
+    @keyframes ring-expand {
+      0% {
+        transform: scale(0.85);
+        opacity: 0;
+      }
+      6% {
+        opacity: 0.7;
+      }
+      8% {
+        opacity: 0.65;
+      }
+      55% {
+        transform: scale(2.6);
+        opacity: 0;
+      }
+      100% {
+        transform: scale(2.6);
+        opacity: 0;
+      }
+    }
+
+    @keyframes wave-draw {
+      0% {
+        stroke-dashoffset: 320;
+        opacity: 0.35;
+      }
+      8% {
+        opacity: 1;
+      }
+      42% {
+        stroke-dashoffset: 0;
+        opacity: 0.95;
+      }
+      70% {
+        stroke-dashoffset: -40;
+        opacity: 0.2;
+      }
+      100% {
+        stroke-dashoffset: -40;
+        opacity: 0.15;
+      }
     }
 
     @keyframes halo-process {
       0%   { opacity: 0; transform: scale(0.9); }
       30%  { opacity: 1; transform: scale(1.08); }
-      100% { opacity: 0; transform: scale(1.2); }
+      100% { opacity: 0; transform: scale(1.25); }
     }
 
     @keyframes engine-soft {
       0%   { transform: scale(1); }
-      30%  { transform: scale(1.04); }
+      30%  { transform: scale(1.03); }
       100% { transform: scale(1); }
     }
 
@@ -739,7 +827,7 @@
       align-items: center;
       justify-content: center;
       gap: 0.85rem;
-      padding: 0 4.5rem 0 1rem;
+      padding: 0 1.25rem;
       background: rgba(255, 255, 255, 0.92);
       border-top: 1px solid var(--border);
       box-shadow: 0 -2px 12px rgba(41, 37, 36, 0.03);
@@ -783,46 +871,6 @@
       user-select: none;
     }
 
-    /* ── Discord float — subtle light-theme treatment ─── */
-    .discord-fab {
-      position: fixed;
-      right: 1.25rem;
-      bottom: calc(var(--footer-h) + 0.75rem);
-      z-index: 60;
-      width: 52px;
-      height: 52px;
-      border-radius: 50%;
-      background: #fff;
-      border: 1px solid var(--border);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      box-shadow: var(--shadow-md);
-      transition: transform 0.2s var(--ease-out), box-shadow 0.2s ease, border-color 0.2s ease;
-      text-decoration: none;
-    }
-
-    .discord-fab:hover {
-      transform: scale(1.05);
-      border-color: rgba(88, 101, 242, 0.35);
-      box-shadow: 0 8px 24px rgba(88, 101, 242, 0.12), var(--shadow-sm);
-    }
-
-    .discord-fab.pulse-hit {
-      animation: discord-soft 0.55s var(--ease-out);
-    }
-
-    @keyframes discord-soft {
-      0% { transform: scale(1.06); }
-      100% { transform: scale(1); }
-    }
-
-    .discord-fab svg {
-      width: 26px;
-      height: 26px;
-      fill: var(--discord);
-    }
-
     .sse-status {
       font-size: 0.85rem;
       letter-spacing: 0.02em;
@@ -842,22 +890,23 @@
 
     /* Respect reduced motion preferences */
     @media (prefers-reduced-motion: reduce) {
-      .particle,
       .cortex-core,
       .cortex-core::before,
+      .pulse-ring,
+      .heartbeat-wave path,
+      .heartbeat-field::before,
       .status-dot,
       .pipeline-dot.sync {
         animation: none !important;
       }
-      .particle {
+      .pulse-ring {
+        opacity: 0.25;
+        transform: scale(1.6);
+      }
+      .heartbeat-wave path:not(.wave-ghost) {
+        stroke-dashoffset: 0;
         opacity: 0.7;
       }
-      .particle.p1 { transform: rotate(0deg) translateX(72px); }
-      .particle.p2 { transform: rotate(40deg) translateX(58px); }
-      .particle.p3 { transform: rotate(120deg) translateX(84px); }
-      .particle.p4 { transform: rotate(200deg) translateX(50px); }
-      .particle.p5 { transform: rotate(280deg) translateX(66px); }
-      .particle.p6 { transform: rotate(320deg) translateX(92px); }
     }
   </style>
 </head>
@@ -907,18 +956,23 @@
       </section>
     </div>
 
-    <!-- CENTER: Execution Engine — Siri-style particle core -->
+    <!-- CENTER: Execution Engine — Robot Heartbeat -->
     <section class="panel" id="panel-cortex">
       <div class="panel-label">Execution Engine</div>
       <div class="cortex-stage">
-        <div class="cortex" id="cortex" title="Master Bot" role="img" aria-label="Execution engine">
-          <div class="cortex-core" aria-hidden="true"></div>
-          <span class="particle p1" aria-hidden="true"></span>
-          <span class="particle p2" aria-hidden="true"></span>
-          <span class="particle p3" aria-hidden="true"></span>
-          <span class="particle p4" aria-hidden="true"></span>
-          <span class="particle p5" aria-hidden="true"></span>
-          <span class="particle p6" aria-hidden="true"></span>
+        <div class="cortex" id="cortex" title="Master Bot" role="img" aria-label="Execution engine robot heartbeat">
+          <div class="heartbeat-field" aria-hidden="true">
+            <span class="pulse-ring r1"></span>
+            <span class="pulse-ring r2"></span>
+            <span class="pulse-ring r3"></span>
+            <svg class="heartbeat-wave" viewBox="0 0 260 64" xmlns="http://www.w3.org/2000/svg">
+              <!-- Soft baseline ghost -->
+              <path class="wave-ghost" d="M0 32 H260" />
+              <!-- ECG-style mechanical heartbeat through the core -->
+              <path d="M0 32 H52 L62 32 L70 18 L78 48 L88 8 L98 40 L106 32 H154 L162 32 L170 14 L178 50 L188 6 L198 42 L206 32 H260" />
+            </svg>
+            <div class="cortex-core"></div>
+          </div>
         </div>
         <div class="cortex-core-label">Master Bot</div>
         <div class="cortex-sub">Decision core · awaiting signal</div>
@@ -968,17 +1022,6 @@
       <span>Hedge DB: <span class="glow" id="footer-hedge-db">—</span></span>
     </span>
   </footer>
-
-  <a class="discord-fab" id="discord-fab"
-     href="https://discord.com"
-     target="_blank"
-     rel="noopener noreferrer"
-     aria-label="Discord"
-     title="Discord">
-    <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-      <path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/>
-    </svg>
-  </a>
 
   <script>
     const CONTRACT_MULT = 100;
@@ -1142,15 +1185,6 @@
       }, 1250);
     }
 
-    function notifyDiscordSoft() {
-      const discord = document.getElementById('discord-fab');
-      if (!discord) return;
-      discord.classList.remove('pulse-hit');
-      void discord.offsetWidth;
-      discord.classList.add('pulse-hit');
-      setTimeout(() => discord.classList.remove('pulse-hit'), 550);
-    }
-
     function slippageBadgeHtml(slippage) {
       const v = Number(slippage);
       if (!Number.isFinite(v) || v === 0) return '';
@@ -1188,7 +1222,6 @@
       if (event.type !== 'EXECUTE' && event.type !== 'CLOSE') return;
 
       flashCortex(event.type);
-      notifyDiscordSoft();
 
       // Gentle delay so engine pulse leads the organic card entrance
       setTimeout(() => {
