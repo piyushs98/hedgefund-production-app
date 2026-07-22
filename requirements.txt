@@ -3,6 +3,7 @@
 
 # Web / orchestration (main.py, keep_alive.py, tracker_agent.py)
 flask==3.1.3
+gunicorn==23.0.0
 requests==2.32.3
 
 # Market data (master_bot.py, data_engineer.py, tracker_agent.py, …)

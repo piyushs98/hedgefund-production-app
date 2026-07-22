@@ -2,12 +2,16 @@
 main.py — Render master orchestrator.
 
 Single process that:
-  1. Serves a Flask health endpoint + Virtual Hedge Fund dashboard/API.
+  1. Serves Flask health + Virtual Hedge Fund dashboard/API under gunicorn.
   2. Runs the macro CEO loop (master_bot, ~30-min trading cadence) on a daemon thread.
   3. Runs the micro tracker loop (tracker_agent, 5-min cadence) on a daemon thread.
+  4. Exposes /api/force-briefing for on-demand DeepSeek pre-market Discord tests.
 
 Either background thread may hit network drops or API throttling; failures are
 logged and the thread backs off without taking down this process.
+
+Serve with (workers MUST be 1 — see prepare_process):
+  gunicorn main:app --workers 1 --threads 8 --bind 0.0.0.0:$PORT --timeout 120
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 
 from flask import Flask, Response, jsonify, render_template
 
@@ -44,6 +48,18 @@ MICRO_RESTART_SLEEP = int(os.environ.get("MICRO_RESTART_SLEEP", "30"))
 
 # Process start for /api/telemetry uptime (dashboard-only observability).
 START_TIME = time.time()
+
+# Exactly-once guard for process bootstrap + macro/micro daemon threads
+# (must survive concurrent prepare_process / start_background_loops under gthread).
+# Use a single non-reentrant Lock; never call start_background_loops while holding it
+# from a nested path without releasing first.
+_init_lock = Lock()
+_background_loops_started = False
+_process_prepared = False
+
+# Serialize on-demand briefings so two browser hits cannot fire dual DeepSeek
+# + Discord storms (DeepSeek call can hold a worker thread up to ~90s).
+_force_briefing_lock = Lock()
 
 app = Flask(__name__)
 
@@ -200,21 +216,43 @@ def _micro_worker() -> None:
 
 
 def start_background_loops() -> None:
-    """Launch macro + micro agents as daemon threads (die with the process)."""
-    macro = Thread(
-        target=_macro_worker,
-        name="macro-master-bot",
-        daemon=True,
-    )
-    micro = Thread(
-        target=_micro_worker,
-        name="micro-tracker-agent",
-        daemon=True,
-    )
-    macro.start()
-    micro.start()
-    print("[main] Background daemon threads started: "
-          f"{macro.name}, {micro.name}")
+    """
+    Launch macro + micro agents as daemon threads (die with the process).
+
+    Thread-safe and idempotent: under gunicorn gthread, only the first caller
+    in this process starts the bots. Subsequent calls are no-ops so we never
+    double-spawn Master Bot / Tracker (duplicate paper trades / Discord).
+
+    NOTE: This is per-process. --workers MUST remain 1; a second OS worker
+    would import this module independently and start its own pair of bots.
+    """
+    global _background_loops_started
+    with _init_lock:
+        if _background_loops_started:
+            print(
+                "[main] Background loops already started in this process — "
+                "skipping re-init (duplicate-bot guard)."
+            )
+            return
+        # Set flag BEFORE .start() so a re-entrant call during thread bootstrap
+        # cannot race another pair of daemons into existence.
+        _background_loops_started = True
+        macro = Thread(
+            target=_macro_worker,
+            name="macro-master-bot",
+            daemon=True,
+        )
+        micro = Thread(
+            target=_micro_worker,
+            name="micro-tracker-agent",
+            daemon=True,
+        )
+        macro.start()
+        micro.start()
+        print(
+            "[main] Background daemon threads started exactly once: "
+            f"{macro.name}, {micro.name}"
+        )
 
 
 # ===========================================================================
@@ -365,6 +403,88 @@ def health():
     return "OK"
 
 
+@app.route("/api/force-briefing")
+def api_force_briefing():
+    """
+    Hidden ops endpoint: run the DeepSeek pre-market briefing + Discord
+    webhook immediately, regardless of EST clock / prep-meeting window.
+
+    Same pipeline as the scheduled 09:15 EST prep meeting
+    (pre_market_meeting.force_pre_market_briefing).
+
+    Holds one gthread worker thread until DeepSeek (≤90s timeout) + Discord
+    finish so the JSON body reflects real outcomes — not a fire-and-forget.
+    Concurrent hits return 409 rather than stacking dual DeepSeek calls.
+    """
+    # Non-blocking acquire: a second tab must not pile another 90s DeepSeek
+    # call onto an already-busy worker pool (health-check starvation risk).
+    if not _force_briefing_lock.acquire(blocking=False):
+        return jsonify({
+            "status": "error",
+            "error": "Briefing already in progress; retry shortly.",
+        }), 409
+
+    try:
+        # Local import: keep cold import light; avoid trading-stack side effects
+        from pre_market_meeting import force_pre_market_briefing
+
+        print("[main] /api/force-briefing hit — running on-demand CoS briefing...")
+        meta = force_pre_market_briefing()
+
+        deepseek_ok = bool(meta.get("deepseek_ok"))
+        discord_ok = bool(meta.get("discord_delivered"))
+        source = meta.get("source") or "fallback"
+        deepseek_error = meta.get("deepseek_error")
+
+        # Full success: DeepSeek synthesized AND Discord accepted the webhook.
+        if deepseek_ok and discord_ok:
+            return jsonify({"status": "Briefing forced and sent"})
+
+        # Partial / failed — still useful for ops diagnosis; do not claim "sent"
+        # if Discord never delivered, and surface DeepSeek timeout/fallback.
+        payload = {
+            "status": "error",
+            "deepseek_ok": deepseek_ok,
+            "deepseek_error": deepseek_error,
+            "discord_delivered": discord_ok,
+            "source": source,
+        }
+        if discord_ok and not deepseek_ok:
+            payload["status"] = "Briefing forced and sent (DeepSeek fallback)"
+            payload["warning"] = (
+                "Discord delivered a DB fallback briefing; DeepSeek did not succeed. "
+                f"detail={deepseek_error}"
+            )
+            # 200 with warning: webhook path verified; model path needs attention
+            return jsonify(payload), 200
+
+        if deepseek_ok and not discord_ok:
+            payload["error"] = (
+                "DeepSeek OK but Discord webhook failed "
+                "(check DISCORD_WEBHOOK / rate limits)."
+            )
+            return jsonify(payload), 502
+
+        payload["error"] = (
+            "DeepSeek failed and Discord did not deliver. "
+            f"deepseek={deepseek_error}"
+        )
+        return jsonify(payload), 502
+
+    except Exception as e:
+        # Unexpected hard failures (import errors, programming bugs). DeepSeek
+        # HTTP timeouts are handled inside generate_morning_briefing and do not
+        # land here — they become deepseek_ok=False + fallback text above.
+        print(f"[main] /api/force-briefing FAILED: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+        }), 500
+    finally:
+        _force_briefing_lock.release()
+
+
 @app.route("/status")
 def status():
     """Optional ops endpoint: active trade count + thread names (best-effort)."""
@@ -388,10 +508,45 @@ def status():
 
 
 # ===========================================================================
-# ENTRYPOINT
+# PROCESS BOOTSTRAP + WSGI ENTRY (gunicorn)
 # ===========================================================================
+#
+# Production (Render / local):
+#   gunicorn main:app --workers 1 --threads 8 --bind 0.0.0.0:$PORT --timeout 120
+#
+# CRITICAL: --workers MUST stay 1. Each worker is a separate OS process that
+# re-imports this module and would start its own macro/micro pair → duplicate
+# trades. The in-process Lock only prevents double-init *within* one worker.
+#
+# Do NOT add --preload: the master would start daemon threads, then fork;
+# children inherit _background_loops_started=True but not live threads → no bots.
+#
+# --threads 8 keeps /health answering while /stream SSE and DeepSeek hold other
+# threads (Flask app.run() blocked on SSE → Render 502 + restarts). Residual
+# risk: each open /stream tab occupies one thread until disconnect; leave headroom
+# for Render health checks (avoid 7+ simultaneous SSE clients on threads=8).
+# --timeout 120 covers /api/force-briefing (DeepSeek HTTP timeout is 90s).
 
-def main() -> None:
+def prepare_process() -> None:
+    """
+    One-shot process init for the gunicorn worker.
+
+    Ledger/files init is idempotent; macro/micro daemons are started exactly
+    once per OS process via the locked flag in start_background_loops().
+    """
+    global _process_prepared
+
+    # Fast path: already bootstrapped (common under repeated imports/tests).
+    with _init_lock:
+        already = _process_prepared
+        if not already:
+            _process_prepared = True
+
+    if already:
+        # Still enforce exactly-once bots if a partial init ever skipped them.
+        start_background_loops()
+        return
+
     print("\n=== RENDER ORCHESTRATOR (main.py) ===")
     ensure_active_trades_file()
     try:
@@ -399,13 +554,33 @@ def main() -> None:
         print("[main] Virtual broker ledger ready")
     except Exception as e:
         print(f"[main] WARNING: virtual broker init failed: {e}")
-    start_background_loops()
 
-    port = int(os.environ.get("PORT", 10000))
-    print(f"[main] Flask binding 0.0.0.0:{port}")
-    # threaded=True so /health answers while agents are busy
-    app.run(host="0.0.0.0", port=port, use_reloader=False, threaded=True)
+    # Idempotent under _init_lock — safe if two gthreads race prepare_process.
+    start_background_loops()
+    port = os.environ.get("PORT", "10000")
+    print(
+        f"[main] Process ready under gunicorn gthread "
+        f"(workers=1 required) — PORT={port}"
+    )
+
+
+# Gunicorn loads `main:app` with __name__ == "main" (not "__main__"), so the
+# single worker bootstraps daemons on import. Skip when `python main.py` is used
+# only to print the gunicorn command (avoids spawning bots that immediately die).
+if __name__ != "__main__":
+    prepare_process()
 
 
 if __name__ == "__main__":
-    main()
+    # Do not use Flask's development server in production — it single-threads
+    # poorly under SSE (/stream) and reverse proxies return 502 Bad Gateway.
+    port = os.environ.get("PORT", "10000")
+    print(
+        "[main] Refusing app.run(). Start the production WSGI server:\n"
+        f"  gunicorn main:app --workers 1 --threads 8 "
+        f"--bind 0.0.0.0:{port} --timeout 120"
+    )
+    raise SystemExit(
+        "Use gunicorn (see Procfile / message above). "
+        "Flask app.run() was removed to prevent SSE 502s."
+    )
