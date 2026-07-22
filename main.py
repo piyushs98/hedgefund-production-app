@@ -6,6 +6,8 @@ Single process that:
   2. Runs the macro CEO loop (master_bot, ~30-min trading cadence) on a daemon thread.
   3. Runs the micro tracker loop (tracker_agent, 5-min cadence) on a daemon thread.
   4. Exposes /api/force-briefing for on-demand DeepSeek pre-market Discord tests.
+  5. Exposes /api/test-master-bot for on-demand Master Bot pipeline verification
+     (force scan outside market hours; last-known prices on a benchmark list).
 
 Either background thread may hit network drops or API throttling; failures are
 logged and the thread backs off without taking down this process.
@@ -60,6 +62,10 @@ _process_prepared = False
 # Serialize on-demand briefings so two browser hits cannot fire dual DeepSeek
 # + Discord storms (DeepSeek call can hold a worker thread up to ~90s).
 _force_briefing_lock = Lock()
+
+# Serialize on-demand Master Bot test scans (full pipeline + Gemini + Discord).
+# Non-blocking acquire → HTTP 409 if a scan is already holding a worker thread.
+_master_test_lock = Lock()
 
 app = Flask(__name__)
 
@@ -485,6 +491,75 @@ def api_force_briefing():
         _force_briefing_lock.release()
 
 
+@app.route("/api/test-master-bot")
+def api_test_master_bot():
+    """
+    Hidden ops endpoint: run one Master Bot portfolio scan immediately,
+    bypassing market-open guards (last-known prices on SPY/QQQ/NVDA).
+
+    Full pipeline via master_bot.run_master_bot_scan(force=True):
+      price/options -> scoring/momentum -> Adversarial veto -> virtual broker.
+    Signal/veto Discord messages are prefixed with ``[TEST SCAN]``.
+
+    Concurrent hits return 409 rather than stacking dual full scans.
+    Holds one gthread until the scan finishes so the JSON body reflects
+    real outcomes (not fire-and-forget).
+    """
+    if not _master_test_lock.acquire(blocking=False):
+        return jsonify({
+            "status": "error",
+            "error": "Master Bot test already in progress.",
+        }), 409
+
+    try:
+        # Local import: keep cold import light; trading stack stays off the
+        # critical path for /health and dashboard routes.
+        from master_bot import run_master_bot_scan
+
+        print("[main] /api/test-master-bot hit — running force Master Bot scan...")
+        meta = run_master_bot_scan(force=True)
+
+        # Normalize for ops clients; always include the fields called out
+        # in the contract even if the scan early-aborted.
+        payload = {
+            "status": meta.get("status") or "Master Bot test scan completed",
+            "tickers_scanned": meta.get("tickers_scanned") or [],
+            "discord_delivered": bool(meta.get("discord_delivered")),
+            "scan_id": meta.get("scan_id"),
+            "force": bool(meta.get("force", True)),
+            "market_open": meta.get("market_open"),
+            "vetoes": meta.get("vetoes") or [],
+            "trades": meta.get("trades") or [],
+            "results": meta.get("results") or [],
+            "discord_attempts": meta.get("discord_attempts", 0),
+            "circuit_breaker_open": bool(meta.get("circuit_breaker_open")),
+            "aborted": bool(meta.get("aborted")),
+        }
+
+        if meta.get("aborted") and meta.get("circuit_breaker_open"):
+            payload["status"] = "Master Bot test scan aborted (circuit breaker open)"
+            payload["warning"] = "Circuit breaker open — remaining tickers skipped."
+
+        print(
+            f"[main] /api/test-master-bot done scan_id={payload.get('scan_id')} "
+            f"vetoes={len(payload['vetoes'])} trades={len(payload['trades'])} "
+            f"discord_delivered={payload['discord_delivered']}"
+        )
+        return jsonify(payload)
+
+    except Exception as e:
+        print(f"[main] /api/test-master-bot FAILED: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "tickers_scanned": [],
+            "discord_delivered": False,
+        }), 500
+    finally:
+        _master_test_lock.release()
+
+
 @app.route("/status")
 def status():
     """Optional ops endpoint: active trade count + thread names (best-effort)."""
@@ -526,6 +601,8 @@ def status():
 # risk: each open /stream tab occupies one thread until disconnect; leave headroom
 # for Render health checks (avoid 7+ simultaneous SSE clients on threads=8).
 # --timeout 120 covers /api/force-briefing (DeepSeek HTTP timeout is 90s).
+# /api/test-master-bot runs a short 3-ticker force scan; raise timeout if the
+# universe grows or Gemini latency spikes (ops can also hit outside RTH).
 
 def prepare_process() -> None:
     """

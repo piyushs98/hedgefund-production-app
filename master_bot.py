@@ -7,7 +7,10 @@ This module is pure trading logic: portfolio scans, CEO synthesis, and
 in modules imported at the top level of this file.
 
 Key design notes:
-  * Single run_portfolio_scan() shared by developer-bypass and live paths.
+  * Single run_portfolio_scan() shared by developer-bypass, live, and
+    on-demand test paths.
+  * run_master_bot_scan(force=True) is the ops entry for any-time pipeline
+    verification (benchmark tickers + [TEST SCAN] Discord on signal/veto).
   * scoring_engine.py grades pillars from raw numbers + dynamic weights.
   * CEO output uses a strict per-ticker Markdown schema; Gemini failure
     falls back to a deterministic numeric formatter.
@@ -43,7 +46,8 @@ from math_agent import calculate_swing_targets
 from news_memory import get_historical_context, save_headline, clear_expired_news
 import sqlite3
 
-# Executive briefing
+# Executive briefing — scheduled prep uses generate_morning_briefing();
+# on-demand ops use pre_market_meeting.force_pre_market_briefing() via main.py.
 from pre_market_meeting import generate_morning_briefing
 
 # Scrapers
@@ -69,6 +73,11 @@ from tracker_agent import save_active_trade
 TICKERS = config.TICKERS
 GEMINI_API_KEY = config.GEMINI_API_KEY
 BYPASS_MARKET_HOURS = os.environ.get("BYPASS_MARKET_HOURS", "false").lower() == "true"
+
+# On-demand test scan universe (last-known prices outside RTH).
+# Kept short so /api/test-master-bot finishes inside gunicorn --timeout.
+TEST_SCAN_TICKERS = ["SPY", "QQQ", "NVDA"]
+TEST_SCAN_DISCORD_PREFIX = "[TEST SCAN]"
 
 # Shared with main.py / tracker_agent.py — absolute path so cwd cannot desync.
 ACTIVE_TRADES_PATH = os.environ.get(
@@ -417,32 +426,124 @@ def run_night_harvest():
         print(f"❌ Scraper error in night harvest: {err}")
 
 
-def run_portfolio_scan(morning_macro_context, breaker, inter_ticker_sleep=10):
-    """One full pass across the ticker universe. Used by both the live
-    trading loop and the developer bypass simulation."""
+def is_us_equity_market_open(now=None):
+    """
+    True during regular NYSE cash session (Mon–Fri 09:30–16:00 ET),
+    excluding configured full-day holidays. Early-close days still count open.
+    """
+    try:
+        est_tz = pytz.timezone("America/New_York")
+    except Exception:
+        est_tz = None
+    now = now or datetime.now(est_tz)
+    if now.tzinfo is None and est_tz is not None:
+        now = est_tz.localize(now)
+    if now.weekday() > 4:
+        return False
+    if now.strftime("%Y-%m-%d") in NYSE_HOLIDAYS:
+        return False
+    t = now.time()
+    trading_start = datetime.strptime("09:30:00", "%H:%M:%S").time()
+    trading_end = datetime.strptime("15:59:59", "%H:%M:%S").time()
+    return trading_start <= t <= trading_end
+
+
+def run_portfolio_scan(
+    morning_macro_context,
+    breaker,
+    inter_ticker_sleep=10,
+    tickers=None,
+    discord_prefix=None,
+    notify_signals_only=False,
+):
+    """
+    One full pass across a ticker universe.
+
+    Shared by the live 30-min loop, developer bypass, and on-demand
+    ``run_master_bot_scan(force=True)`` test path.
+
+    Pipeline per ticker:
+      price/options retrieval -> technical/momentum scoring ->
+      Adversarial Agent risk/veto -> strike select -> CEO decision ->
+      Discord (+ virtual broker on EXECUTE).
+
+    Args:
+        morning_macro_context: Pre-market / test briefing text for the CEO.
+        breaker: CircuitBreaker instance.
+        inter_ticker_sleep: Seconds between tickers (rate-limit cushion).
+        tickers: Universe override; defaults to config TICKERS.
+        discord_prefix: Optional string prepended to Discord messages
+            (e.g. ``[TEST SCAN]`` for on-demand tests).
+        notify_signals_only: When True, only Discord on EXECUTE signals
+            or adversarial vetoes (test path). Live path keeps always-on.
+
+    Returns:
+        dict with scan_id, tickers_scanned, results, vetoes, trades,
+        discord_delivered, circuit_breaker_open.
+    """
+    universe = list(tickers) if tickers is not None else list(TICKERS)
+    result = {
+        "scan_id": None,
+        "tickers_scanned": universe,
+        "results": [],
+        "vetoes": [],
+        "trades": [],
+        "discord_delivered": None,  # None = no Discord attempts this scan
+        "discord_attempts": 0,
+        "discord_successes": 0,
+        "circuit_breaker_open": False,
+        "aborted": False,
+    }
+
     if breaker.is_open():
         print("🛑 [System] Circuit breaker OPEN — portfolio scan suspended this cycle.")
-        return
+        result["circuit_breaker_open"] = True
+        result["aborted"] = True
+        return result
 
     scan_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    result["scan_id"] = scan_id
     weights = config.load_weights()
     futures_pct = get_latest_futures_pct("ES=F")
-    print(f"\n🚀 PORTFOLIO SCAN {scan_id} | weights={weights} | ES=F overnight {futures_pct}%")
+    print(f"\n🚀 PORTFOLIO SCAN {scan_id} | tickers={universe} | "
+          f"weights={weights} | ES=F overnight {futures_pct}%")
 
     # Portfolio-level technical color (LLM, for the CoS brief only)
     try:
         print("\n[System State] 👷 Running Ticker Specialist Desk...")
-        specialist_briefings = get_aggregated_briefings(TICKERS)
+        specialist_briefings = get_aggregated_briefings(universe)
         ticker_manager_report = generate_ticker_manager_report(
             specialist_briefings, api_key=GEMINI_API_KEY)
     except Exception as desk_err:
         print(f"❌ Specialist Desk/Manager error: {desk_err}")
         ticker_manager_report = "Portfolio technical report unavailable this cycle."
 
-    for idx, ticker in enumerate(TICKERS):
+    def _maybe_discord(message, force_send=False):
+        """Send Discord; track delivery. force_send=True ignores notify_signals_only."""
+        if notify_signals_only and not force_send:
+            return None
+        text = str(message) if message is not None else ""
+        if discord_prefix and text:
+            text = f"{discord_prefix} {text}"
+        result["discord_attempts"] += 1
+        ok = broadcaster.send_discord_alert(text)
+        if ok:
+            result["discord_successes"] += 1
+        return ok
+
+    for idx, ticker in enumerate(universe):
         print(f"\n------------------------------------------")
-        print(f"🔄 PROCESSING TICKER: {ticker} ({idx + 1}/{len(TICKERS)})")
+        print(f"🔄 PROCESSING TICKER: {ticker} ({idx + 1}/{len(universe)})")
         print(f"------------------------------------------")
+        ticker_summary = {
+            "ticker": ticker,
+            "action_flag": None,
+            "total_score": None,
+            "vetoed": False,
+            "veto_reason": None,
+            "trade_executed": False,
+            "error": None,
+        }
         try:
             # ---- Employee tier: raw data (circuit-breaker instrumented) ----
             print(f"[{ticker}] 👷 Data Engineer: Fetching options chain...")
@@ -450,10 +551,14 @@ def run_portfolio_scan(morning_macro_context, breaker, inter_ticker_sleep=10):
             options_dict = json.loads(options_json)
             if "error" in options_dict:
                 print(f"❌ Skipping {ticker}: {options_dict['error']}")
+                ticker_summary["error"] = options_dict["error"]
+                result["results"].append(ticker_summary)
                 breaker.record_failure(f"options_chain:{ticker}")
                 if breaker.is_open():
                     print("🛑 Circuit breaker tripped mid-scan — aborting remaining tickers.")
-                    return
+                    result["circuit_breaker_open"] = True
+                    result["aborted"] = True
+                    break
                 continue
             breaker.record_success(f"options_chain:{ticker}")
 
@@ -480,6 +585,8 @@ def run_portfolio_scan(morning_macro_context, breaker, inter_ticker_sleep=10):
 
             # ---- Devil's Advocate intercept ----
             adv_result = None
+            vetoed = False
+            veto_reason = None
             if card.action_flag == "EXECUTE":
                 advocate = DevilsAdvocate(api_key=GEMINI_API_KEY)
                 adv_result = advocate.evaluate_trade({
@@ -490,8 +597,10 @@ def run_portfolio_scan(morning_macro_context, breaker, inter_ticker_sleep=10):
                     "raw_metrics": card.metrics,
                 })
                 if adv_result.get("veto_triggered") and float(adv_result.get("risk_confidence", 0)) > 0.75:
+                    veto_reason = adv_result.get("reason", "") or "Adversarial veto"
                     scoring_engine.apply_adversarial_penalty(
-                        card, 15.0, adv_result.get("reason", ""))
+                        card, 15.0, veto_reason)
+                    vetoed = True
                     print(f"[{ticker}] 🛑 Devil's Advocate veto -15 -> "
                           f"{card.total_score}/100 ({card.action_flag}).")
                 else:
@@ -527,7 +636,38 @@ def run_portfolio_scan(morning_macro_context, breaker, inter_ticker_sleep=10):
                 agent_params={"weights": weights, "futures_pct": futures_pct,
                               "macro_vector": macro_vector[:300] if macro_vector else ""},
             )
-            broadcaster.send_discord_alert(trade_decision)
+
+            ticker_summary["action_flag"] = card.action_flag
+            ticker_summary["total_score"] = getattr(card, "total_score", None)
+            ticker_summary["vetoed"] = vetoed
+            ticker_summary["veto_reason"] = veto_reason
+
+            # Discord: live path always broadcasts CEO decision.
+            # Test path (notify_signals_only) only on signal or veto, with prefix.
+            if notify_signals_only:
+                if vetoed:
+                    veto_msg = (
+                        f"{ticker} VETO — score {card.total_score}/100 "
+                        f"flag={card.action_flag}. Reason: {veto_reason}"
+                    )
+                    _maybe_discord(veto_msg, force_send=True)
+                    result["vetoes"].append({
+                        "ticker": ticker,
+                        "reason": veto_reason,
+                        "total_score": card.total_score,
+                        "action_flag": card.action_flag,
+                    })
+                elif card.action_flag == "EXECUTE":
+                    _maybe_discord(trade_decision, force_send=True)
+            else:
+                _maybe_discord(trade_decision, force_send=True)
+                if vetoed:
+                    result["vetoes"].append({
+                        "ticker": ticker,
+                        "reason": veto_reason,
+                        "total_score": card.total_score,
+                        "action_flag": card.action_flag,
+                    })
 
             # ---- Persist confirmed EXECUTE for Tracker micro-loop ----
             # Scoring / strike selection already decided action_flag; this only
@@ -546,17 +686,143 @@ def run_portfolio_scan(morning_macro_context, breaker, inter_ticker_sleep=10):
                               f"for {ticker}: {broker_err}")
                     record_executed_trade(
                         ticker, contract, scan_id=scan_id, card=card)
+                    ticker_summary["trade_executed"] = True
+                    result["trades"].append({
+                        "ticker": ticker,
+                        "direction": contract.get("direction"),
+                        "strike": contract.get("strike"),
+                        "expiration": contract.get("expiration"),
+                        "entry_premium": contract.get("entry_premium"),
+                        "total_score": card.total_score,
+                        "action_flag": card.action_flag,
+                    })
                 except Exception as persist_err:
                     # Never let state I/O kill the portfolio scan
                     print(f"[CEO] WARNING: active_trades persistence failed "
                           f"for {ticker}: {persist_err}")
+                    ticker_summary["error"] = f"persist: {persist_err}"
 
-            if idx < len(TICKERS) - 1:
+            result["results"].append(ticker_summary)
+
+            if idx < len(universe) - 1:
                 time.sleep(inter_ticker_sleep)
         except Exception as ticker_err:
             print(f"❌ Error processing ticker {ticker}: {ticker_err}")
+            ticker_summary["error"] = str(ticker_err)
+            result["results"].append(ticker_summary)
+
+    if result["discord_attempts"] > 0:
+        result["discord_delivered"] = (
+            result["discord_successes"] == result["discord_attempts"]
+            and result["discord_successes"] > 0
+        )
+    else:
+        # No signal/veto (test mode) or empty universe — not a delivery failure.
+        result["discord_delivered"] = True
 
     print(f"\n✅ PORTFOLIO SCAN {scan_id} COMPLETED.")
+    return result
+
+
+def run_master_bot_scan(force=False, inter_ticker_sleep=None):
+    """
+    Standalone single-iteration Master Bot market scan.
+
+    Full pipeline: price retrieval -> technical/momentum analysis ->
+    Adversarial Agent risk/veto -> virtual broker execution (+ Discord).
+
+    Args:
+        force: When True, bypass market-open guards and scan the benchmark
+            list ``TEST_SCAN_TICKERS`` using last-known yfinance prices.
+            Signals and vetoes are Discord-notified with a ``[TEST SCAN]``
+            prefix. When False, only runs during the NYSE cash session on
+            the full configured ``TICKERS`` universe (same as live cadence).
+        inter_ticker_sleep: Optional override; defaults to 5s (force) / 10s (live).
+
+    Returns:
+        dict suitable for the ``/api/test-master-bot`` JSON response, including
+        tickers_scanned, vetoes, trades, discord_delivered, and status.
+    """
+    telemetry.init_telemetry_table()
+    breaker = CircuitBreaker(failure_threshold=5, cooldown_seconds=900)
+
+    if force:
+        universe = list(TEST_SCAN_TICKERS)
+        sleep_s = 5 if inter_ticker_sleep is None else inter_ticker_sleep
+        morning_macro_context = (
+            f"{TEST_SCAN_DISCORD_PREFIX} On-demand Master Bot pipeline test. "
+            "Using last-known prices outside market-hours guards. "
+            "Not a scheduled live cycle."
+        )
+        print(
+            f"\n🔬 [TEST SCAN] force=True — bypassing market-open guards; "
+            f"universe={universe}"
+        )
+        scan = run_portfolio_scan(
+            morning_macro_context,
+            breaker,
+            inter_ticker_sleep=sleep_s,
+            tickers=universe,
+            discord_prefix=TEST_SCAN_DISCORD_PREFIX,
+            notify_signals_only=True,
+        )
+        return {
+            "status": "Master Bot test scan completed",
+            "force": True,
+            "market_open": is_us_equity_market_open(),
+            "tickers_scanned": scan.get("tickers_scanned") or universe,
+            "scan_id": scan.get("scan_id"),
+            "results": scan.get("results") or [],
+            "vetoes": scan.get("vetoes") or [],
+            "trades": scan.get("trades") or [],
+            "discord_delivered": bool(scan.get("discord_delivered")),
+            "discord_attempts": scan.get("discord_attempts", 0),
+            "circuit_breaker_open": bool(scan.get("circuit_breaker_open")),
+            "aborted": bool(scan.get("aborted")),
+        }
+
+    # Non-force: respect market-open guards (single iteration only).
+    if not is_us_equity_market_open() and not BYPASS_MARKET_HOURS:
+        return {
+            "status": "skipped",
+            "force": False,
+            "market_open": False,
+            "error": "US equity market is closed; pass force=True to scan last-known prices.",
+            "tickers_scanned": [],
+            "vetoes": [],
+            "trades": [],
+            "discord_delivered": True,
+        }
+
+    universe = list(TICKERS)
+    sleep_s = 10 if inter_ticker_sleep is None else inter_ticker_sleep
+    morning_macro_context = (
+        "On-demand Master Bot scan (market open). "
+        "No pre-market briefing cache attached."
+    )
+    print(f"\n📈 [Master Scan] force=False — market open; universe={universe}")
+    scan = run_portfolio_scan(
+        morning_macro_context,
+        breaker,
+        inter_ticker_sleep=sleep_s,
+        tickers=universe,
+        discord_prefix=None,
+        notify_signals_only=False,
+    )
+    return {
+        "status": "Master Bot scan completed",
+        "force": False,
+        "market_open": True,
+        "tickers_scanned": scan.get("tickers_scanned") or universe,
+        "scan_id": scan.get("scan_id"),
+        "results": scan.get("results") or [],
+        "vetoes": scan.get("vetoes") or [],
+        "trades": scan.get("trades") or [],
+        "discord_delivered": bool(scan.get("discord_delivered")),
+        "discord_attempts": scan.get("discord_attempts", 0),
+        "circuit_breaker_open": bool(scan.get("circuit_breaker_open")),
+        "aborted": bool(scan.get("aborted")),
+    }
 
 
 # ==========================================
