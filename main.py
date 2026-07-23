@@ -504,6 +504,13 @@ def api_test_master_bot():
     Concurrent hits return 409 rather than stacking dual full scans.
     Holds one gthread until the scan finishes so the JSON body reflects
     real outcomes (not fire-and-forget).
+
+    Safety:
+      * Non-blocking lock acquire → 409 if another test is mid-flight.
+      * ``finally`` ALWAYS releases the lock (``locked()`` guard) so a
+        crash, timeout, or unhandled exception cannot brick this endpoint
+        into permanent 409s for the rest of the worker lifetime.
+      * Structured 500 / 504 JSON names the failing pipeline step.
     """
     if not _master_test_lock.acquire(blocking=False):
         return jsonify({
@@ -511,13 +518,39 @@ def api_test_master_bot():
             "error": "Master Bot test already in progress.",
         }), 409
 
+    failed_step = "init"
     try:
         # Local import: keep cold import light; trading stack stays off the
         # critical path for /health and dashboard routes.
-        from master_bot import run_master_bot_scan
+        from master_bot import MasterBotScanError, run_master_bot_scan
 
+        failed_step = "run_master_bot_scan"
         print("[main] /api/test-master-bot hit — running force Master Bot scan...")
         meta = run_master_bot_scan(force=True)
+
+        # Pipeline returned a structured failure without raising (e.g. hard
+        # step abort after a timed-out external API call).
+        if meta.get("status") == "error" or meta.get("failed_at"):
+            step = meta.get("failed_at") or failed_step
+            is_timeout = bool(meta.get("is_timeout"))
+            status_code = 504 if is_timeout else 500
+            print(
+                f"[main] /api/test-master-bot FAILED at {step} "
+                f"(timeout={is_timeout}): {meta.get('error')}"
+            )
+            return jsonify({
+                "status": "error",
+                "error": f"Scan failed at: {step}",
+                "detail": meta.get("error") or meta.get("status"),
+                "is_timeout": is_timeout,
+                "failed_at": step,
+                "tickers_scanned": meta.get("tickers_scanned") or [],
+                "discord_delivered": bool(meta.get("discord_delivered", False)),
+                "scan_id": meta.get("scan_id"),
+                "results": meta.get("results") or [],
+                "vetoes": meta.get("vetoes") or [],
+                "trades": meta.get("trades") or [],
+            }), status_code
 
         # Normalize for ops clients; always include the fields called out
         # in the contract even if the scan early-aborted.
@@ -548,16 +581,51 @@ def api_test_master_bot():
         return jsonify(payload)
 
     except Exception as e:
-        print(f"[main] /api/test-master-bot FAILED: {e}")
+        # Prefer MasterBotScanError step/timeout metadata when available.
+        is_timeout = False
+        step = failed_step
+        detail = str(e)
+        try:
+            from master_bot import MasterBotScanError
+            if isinstance(e, MasterBotScanError):
+                is_timeout = bool(e.is_timeout)
+                step = e.step or failed_step
+                detail = e.message if getattr(e, "message", None) else str(e)
+        except Exception:
+            pass
+
+        if not is_timeout:
+            name = type(e).__name__.lower()
+            msg = str(e).lower()
+            if (
+                "timeout" in name
+                or "timed out" in msg
+                or "timeout" in msg
+                or isinstance(e, TimeoutError)
+            ):
+                is_timeout = True
+
+        status_code = 504 if is_timeout else 500
+        print(
+            f"[main] /api/test-master-bot FAILED at {step} "
+            f"(http={status_code}, timeout={is_timeout}): {e}"
+        )
         traceback.print_exc()
         return jsonify({
             "status": "error",
-            "error": str(e),
+            "error": f"Scan failed at: {step}",
+            "detail": detail,
+            "is_timeout": is_timeout,
+            "failed_at": step,
             "tickers_scanned": [],
             "discord_delivered": False,
-        }), 500
+        }), status_code
     finally:
-        _master_test_lock.release()
+        # ALWAYS reset the lock — success, soft failure, hard exception, or
+        # unexpected RuntimeError mid-handler. ``locked()`` avoids a second
+        # release raising if the lock was never held (defensive).
+        if _master_test_lock.locked():
+            _master_test_lock.release()
 
 
 @app.route("/status")

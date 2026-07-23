@@ -23,9 +23,11 @@ import json
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
 
 import pytz
+import requests
 import yfinance as yf
 from google import genai
 
@@ -37,6 +39,33 @@ import strike_selector
 import virtual_broker
 from circuit_breaker import CircuitBreaker
 from yf_client import SESSION
+
+# ---------------------------------------------------------------------------
+# Network / LLM hard limits
+# ---------------------------------------------------------------------------
+# Wall-clock budget per external call. Keep well under gunicorn --timeout 120
+# so a hung Yahoo/Gemini request cannot pin a gthread until worker kill.
+API_CALL_TIMEOUT_S = 20
+# google-genai HttpOptions.timeout is in milliseconds.
+LLM_HTTP_TIMEOUT_MS = 20_000
+
+
+class MasterBotScanError(Exception):
+    """
+    Hard failure during a Master Bot scan step (timeout or unrecoverable).
+
+    Attributes:
+        step: Pipeline stage name for ops JSON (``Scan failed at: <step>``).
+        is_timeout: True when the failure was a wall-clock / network timeout.
+        message: Human-readable diagnostic string.
+    """
+
+    def __init__(self, message, *, step="unknown", is_timeout=False):
+        super().__init__(message)
+        self.message = message
+        self.step = step or "unknown"
+        self.is_timeout = bool(is_timeout)
+
 
 # Employee tier
 from data_engineer import fetch_options_data
@@ -73,6 +102,68 @@ from tracker_agent import save_active_trade
 TICKERS = config.TICKERS
 GEMINI_API_KEY = config.GEMINI_API_KEY
 BYPASS_MARKET_HOURS = os.environ.get("BYPASS_MARKET_HOURS", "false").lower() == "true"
+
+
+def _gemini_client():
+    """
+    Gemini client with a strict per-request HTTP timeout.
+
+    The google-genai SDK accepts timeout via Client ``http_options``
+    (milliseconds). Do NOT pass ``request_options=`` to generate_content —
+    that kwarg is not part of the current SDK surface and is silently
+    ignored or TypeError'd depending on version.
+    """
+    return genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options={"timeout": LLM_HTTP_TIMEOUT_MS},
+    )
+
+
+def _call_with_timeout(fn, *, timeout_s=API_CALL_TIMEOUT_S, step="api_call"):
+    """
+    Run ``fn()`` under a hard wall-clock timeout.
+
+    HTTP adapters (yf_client SESSION, Gemini HttpOptions) handle most hangs,
+    but yfinance multi-request sequences and SDK edge cases can still stall.
+    This wrapper guarantees the trading thread resumes within ``timeout_s``.
+
+    Raises:
+        MasterBotScanError: on wall-clock timeout (is_timeout=True) or when
+            the underlying call raises a requests/timeout-class error.
+    """
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(fn)
+        try:
+            return future.result(timeout=timeout_s)
+        except FuturesTimeoutError as exc:
+            print(
+                f"[master_bot] TIMEOUT step={step} after {timeout_s}s — "
+                "aborting this call cleanly"
+            )
+            raise MasterBotScanError(
+                f"Timed out after {timeout_s}s",
+                step=step,
+                is_timeout=True,
+            ) from exc
+        except MasterBotScanError:
+            raise
+        except Exception as exc:
+            name = type(exc).__name__.lower()
+            msg = str(exc).lower()
+            is_timeout = (
+                "timeout" in name
+                or "timed out" in msg
+                or "timeout" in msg
+                or isinstance(exc, (TimeoutError, requests.Timeout))
+            )
+            if is_timeout:
+                print(f"[master_bot] TIMEOUT step={step}: {exc}")
+                raise MasterBotScanError(
+                    str(exc) or f"Timeout at {step}",
+                    step=step,
+                    is_timeout=True,
+                ) from exc
+            raise
 
 # On-demand test scan universe (last-known prices outside RTH).
 # Kept short so /api/test-master-bot finishes inside gunicorn --timeout.
@@ -209,13 +300,27 @@ def get_latest_futures_pct(symbol="ES=F"):
 
 
 def fetch_atr(ticker, breaker=None):
-    """ATR(14) via 1-month daily history. Returns (atr_abs, atr_pct)."""
+    """ATR(14) via 1-month daily history. Returns (atr_abs, atr_pct).
+
+    yfinance is wall-clock bounded so a hung Yahoo socket cannot stall the
+    portfolio scan / test endpoint indefinitely.
+    """
     try:
-        hist = yf.Ticker(ticker, session=SESSION).history(period="1mo")
-        atr_abs, atr_pct = strike_selector.compute_atr(hist)
+        def _fetch():
+            hist = yf.Ticker(ticker, session=SESSION).history(period="1mo")
+            return strike_selector.compute_atr(hist)
+
+        atr_abs, atr_pct = _call_with_timeout(
+            _fetch, timeout_s=API_CALL_TIMEOUT_S, step=f"yfinance_atr:{ticker}"
+        )
         if breaker and atr_abs is not None:
             breaker.record_success(f"atr:{ticker}")
         return atr_abs, atr_pct
+    except MasterBotScanError as e:
+        print(f"[{ticker}] ATR fetch failed at {e.step}: {e.message}")
+        if breaker:
+            breaker.record_failure(f"atr:{ticker}")
+        return None, None
     except Exception as e:
         print(f"[{ticker}] ATR fetch failed: {e}")
         if breaker:
@@ -230,7 +335,14 @@ def ensure_news_context(ticker, breaker=None):
         return news_string
     print(f"[{ticker}] 👷 No news in database. Running live yfinance fallback...")
     try:
-        articles = yf.Ticker(ticker, session=SESSION).news
+        def _fetch_news():
+            return yf.Ticker(ticker, session=SESSION).news
+
+        articles = _call_with_timeout(
+            _fetch_news,
+            timeout_s=API_CALL_TIMEOUT_S,
+            step=f"yfinance_news:{ticker}",
+        )
         for article in articles or []:
             title, publisher = extract_article_info(article)
             if title and title != "Unknown Title":
@@ -238,6 +350,10 @@ def ensure_news_context(ticker, breaker=None):
         news_string = get_historical_context(ticker, days=90)
         if breaker:
             breaker.record_success(f"news:{ticker}")
+    except MasterBotScanError as e:
+        print(f"❌ [{ticker}] yfinance news fallback {e.step}: {e.message}")
+        if breaker:
+            breaker.record_failure(f"news:{ticker}")
     except Exception as e:
         print(f"❌ [{ticker}] yfinance news fallback error: {e}")
         if breaker:
@@ -251,7 +367,7 @@ def ensure_news_context(ticker, breaker=None):
 
 def run_quant_manager(options_json, ticker_symbol):
     print(f"[{ticker_symbol}] 💼 Quant Manager (AI): Analyzing options chain for setups...")
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = _gemini_client()
     prompt = f"""
 You are a Quantitative Analyst. Analyze this options data for {ticker_symbol}.
 Look at the Strike prices, Implied Volatility, Volume, and Open Interest.
@@ -262,10 +378,16 @@ Data:
 {options_json}
 """
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            request_options={"timeout": 30},
+        def _llm():
+            return client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+            )
+
+        response = _call_with_timeout(
+            _llm,
+            timeout_s=API_CALL_TIMEOUT_S,
+            step=f"gemini_quant:{ticker_symbol}",
         )
         return response.text.strip()
     except Exception as e:
@@ -280,7 +402,7 @@ Data:
 
 def run_cos_synthesis(ticker_symbol, ticker_manager_report, news_report, options_report, quant_report):
     print(f"[{ticker_symbol}] 👔 Chief of Staff (AI): Synthesizing Corporate Brief...")
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = _gemini_client()
     prompt = f"""
 You are the Chief of Staff (CoS) of a quantitative hedge fund. Compile a synthesized Corporate Brief for ticker {ticker_symbol}.
 
@@ -306,10 +428,16 @@ Structure the brief as:
 - **CoS Direct Recommendation**: your advice with the deciding metrics named.
 """
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            request_options={"timeout": 30},
+        def _llm():
+            return client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+            )
+
+        response = _call_with_timeout(
+            _llm,
+            timeout_s=API_CALL_TIMEOUT_S,
+            step=f"gemini_cos:{ticker_symbol}",
         )
         return response.text.strip()
     except Exception as e:
@@ -359,7 +487,7 @@ def format_ceo_deterministic(card, contract=None):
 def run_ceo_decision(corporate_brief, morning_macro_context, card, contract=None):
     ticker = card.ticker
     print(f"[{ticker}] 👑 CEO Agent (AI): Formulating final decision...")
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = _gemini_client()
     snapshot = scoring_engine.metrics_snapshot_text(card)
     contract_block = json.dumps(contract, indent=2) if contract else "No contract selected (PASS)."
     prompt = f"""
@@ -389,10 +517,16 @@ OUTPUT RULES (strict):
 4. Do not truncate, summarize away, or omit any of the four bullets.
 """
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            request_options={"timeout": 30},
+        def _llm():
+            return client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+            )
+
+        response = _call_with_timeout(
+            _llm,
+            timeout_s=API_CALL_TIMEOUT_S,
+            step=f"gemini_ceo:{ticker}",
         )
         text = response.text.strip()
         # Schema guard: if the model drifted, fall back to deterministic format
@@ -493,6 +627,9 @@ def run_portfolio_scan(
         "discord_successes": 0,
         "circuit_breaker_open": False,
         "aborted": False,
+        "failed_at": None,
+        "error": None,
+        "is_timeout": False,
     }
 
     if breaker.is_open():
@@ -508,12 +645,43 @@ def run_portfolio_scan(
     print(f"\n🚀 PORTFOLIO SCAN {scan_id} | tickers={universe} | "
           f"weights={weights} | ES=F overnight {futures_pct}%")
 
-    # Portfolio-level technical color (LLM, for the CoS brief only)
+    # Portfolio-level technical color (LLM, for the CoS brief only).
+    # Wall-clock bound: a hung yfinance desk + Gemini manager must not pin
+    # the worker thread past API_CALL_TIMEOUT_S * stages.
     try:
         print("\n[System State] 👷 Running Ticker Specialist Desk...")
-        specialist_briefings = get_aggregated_briefings(universe)
-        ticker_manager_report = generate_ticker_manager_report(
-            specialist_briefings, api_key=GEMINI_API_KEY)
+        specialist_briefings = _call_with_timeout(
+            lambda: get_aggregated_briefings(universe),
+            # Desk fans out one yfinance pull per ticker; budget scales lightly.
+            timeout_s=max(API_CALL_TIMEOUT_S, API_CALL_TIMEOUT_S * max(1, len(universe))),
+            step="specialist_desk_yfinance",
+        )
+        ticker_manager_report = _call_with_timeout(
+            lambda: generate_ticker_manager_report(
+                specialist_briefings, api_key=GEMINI_API_KEY
+            ),
+            timeout_s=API_CALL_TIMEOUT_S,
+            step="gemini_ticker_manager",
+        )
+    except MasterBotScanError as desk_err:
+        print(
+            f"❌ Specialist Desk/Manager hard failure at {desk_err.step}: "
+            f"{desk_err.message}"
+        )
+        result["failed_at"] = desk_err.step
+        result["error"] = desk_err.message
+        result["is_timeout"] = desk_err.is_timeout
+        result["aborted"] = True
+        # Soft-degrade the brief so a force test can still exercise the
+        # per-ticker pipeline when only the portfolio desk timed out.
+        ticker_manager_report = (
+            f"Portfolio technical report unavailable "
+            f"(failed at {desk_err.step}: {desk_err.message})."
+        )
+        # Timeouts at desk level are diagnostic failures for the ops endpoint.
+        if desk_err.is_timeout:
+            result["discord_delivered"] = False
+            return result
     except Exception as desk_err:
         print(f"❌ Specialist Desk/Manager error: {desk_err}")
         ticker_manager_report = "Portfolio technical report unavailable this cycle."
@@ -531,6 +699,20 @@ def run_portfolio_scan(
             result["discord_successes"] += 1
         return ok
 
+    def _abort_scan(step_err, ticker_summary=None):
+        """Record a hard step failure and stop remaining tickers."""
+        print(
+            f"❌ Hard scan abort at {step_err.step}: {step_err.message} "
+            f"(timeout={step_err.is_timeout})"
+        )
+        result["failed_at"] = step_err.step
+        result["error"] = step_err.message
+        result["is_timeout"] = step_err.is_timeout
+        result["aborted"] = True
+        if ticker_summary is not None:
+            ticker_summary["error"] = f"{step_err.step}: {step_err.message}"
+            result["results"].append(ticker_summary)
+
     for idx, ticker in enumerate(universe):
         print(f"\n------------------------------------------")
         print(f"🔄 PROCESSING TICKER: {ticker} ({idx + 1}/{len(universe)})")
@@ -547,7 +729,11 @@ def run_portfolio_scan(
         try:
             # ---- Employee tier: raw data (circuit-breaker instrumented) ----
             print(f"[{ticker}] 👷 Data Engineer: Fetching options chain...")
-            options_json = fetch_options_data(ticker)
+            options_json = _call_with_timeout(
+                lambda t=ticker: fetch_options_data(t),
+                timeout_s=API_CALL_TIMEOUT_S,
+                step=f"yfinance_options:{ticker}",
+            )
             options_dict = json.loads(options_json)
             if "error" in options_dict:
                 print(f"❌ Skipping {ticker}: {options_dict['error']}")
@@ -562,16 +748,61 @@ def run_portfolio_scan(
                 continue
             breaker.record_success(f"options_chain:{ticker}")
 
-            pivot_data = fetch_pivot_data(ticker)
+            pivot_data = _call_with_timeout(
+                lambda t=ticker: fetch_pivot_data(t),
+                timeout_s=API_CALL_TIMEOUT_S,
+                step=f"yfinance_pivot:{ticker}",
+            )
             atr_abs, atr_pct = fetch_atr(ticker, breaker)
             news_string = ensure_news_context(ticker, breaker)
             math_json = calculate_swing_targets(options_json)
 
             # ---- Manager tier (LLM context for the brief) ----
-            risk_report = generate_risk_report(math_json, ticker, api_key=GEMINI_API_KEY)
-            sentiment_report = generate_sentiment_report(news_string, ticker, api_key=GEMINI_API_KEY)
+            # Each call is wall-clock bounded. Soft LLM failures fall back
+            # inside the manager modules; hard timeouts abort this ticker.
+            try:
+                risk_report = _call_with_timeout(
+                    lambda: generate_risk_report(
+                        math_json, ticker, api_key=GEMINI_API_KEY
+                    ),
+                    timeout_s=API_CALL_TIMEOUT_S,
+                    step=f"gemini_risk:{ticker}",
+                )
+            except MasterBotScanError as llm_err:
+                if llm_err.is_timeout:
+                    _abort_scan(llm_err, ticker_summary)
+                    break
+                risk_report = f"Risk report unavailable ({llm_err.message})."
+
+            try:
+                sentiment_report = _call_with_timeout(
+                    lambda: generate_sentiment_report(
+                        news_string, ticker, api_key=GEMINI_API_KEY
+                    ),
+                    timeout_s=API_CALL_TIMEOUT_S,
+                    step=f"gemini_sentiment:{ticker}",
+                )
+            except MasterBotScanError as llm_err:
+                if llm_err.is_timeout:
+                    _abort_scan(llm_err, ticker_summary)
+                    break
+                sentiment_report = f"Sentiment report unavailable ({llm_err.message})."
+
             quant_report = run_quant_manager(math_json, ticker)
-            macro_vector = generate_macro_catalyst_vector(ticker, api_key=GEMINI_API_KEY)
+
+            try:
+                macro_vector = _call_with_timeout(
+                    lambda: generate_macro_catalyst_vector(
+                        ticker, api_key=GEMINI_API_KEY
+                    ),
+                    timeout_s=API_CALL_TIMEOUT_S,
+                    step=f"gemini_macro:{ticker}",
+                )
+            except MasterBotScanError as llm_err:
+                if llm_err.is_timeout:
+                    _abort_scan(llm_err, ticker_summary)
+                    break
+                macro_vector = "Neutral macroeconomic backdrop (LLM offline)."
 
             # ---- Deterministic weighted scoring (Task 2) ----
             card = scoring_engine.score_ticker(
@@ -589,13 +820,31 @@ def run_portfolio_scan(
             veto_reason = None
             if card.action_flag == "EXECUTE":
                 advocate = DevilsAdvocate(api_key=GEMINI_API_KEY)
-                adv_result = advocate.evaluate_trade({
-                    "ticker": ticker,
-                    "liquidity_score": card.liquidity_score,
-                    "tech_score": card.technical_score,
-                    "sentiment_score": card.sentiment_score,
-                    "raw_metrics": card.metrics,
-                })
+                try:
+                    adv_result = _call_with_timeout(
+                        lambda: advocate.evaluate_trade({
+                            "ticker": ticker,
+                            "liquidity_score": card.liquidity_score,
+                            "tech_score": card.technical_score,
+                            "sentiment_score": card.sentiment_score,
+                            "raw_metrics": card.metrics,
+                        }),
+                        timeout_s=API_CALL_TIMEOUT_S,
+                        step=f"gemini_adversarial:{ticker}",
+                    )
+                except MasterBotScanError as llm_err:
+                    if llm_err.is_timeout:
+                        _abort_scan(llm_err, ticker_summary)
+                        break
+                    print(
+                        f"[{ticker}] 👹 Devil's Advocate timeout/fail "
+                        f"({llm_err.message}); using non-veto fallback."
+                    )
+                    adv_result = {
+                        "veto_triggered": False,
+                        "risk_confidence": 0.20,
+                        "reason": f"Fallback after {llm_err.step}: {llm_err.message}",
+                    }
                 if adv_result.get("veto_triggered") and float(adv_result.get("risk_confidence", 0)) > 0.75:
                     veto_reason = adv_result.get("reason", "") or "Adversarial veto"
                     scoring_engine.apply_adversarial_penalty(
@@ -706,6 +955,10 @@ def run_portfolio_scan(
 
             if idx < len(universe) - 1:
                 time.sleep(inter_ticker_sleep)
+        except MasterBotScanError as step_err:
+            # Hard timeout / network failure on yfinance or LLM for this ticker.
+            _abort_scan(step_err, ticker_summary)
+            break
         except Exception as ticker_err:
             print(f"❌ Error processing ticker {ticker}: {ticker_err}")
             ticker_summary["error"] = str(ticker_err)
@@ -720,8 +973,44 @@ def run_portfolio_scan(
         # No signal/veto (test mode) or empty universe — not a delivery failure.
         result["discord_delivered"] = True
 
-    print(f"\n✅ PORTFOLIO SCAN {scan_id} COMPLETED.")
+    if result.get("aborted") and result.get("failed_at"):
+        print(
+            f"\n⚠️ PORTFOLIO SCAN {scan_id} ABORTED at {result['failed_at']}: "
+            f"{result.get('error')}"
+        )
+    else:
+        print(f"\n✅ PORTFOLIO SCAN {scan_id} COMPLETED.")
     return result
+
+
+def _scan_result_payload(scan, *, force, universe, market_open, default_status):
+    """
+    Normalize portfolio-scan output for the ops HTTP contract.
+
+    When the scan aborted on a hard step failure (timeout / network), status
+    is ``error`` with ``failed_at`` so ``/api/test-master-bot`` can return
+    500/504 with ``Scan failed at: <step>``.
+    """
+    payload = {
+        "status": default_status,
+        "force": force,
+        "market_open": market_open,
+        "tickers_scanned": scan.get("tickers_scanned") or universe,
+        "scan_id": scan.get("scan_id"),
+        "results": scan.get("results") or [],
+        "vetoes": scan.get("vetoes") or [],
+        "trades": scan.get("trades") or [],
+        "discord_delivered": bool(scan.get("discord_delivered")),
+        "discord_attempts": scan.get("discord_attempts", 0),
+        "circuit_breaker_open": bool(scan.get("circuit_breaker_open")),
+        "aborted": bool(scan.get("aborted")),
+        "failed_at": scan.get("failed_at"),
+        "error": scan.get("error"),
+        "is_timeout": bool(scan.get("is_timeout")),
+    }
+    if scan.get("failed_at") and scan.get("error"):
+        payload["status"] = "error"
+    return payload
 
 
 def run_master_bot_scan(force=False, inter_ticker_sleep=None):
@@ -742,87 +1031,89 @@ def run_master_bot_scan(force=False, inter_ticker_sleep=None):
     Returns:
         dict suitable for the ``/api/test-master-bot`` JSON response, including
         tickers_scanned, vetoes, trades, discord_delivered, and status.
-    """
-    telemetry.init_telemetry_table()
-    breaker = CircuitBreaker(failure_threshold=5, cooldown_seconds=900)
+        On hard step failure also includes ``failed_at``, ``error``, ``is_timeout``.
 
-    if force:
-        universe = list(TEST_SCAN_TICKERS)
-        sleep_s = 5 if inter_ticker_sleep is None else inter_ticker_sleep
+    Raises:
+        MasterBotScanError: unexpected hard failures outside the per-ticker
+            path (propagated so the route can emit 500/504 JSON).
+    """
+    try:
+        telemetry.init_telemetry_table()
+        breaker = CircuitBreaker(failure_threshold=5, cooldown_seconds=900)
+
+        if force:
+            universe = list(TEST_SCAN_TICKERS)
+            sleep_s = 5 if inter_ticker_sleep is None else inter_ticker_sleep
+            morning_macro_context = (
+                f"{TEST_SCAN_DISCORD_PREFIX} On-demand Master Bot pipeline test. "
+                "Using last-known prices outside market-hours guards. "
+                "Not a scheduled live cycle."
+            )
+            print(
+                f"\n🔬 [TEST SCAN] force=True — bypassing market-open guards; "
+                f"universe={universe}"
+            )
+            scan = run_portfolio_scan(
+                morning_macro_context,
+                breaker,
+                inter_ticker_sleep=sleep_s,
+                tickers=universe,
+                discord_prefix=TEST_SCAN_DISCORD_PREFIX,
+                notify_signals_only=True,
+            )
+            return _scan_result_payload(
+                scan,
+                force=True,
+                universe=universe,
+                market_open=is_us_equity_market_open(),
+                default_status="Master Bot test scan completed",
+            )
+
+        # Non-force: respect market-open guards (single iteration only).
+        if not is_us_equity_market_open() and not BYPASS_MARKET_HOURS:
+            return {
+                "status": "skipped",
+                "force": False,
+                "market_open": False,
+                "error": "US equity market is closed; pass force=True to scan last-known prices.",
+                "tickers_scanned": [],
+                "vetoes": [],
+                "trades": [],
+                "discord_delivered": True,
+            }
+
+        universe = list(TICKERS)
+        sleep_s = 10 if inter_ticker_sleep is None else inter_ticker_sleep
         morning_macro_context = (
-            f"{TEST_SCAN_DISCORD_PREFIX} On-demand Master Bot pipeline test. "
-            "Using last-known prices outside market-hours guards. "
-            "Not a scheduled live cycle."
+            "On-demand Master Bot scan (market open). "
+            "No pre-market briefing cache attached."
         )
-        print(
-            f"\n🔬 [TEST SCAN] force=True — bypassing market-open guards; "
-            f"universe={universe}"
-        )
+        print(f"\n📈 [Master Scan] force=False — market open; universe={universe}")
         scan = run_portfolio_scan(
             morning_macro_context,
             breaker,
             inter_ticker_sleep=sleep_s,
             tickers=universe,
-            discord_prefix=TEST_SCAN_DISCORD_PREFIX,
-            notify_signals_only=True,
+            discord_prefix=None,
+            notify_signals_only=False,
         )
-        return {
-            "status": "Master Bot test scan completed",
-            "force": True,
-            "market_open": is_us_equity_market_open(),
-            "tickers_scanned": scan.get("tickers_scanned") or universe,
-            "scan_id": scan.get("scan_id"),
-            "results": scan.get("results") or [],
-            "vetoes": scan.get("vetoes") or [],
-            "trades": scan.get("trades") or [],
-            "discord_delivered": bool(scan.get("discord_delivered")),
-            "discord_attempts": scan.get("discord_attempts", 0),
-            "circuit_breaker_open": bool(scan.get("circuit_breaker_open")),
-            "aborted": bool(scan.get("aborted")),
-        }
-
-    # Non-force: respect market-open guards (single iteration only).
-    if not is_us_equity_market_open() and not BYPASS_MARKET_HOURS:
-        return {
-            "status": "skipped",
-            "force": False,
-            "market_open": False,
-            "error": "US equity market is closed; pass force=True to scan last-known prices.",
-            "tickers_scanned": [],
-            "vetoes": [],
-            "trades": [],
-            "discord_delivered": True,
-        }
-
-    universe = list(TICKERS)
-    sleep_s = 10 if inter_ticker_sleep is None else inter_ticker_sleep
-    morning_macro_context = (
-        "On-demand Master Bot scan (market open). "
-        "No pre-market briefing cache attached."
-    )
-    print(f"\n📈 [Master Scan] force=False — market open; universe={universe}")
-    scan = run_portfolio_scan(
-        morning_macro_context,
-        breaker,
-        inter_ticker_sleep=sleep_s,
-        tickers=universe,
-        discord_prefix=None,
-        notify_signals_only=False,
-    )
-    return {
-        "status": "Master Bot scan completed",
-        "force": False,
-        "market_open": True,
-        "tickers_scanned": scan.get("tickers_scanned") or universe,
-        "scan_id": scan.get("scan_id"),
-        "results": scan.get("results") or [],
-        "vetoes": scan.get("vetoes") or [],
-        "trades": scan.get("trades") or [],
-        "discord_delivered": bool(scan.get("discord_delivered")),
-        "discord_attempts": scan.get("discord_attempts", 0),
-        "circuit_breaker_open": bool(scan.get("circuit_breaker_open")),
-        "aborted": bool(scan.get("aborted")),
-    }
+        return _scan_result_payload(
+            scan,
+            force=False,
+            universe=universe,
+            market_open=True,
+            default_status="Master Bot scan completed",
+        )
+    except MasterBotScanError:
+        raise
+    except Exception as exc:
+        # Unexpected programming / import / DB failures — wrap with step so
+        # the HTTP layer always has a stable diagnostic field.
+        raise MasterBotScanError(
+            str(exc) or type(exc).__name__,
+            step="run_master_bot_scan",
+            is_timeout=False,
+        ) from exc
 
 
 # ==========================================
