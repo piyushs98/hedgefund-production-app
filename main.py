@@ -5,9 +5,6 @@ Single process that:
   1. Serves Flask health + Virtual Hedge Fund dashboard/API under gunicorn.
   2. Runs the macro CEO loop (master_bot, ~30-min trading cadence) on a daemon thread.
   3. Runs the micro tracker loop (tracker_agent, 5-min cadence) on a daemon thread.
-  4. Exposes /api/force-briefing for on-demand DeepSeek pre-market Discord tests.
-  5. Exposes /api/test-master-bot for on-demand Master Bot pipeline verification
-     (force scan outside market hours; last-known prices on a benchmark list).
 
 Either background thread may hit network drops or API throttling; failures are
 logged and the thread backs off without taking down this process.
@@ -58,14 +55,6 @@ START_TIME = time.time()
 _init_lock = Lock()
 _background_loops_started = False
 _process_prepared = False
-
-# Serialize on-demand briefings so two browser hits cannot fire dual DeepSeek
-# + Discord storms (DeepSeek call can hold a worker thread up to ~90s).
-_force_briefing_lock = Lock()
-
-# Serialize on-demand Master Bot test scans (full pipeline + Gemini + Discord).
-# Non-blocking acquire → HTTP 409 if a scan is already holding a worker thread.
-_master_test_lock = Lock()
 
 app = Flask(__name__)
 
@@ -409,225 +398,6 @@ def health():
     return "OK"
 
 
-@app.route("/api/force-briefing")
-def api_force_briefing():
-    """
-    Hidden ops endpoint: run the DeepSeek pre-market briefing + Discord
-    webhook immediately, regardless of EST clock / prep-meeting window.
-
-    Same pipeline as the scheduled 09:15 EST prep meeting
-    (pre_market_meeting.force_pre_market_briefing).
-
-    Holds one gthread worker thread until DeepSeek (≤90s timeout) + Discord
-    finish so the JSON body reflects real outcomes — not a fire-and-forget.
-    Concurrent hits return 409 rather than stacking dual DeepSeek calls.
-    """
-    # Non-blocking acquire: a second tab must not pile another 90s DeepSeek
-    # call onto an already-busy worker pool (health-check starvation risk).
-    if not _force_briefing_lock.acquire(blocking=False):
-        return jsonify({
-            "status": "error",
-            "error": "Briefing already in progress; retry shortly.",
-        }), 409
-
-    try:
-        # Local import: keep cold import light; avoid trading-stack side effects
-        from pre_market_meeting import force_pre_market_briefing
-
-        print("[main] /api/force-briefing hit — running on-demand CoS briefing...")
-        meta = force_pre_market_briefing()
-
-        deepseek_ok = bool(meta.get("deepseek_ok"))
-        discord_ok = bool(meta.get("discord_delivered"))
-        source = meta.get("source") or "fallback"
-        deepseek_error = meta.get("deepseek_error")
-
-        # Full success: DeepSeek synthesized AND Discord accepted the webhook.
-        if deepseek_ok and discord_ok:
-            return jsonify({"status": "Briefing forced and sent"})
-
-        # Partial / failed — still useful for ops diagnosis; do not claim "sent"
-        # if Discord never delivered, and surface DeepSeek timeout/fallback.
-        payload = {
-            "status": "error",
-            "deepseek_ok": deepseek_ok,
-            "deepseek_error": deepseek_error,
-            "discord_delivered": discord_ok,
-            "source": source,
-        }
-        if discord_ok and not deepseek_ok:
-            payload["status"] = "Briefing forced and sent (DeepSeek fallback)"
-            payload["warning"] = (
-                "Discord delivered a DB fallback briefing; DeepSeek did not succeed. "
-                f"detail={deepseek_error}"
-            )
-            # 200 with warning: webhook path verified; model path needs attention
-            return jsonify(payload), 200
-
-        if deepseek_ok and not discord_ok:
-            payload["error"] = (
-                "DeepSeek OK but Discord webhook failed "
-                "(check DISCORD_WEBHOOK / rate limits)."
-            )
-            return jsonify(payload), 502
-
-        payload["error"] = (
-            "DeepSeek failed and Discord did not deliver. "
-            f"deepseek={deepseek_error}"
-        )
-        return jsonify(payload), 502
-
-    except Exception as e:
-        # Unexpected hard failures (import errors, programming bugs). DeepSeek
-        # HTTP timeouts are handled inside generate_morning_briefing and do not
-        # land here — they become deepseek_ok=False + fallback text above.
-        print(f"[main] /api/force-briefing FAILED: {e}")
-        traceback.print_exc()
-        return jsonify({
-            "status": "error",
-            "error": str(e),
-        }), 500
-    finally:
-        _force_briefing_lock.release()
-
-
-@app.route("/api/test-master-bot")
-def api_test_master_bot():
-    """
-    Hidden ops endpoint: run one Master Bot portfolio scan immediately,
-    bypassing market-open guards (last-known prices on SPY/QQQ/NVDA).
-
-    Full pipeline via master_bot.run_master_bot_scan(force=True):
-      price/options -> scoring/momentum -> Adversarial veto -> virtual broker.
-    Signal/veto Discord messages are prefixed with ``[TEST SCAN]``.
-
-    Concurrent hits return 409 rather than stacking dual full scans.
-    Holds one gthread until the scan finishes so the JSON body reflects
-    real outcomes (not fire-and-forget).
-
-    Safety:
-      * Non-blocking lock acquire → 409 if another test is mid-flight.
-      * ``finally`` ALWAYS releases the lock (``locked()`` guard) so a
-        crash, timeout, or unhandled exception cannot brick this endpoint
-        into permanent 409s for the rest of the worker lifetime.
-      * Structured 500 / 504 JSON names the failing pipeline step.
-    """
-    if not _master_test_lock.acquire(blocking=False):
-        return jsonify({
-            "status": "error",
-            "error": "Master Bot test already in progress.",
-        }), 409
-
-    failed_step = "init"
-    try:
-        # Local import: keep cold import light; trading stack stays off the
-        # critical path for /health and dashboard routes.
-        from master_bot import MasterBotScanError, run_master_bot_scan
-
-        failed_step = "run_master_bot_scan"
-        print("[main] /api/test-master-bot hit — running force Master Bot scan...")
-        meta = run_master_bot_scan(force=True)
-
-        # Pipeline returned a structured failure without raising (e.g. hard
-        # step abort after a timed-out external API call).
-        if meta.get("status") == "error" or meta.get("failed_at"):
-            step = meta.get("failed_at") or failed_step
-            is_timeout = bool(meta.get("is_timeout"))
-            status_code = 504 if is_timeout else 500
-            print(
-                f"[main] /api/test-master-bot FAILED at {step} "
-                f"(timeout={is_timeout}): {meta.get('error')}"
-            )
-            return jsonify({
-                "status": "error",
-                "error": f"Scan failed at: {step}",
-                "detail": meta.get("error") or meta.get("status"),
-                "is_timeout": is_timeout,
-                "failed_at": step,
-                "tickers_scanned": meta.get("tickers_scanned") or [],
-                "discord_delivered": bool(meta.get("discord_delivered", False)),
-                "scan_id": meta.get("scan_id"),
-                "results": meta.get("results") or [],
-                "vetoes": meta.get("vetoes") or [],
-                "trades": meta.get("trades") or [],
-            }), status_code
-
-        # Normalize for ops clients; always include the fields called out
-        # in the contract even if the scan early-aborted.
-        payload = {
-            "status": meta.get("status") or "Master Bot test scan completed",
-            "tickers_scanned": meta.get("tickers_scanned") or [],
-            "discord_delivered": bool(meta.get("discord_delivered")),
-            "scan_id": meta.get("scan_id"),
-            "force": bool(meta.get("force", True)),
-            "market_open": meta.get("market_open"),
-            "vetoes": meta.get("vetoes") or [],
-            "trades": meta.get("trades") or [],
-            "results": meta.get("results") or [],
-            "discord_attempts": meta.get("discord_attempts", 0),
-            "circuit_breaker_open": bool(meta.get("circuit_breaker_open")),
-            "aborted": bool(meta.get("aborted")),
-        }
-
-        if meta.get("aborted") and meta.get("circuit_breaker_open"):
-            payload["status"] = "Master Bot test scan aborted (circuit breaker open)"
-            payload["warning"] = "Circuit breaker open — remaining tickers skipped."
-
-        print(
-            f"[main] /api/test-master-bot done scan_id={payload.get('scan_id')} "
-            f"vetoes={len(payload['vetoes'])} trades={len(payload['trades'])} "
-            f"discord_delivered={payload['discord_delivered']}"
-        )
-        return jsonify(payload)
-
-    except Exception as e:
-        # Prefer MasterBotScanError step/timeout metadata when available.
-        is_timeout = False
-        step = failed_step
-        detail = str(e)
-        try:
-            from master_bot import MasterBotScanError
-            if isinstance(e, MasterBotScanError):
-                is_timeout = bool(e.is_timeout)
-                step = e.step or failed_step
-                detail = e.message if getattr(e, "message", None) else str(e)
-        except Exception:
-            pass
-
-        if not is_timeout:
-            name = type(e).__name__.lower()
-            msg = str(e).lower()
-            if (
-                "timeout" in name
-                or "timed out" in msg
-                or "timeout" in msg
-                or isinstance(e, TimeoutError)
-            ):
-                is_timeout = True
-
-        status_code = 504 if is_timeout else 500
-        print(
-            f"[main] /api/test-master-bot FAILED at {step} "
-            f"(http={status_code}, timeout={is_timeout}): {e}"
-        )
-        traceback.print_exc()
-        return jsonify({
-            "status": "error",
-            "error": f"Scan failed at: {step}",
-            "detail": detail,
-            "is_timeout": is_timeout,
-            "failed_at": step,
-            "tickers_scanned": [],
-            "discord_delivered": False,
-        }), status_code
-    finally:
-        # ALWAYS reset the lock — success, soft failure, hard exception, or
-        # unexpected RuntimeError mid-handler. ``locked()`` avoids a second
-        # release raising if the lock was never held (defensive).
-        if _master_test_lock.locked():
-            _master_test_lock.release()
-
-
 @app.route("/status")
 def status():
     """Optional ops endpoint: active trade count + thread names (best-effort)."""
@@ -664,13 +434,12 @@ def status():
 # Do NOT add --preload: the master would start daemon threads, then fork;
 # children inherit _background_loops_started=True but not live threads → no bots.
 #
-# --threads 8 keeps /health answering while /stream SSE and DeepSeek hold other
-# threads (Flask app.run() blocked on SSE → Render 502 + restarts). Residual
-# risk: each open /stream tab occupies one thread until disconnect; leave headroom
+# --threads 8 keeps /health answering while /stream SSE holds other threads
+# (Flask app.run() blocked on SSE → Render 502 + restarts). Residual risk:
+# each open /stream tab occupies one thread until disconnect; leave headroom
 # for Render health checks (avoid 7+ simultaneous SSE clients on threads=8).
-# --timeout 120 covers /api/force-briefing (DeepSeek HTTP timeout is 90s).
-# /api/test-master-bot runs a short 3-ticker force scan; raise timeout if the
-# universe grows or Gemini latency spikes (ops can also hit outside RTH).
+# --timeout 120 covers long portfolio scans / Gemini calls on daemon threads
+# without killing the worker mid-cycle.
 
 def prepare_process() -> None:
     """

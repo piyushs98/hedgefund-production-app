@@ -349,32 +349,22 @@ def _call_deepseek(api_key: str, overnight_context: str) -> str:
     return _extract_deepseek_text(payload)
 
 
-def generate_morning_briefing(api_key=None, *, return_meta: bool = False):
+def generate_morning_briefing(api_key=None):
     """
     Chief of Staff (CoS) Agent - Executive Tier:
     Queries SQLite for overnight data, synthesizes an executive summary briefing
     using DeepSeek, and broadcasts the formatted alert to Discord.
 
-    DeepSeek HTTP timeouts / API errors are caught here and fall back to a
-    live overnight-data briefing so the scheduled prep meeting never crashes
-    the macro loop. Ops callers that need success diagnostics should use
-    force_pre_market_briefing() or pass return_meta=True.
+    Scheduled by master_bot.run_macro_loop() during the 09:15–09:29 EST
+    pre-market prep window (once per trading day). DeepSeek HTTP timeouts /
+    API errors fall back to a live overnight-data briefing so the prep
+    meeting never crashes the macro loop.
 
     Args:
         api_key: Optional DeepSeek key override.
-        return_meta: When True, return a dict with delivery diagnostics instead
-            of plain briefing text (used by /api/force-briefing).
 
     Returns:
-        str | dict: Synthesized briefing text (default), or metadata dict when
-        return_meta=True:
-            {
-              "briefing_text": str,
-              "deepseek_ok": bool,
-              "deepseek_error": str | None,
-              "discord_delivered": bool,
-              "source": "deepseek" | "fallback",
-            }
+        str: Synthesized briefing text (DeepSeek or DB fallback).
     """
     key = (api_key or DEEPSEEK_API_KEY or "").strip()
     print("[Chief of Staff] 📋 CoS Agent (AI): Querying database for overnight data...")
@@ -388,12 +378,8 @@ def generate_morning_briefing(api_key=None, *, return_meta: bool = False):
 
     print("[Chief of Staff] 📋 CoS Agent (AI): Synthesizing Morning Briefing with DeepSeek...")
     briefing_text = None
-    deepseek_ok = False
-    deepseek_error = None
-    source = "fallback"
 
     if not key:
-        deepseek_error = "DEEPSEEK_API_KEY is empty"
         print(
             "[Chief of Staff] ERROR: DEEPSEEK_API_KEY is empty — cannot call DeepSeek. "
             "Building live data-driven briefing from overnight DB instead."
@@ -403,8 +389,6 @@ def generate_morning_briefing(api_key=None, *, return_meta: bool = False):
         try:
             briefing_text = _call_deepseek(key, overnight_context)
             if not briefing_text:
-                # Log so silent empty replies are diagnosable
-                deepseek_error = "DeepSeek returned empty text after successful HTTP call"
                 print(
                     "[Chief of Staff] ERROR: DeepSeek returned empty text after "
                     "successful call."
@@ -415,8 +399,6 @@ def generate_morning_briefing(api_key=None, *, return_meta: bool = False):
                 )
                 briefing_text = _build_live_data_briefing(overnight_context)
             else:
-                deepseek_ok = True
-                source = "deepseek"
                 print(
                     f"[Chief of Staff] DeepSeek briefing OK ({len(briefing_text)} chars)."
                 )
@@ -432,7 +414,6 @@ def generate_morning_briefing(api_key=None, *, return_meta: bool = False):
                 if http_status is not None
                 else ""
             )
-            deepseek_error = f"{type(e).__name__}: {e}{status_suffix}"
             print(f"[Pre-Market] DeepSeek Call Failed: {e}{status_suffix}")
             traceback.print_exc()
             print(
@@ -453,59 +434,19 @@ def generate_morning_briefing(api_key=None, *, return_meta: bool = False):
 
     # 2. Broadcast to Discord (never raises; returns False on webhook failure)
     print("[Chief of Staff] 📋 CoS Agent (AI): Broadcasting morning briefing to Discord...")
-    discord_delivered = bool(broadcaster.send_discord_alert(briefing_text))
-
-    if return_meta:
-        return {
-            "briefing_text": briefing_text,
-            "deepseek_ok": deepseek_ok,
-            "deepseek_error": deepseek_error,
-            "discord_delivered": discord_delivered,
-            "source": source,
-        }
+    broadcaster.send_discord_alert(briefing_text)
     return briefing_text
 
 
-def force_pre_market_briefing(api_key=None) -> dict:
-    """
-    On-demand pre-market briefing — same DeepSeek + Discord pipeline as the
-    scheduled 09:15–09:29 EST prep meeting, but runnable at any time of day.
-
-    Intended for ops verification (API keys, Discord webhooks) via
-    `/api/force-briefing` or direct import. Does not consult the macro clock.
-
-    Always returns a diagnostics dict (never bare str) so callers can tell
-    DeepSeek timeouts / Discord failures from true success. DeepSeek errors
-    are swallowed inside generate_morning_briefing with a DB fallback so this
-    function does not raise on API timeout; check deepseek_ok / discord_delivered.
-    """
-    print(
-        "[Chief of Staff] ⚡ FORCE pre-market briefing requested "
-        "(bypassing schedule)..."
-    )
-    meta = generate_morning_briefing(api_key=api_key, return_meta=True)
-    assert isinstance(meta, dict)
-    return meta
-
-
-# ==========================================
-# 🧪 TEST THE AGENT
-# ==========================================
 if __name__ == "__main__":
-    print("[Chief of Staff] Standalone Test: Generating morning briefing...")
+    print("[Chief of Staff] Standalone run: Generating morning briefing...")
 
-    # Verify environment variable configuration overrides broadcaster webhook
+    # Allow env webhook override when running this module directly.
     discord_webhook = os.environ.get("DISCORD_WEBHOOK")
     if discord_webhook:
         broadcaster.WEBHOOK_URL = discord_webhook
 
-    result = force_pre_market_briefing()
+    result = generate_morning_briefing()
     print("\n--- GENERATED MORNING BRIEFING ---\n")
-    print(result.get("briefing_text"))
-    print("\n--- DIAGNOSTICS ---")
-    print(
-        f"source={result.get('source')} deepseek_ok={result.get('deepseek_ok')} "
-        f"discord_delivered={result.get('discord_delivered')} "
-        f"deepseek_error={result.get('deepseek_error')}"
-    )
+    print(result)
     print("\n----------------------------------")

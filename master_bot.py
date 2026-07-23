@@ -7,10 +7,8 @@ This module is pure trading logic: portfolio scans, CEO synthesis, and
 in modules imported at the top level of this file.
 
 Key design notes:
-  * Single run_portfolio_scan() shared by developer-bypass, live, and
-    on-demand test paths.
-  * run_master_bot_scan(force=True) is the ops entry for any-time pipeline
-    verification (benchmark tickers + [TEST SCAN] Discord on signal/veto).
+  * Single run_portfolio_scan() used by the live 30-min market-hours loop
+    and the optional BYPASS_MARKET_HOURS developer one-shot.
   * scoring_engine.py grades pillars from raw numbers + dynamic weights.
   * CEO output uses a strict per-ticker Markdown schema; Gemini failure
     falls back to a deterministic numeric formatter.
@@ -75,8 +73,7 @@ from math_agent import calculate_swing_targets
 from news_memory import get_historical_context, save_headline, clear_expired_news
 import sqlite3
 
-# Executive briefing — scheduled prep uses generate_morning_briefing();
-# on-demand ops use pre_market_meeting.force_pre_market_briefing() via main.py.
+# Executive briefing — scheduled 09:15–09:29 EST prep meeting.
 from pre_market_meeting import generate_morning_briefing
 
 # Scrapers
@@ -164,11 +161,6 @@ def _call_with_timeout(fn, *, timeout_s=API_CALL_TIMEOUT_S, step="api_call"):
                     is_timeout=True,
                 ) from exc
             raise
-
-# On-demand test scan universe (last-known prices outside RTH).
-# Kept short so /api/test-master-bot finishes inside gunicorn --timeout.
-TEST_SCAN_TICKERS = ["SPY", "QQQ", "NVDA"]
-TEST_SCAN_DISCORD_PREFIX = "[TEST SCAN]"
 
 # Shared with main.py / tracker_agent.py — absolute path so cwd cannot desync.
 ACTIVE_TRADES_PATH = os.environ.get(
@@ -303,7 +295,7 @@ def fetch_atr(ticker, breaker=None):
     """ATR(14) via 1-month daily history. Returns (atr_abs, atr_pct).
 
     yfinance is wall-clock bounded so a hung Yahoo socket cannot stall the
-    portfolio scan / test endpoint indefinitely.
+    portfolio scan indefinitely.
     """
     try:
         def _fetch():
@@ -587,14 +579,11 @@ def run_portfolio_scan(
     breaker,
     inter_ticker_sleep=10,
     tickers=None,
-    discord_prefix=None,
-    notify_signals_only=False,
 ):
     """
     One full pass across a ticker universe.
 
-    Shared by the live 30-min loop, developer bypass, and on-demand
-    ``run_master_bot_scan(force=True)`` test path.
+    Used by the live 30-min market-hours loop (and optional developer bypass).
 
     Pipeline per ticker:
       price/options retrieval -> technical/momentum scoring ->
@@ -602,14 +591,10 @@ def run_portfolio_scan(
       Discord (+ virtual broker on EXECUTE).
 
     Args:
-        morning_macro_context: Pre-market / test briefing text for the CEO.
+        morning_macro_context: Pre-market briefing text for the CEO.
         breaker: CircuitBreaker instance.
         inter_ticker_sleep: Seconds between tickers (rate-limit cushion).
         tickers: Universe override; defaults to config TICKERS.
-        discord_prefix: Optional string prepended to Discord messages
-            (e.g. ``[TEST SCAN]`` for on-demand tests).
-        notify_signals_only: When True, only Discord on EXECUTE signals
-            or adversarial vetoes (test path). Live path keeps always-on.
 
     Returns:
         dict with scan_id, tickers_scanned, results, vetoes, trades,
@@ -647,7 +632,7 @@ def run_portfolio_scan(
 
     # Portfolio-level technical color (LLM, for the CoS brief only).
     # Wall-clock bound: a hung yfinance desk + Gemini manager must not pin
-    # the worker thread past API_CALL_TIMEOUT_S * stages.
+    # the trading thread past API_CALL_TIMEOUT_S * stages.
     try:
         print("\n[System State] 👷 Running Ticker Specialist Desk...")
         specialist_briefings = _call_with_timeout(
@@ -672,13 +657,12 @@ def run_portfolio_scan(
         result["error"] = desk_err.message
         result["is_timeout"] = desk_err.is_timeout
         result["aborted"] = True
-        # Soft-degrade the brief so a force test can still exercise the
-        # per-ticker pipeline when only the portfolio desk timed out.
+        # Soft-degrade the brief so per-ticker pipeline can still run when
+        # only the portfolio desk timed out.
         ticker_manager_report = (
             f"Portfolio technical report unavailable "
             f"(failed at {desk_err.step}: {desk_err.message})."
         )
-        # Timeouts at desk level are diagnostic failures for the ops endpoint.
         if desk_err.is_timeout:
             result["discord_delivered"] = False
             return result
@@ -686,13 +670,9 @@ def run_portfolio_scan(
         print(f"❌ Specialist Desk/Manager error: {desk_err}")
         ticker_manager_report = "Portfolio technical report unavailable this cycle."
 
-    def _maybe_discord(message, force_send=False):
-        """Send Discord; track delivery. force_send=True ignores notify_signals_only."""
-        if notify_signals_only and not force_send:
-            return None
+    def _send_discord(message):
+        """Send Discord alert and track delivery success for this scan."""
         text = str(message) if message is not None else ""
-        if discord_prefix and text:
-            text = f"{discord_prefix} {text}"
         result["discord_attempts"] += 1
         ok = broadcaster.send_discord_alert(text)
         if ok:
@@ -891,32 +871,15 @@ def run_portfolio_scan(
             ticker_summary["vetoed"] = vetoed
             ticker_summary["veto_reason"] = veto_reason
 
-            # Discord: live path always broadcasts CEO decision.
-            # Test path (notify_signals_only) only on signal or veto, with prefix.
-            if notify_signals_only:
-                if vetoed:
-                    veto_msg = (
-                        f"{ticker} VETO — score {card.total_score}/100 "
-                        f"flag={card.action_flag}. Reason: {veto_reason}"
-                    )
-                    _maybe_discord(veto_msg, force_send=True)
-                    result["vetoes"].append({
-                        "ticker": ticker,
-                        "reason": veto_reason,
-                        "total_score": card.total_score,
-                        "action_flag": card.action_flag,
-                    })
-                elif card.action_flag == "EXECUTE":
-                    _maybe_discord(trade_decision, force_send=True)
-            else:
-                _maybe_discord(trade_decision, force_send=True)
-                if vetoed:
-                    result["vetoes"].append({
-                        "ticker": ticker,
-                        "reason": veto_reason,
-                        "total_score": card.total_score,
-                        "action_flag": card.action_flag,
-                    })
+            # Live path: always broadcast CEO decision; record vetoes.
+            _send_discord(trade_decision)
+            if vetoed:
+                result["vetoes"].append({
+                    "ticker": ticker,
+                    "reason": veto_reason,
+                    "total_score": card.total_score,
+                    "action_flag": card.action_flag,
+                })
 
             # ---- Persist confirmed EXECUTE for Tracker micro-loop ----
             # Scoring / strike selection already decided action_flag; this only
@@ -970,7 +933,7 @@ def run_portfolio_scan(
             and result["discord_successes"] > 0
         )
     else:
-        # No signal/veto (test mode) or empty universe — not a delivery failure.
+        # Empty universe or no alerts — not a delivery failure.
         result["discord_delivered"] = True
 
     if result.get("aborted") and result.get("failed_at"):
@@ -981,139 +944,6 @@ def run_portfolio_scan(
     else:
         print(f"\n✅ PORTFOLIO SCAN {scan_id} COMPLETED.")
     return result
-
-
-def _scan_result_payload(scan, *, force, universe, market_open, default_status):
-    """
-    Normalize portfolio-scan output for the ops HTTP contract.
-
-    When the scan aborted on a hard step failure (timeout / network), status
-    is ``error`` with ``failed_at`` so ``/api/test-master-bot`` can return
-    500/504 with ``Scan failed at: <step>``.
-    """
-    payload = {
-        "status": default_status,
-        "force": force,
-        "market_open": market_open,
-        "tickers_scanned": scan.get("tickers_scanned") or universe,
-        "scan_id": scan.get("scan_id"),
-        "results": scan.get("results") or [],
-        "vetoes": scan.get("vetoes") or [],
-        "trades": scan.get("trades") or [],
-        "discord_delivered": bool(scan.get("discord_delivered")),
-        "discord_attempts": scan.get("discord_attempts", 0),
-        "circuit_breaker_open": bool(scan.get("circuit_breaker_open")),
-        "aborted": bool(scan.get("aborted")),
-        "failed_at": scan.get("failed_at"),
-        "error": scan.get("error"),
-        "is_timeout": bool(scan.get("is_timeout")),
-    }
-    if scan.get("failed_at") and scan.get("error"):
-        payload["status"] = "error"
-    return payload
-
-
-def run_master_bot_scan(force=False, inter_ticker_sleep=None):
-    """
-    Standalone single-iteration Master Bot market scan.
-
-    Full pipeline: price retrieval -> technical/momentum analysis ->
-    Adversarial Agent risk/veto -> virtual broker execution (+ Discord).
-
-    Args:
-        force: When True, bypass market-open guards and scan the benchmark
-            list ``TEST_SCAN_TICKERS`` using last-known yfinance prices.
-            Signals and vetoes are Discord-notified with a ``[TEST SCAN]``
-            prefix. When False, only runs during the NYSE cash session on
-            the full configured ``TICKERS`` universe (same as live cadence).
-        inter_ticker_sleep: Optional override; defaults to 5s (force) / 10s (live).
-
-    Returns:
-        dict suitable for the ``/api/test-master-bot`` JSON response, including
-        tickers_scanned, vetoes, trades, discord_delivered, and status.
-        On hard step failure also includes ``failed_at``, ``error``, ``is_timeout``.
-
-    Raises:
-        MasterBotScanError: unexpected hard failures outside the per-ticker
-            path (propagated so the route can emit 500/504 JSON).
-    """
-    try:
-        telemetry.init_telemetry_table()
-        breaker = CircuitBreaker(failure_threshold=5, cooldown_seconds=900)
-
-        if force:
-            universe = list(TEST_SCAN_TICKERS)
-            sleep_s = 5 if inter_ticker_sleep is None else inter_ticker_sleep
-            morning_macro_context = (
-                f"{TEST_SCAN_DISCORD_PREFIX} On-demand Master Bot pipeline test. "
-                "Using last-known prices outside market-hours guards. "
-                "Not a scheduled live cycle."
-            )
-            print(
-                f"\n🔬 [TEST SCAN] force=True — bypassing market-open guards; "
-                f"universe={universe}"
-            )
-            scan = run_portfolio_scan(
-                morning_macro_context,
-                breaker,
-                inter_ticker_sleep=sleep_s,
-                tickers=universe,
-                discord_prefix=TEST_SCAN_DISCORD_PREFIX,
-                notify_signals_only=True,
-            )
-            return _scan_result_payload(
-                scan,
-                force=True,
-                universe=universe,
-                market_open=is_us_equity_market_open(),
-                default_status="Master Bot test scan completed",
-            )
-
-        # Non-force: respect market-open guards (single iteration only).
-        if not is_us_equity_market_open() and not BYPASS_MARKET_HOURS:
-            return {
-                "status": "skipped",
-                "force": False,
-                "market_open": False,
-                "error": "US equity market is closed; pass force=True to scan last-known prices.",
-                "tickers_scanned": [],
-                "vetoes": [],
-                "trades": [],
-                "discord_delivered": True,
-            }
-
-        universe = list(TICKERS)
-        sleep_s = 10 if inter_ticker_sleep is None else inter_ticker_sleep
-        morning_macro_context = (
-            "On-demand Master Bot scan (market open). "
-            "No pre-market briefing cache attached."
-        )
-        print(f"\n📈 [Master Scan] force=False — market open; universe={universe}")
-        scan = run_portfolio_scan(
-            morning_macro_context,
-            breaker,
-            inter_ticker_sleep=sleep_s,
-            tickers=universe,
-            discord_prefix=None,
-            notify_signals_only=False,
-        )
-        return _scan_result_payload(
-            scan,
-            force=False,
-            universe=universe,
-            market_open=True,
-            default_status="Master Bot scan completed",
-        )
-    except MasterBotScanError:
-        raise
-    except Exception as exc:
-        # Unexpected programming / import / DB failures — wrap with step so
-        # the HTTP layer always has a stable diagnostic field.
-        raise MasterBotScanError(
-            str(exc) or type(exc).__name__,
-            step="run_master_bot_scan",
-            is_timeout=False,
-        ) from exc
 
 
 # ==========================================
