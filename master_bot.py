@@ -35,6 +35,7 @@ import telemetry
 import scoring_engine
 import strike_selector
 import virtual_broker
+import llm_chain
 from circuit_breaker import CircuitBreaker
 from yf_client import SESSION
 
@@ -46,6 +47,9 @@ from yf_client import SESSION
 API_CALL_TIMEOUT_S = 20
 # google-genai HttpOptions.timeout is in milliseconds.
 LLM_HTTP_TIMEOUT_MS = 20_000
+# Gemini → DeepSeek chain may use two sequential provider attempts.
+LLM_CHAIN_TIMEOUT_S = API_CALL_TIMEOUT_S
+LLM_CHAIN_WALL_CLOCK_S = API_CALL_TIMEOUT_S * 2
 
 
 class MasterBotScanError(Exception):
@@ -98,6 +102,7 @@ from tracker_agent import save_active_trade
 
 TICKERS = config.TICKERS
 GEMINI_API_KEY = config.GEMINI_API_KEY
+DEEPSEEK_API_KEY = getattr(config, "DEEPSEEK_API_KEY", "") or os.environ.get("DEEPSEEK_API_KEY", "")
 BYPASS_MARKET_HOURS = os.environ.get("BYPASS_MARKET_HOURS", "false").lower() == "true"
 
 
@@ -109,11 +114,54 @@ def _gemini_client():
     (milliseconds). Do NOT pass ``request_options=`` to generate_content —
     that kwarg is not part of the current SDK surface and is silently
     ignored or TypeError'd depending on version.
+
+    Prefer ``_llm_generate_text`` for new call sites — it adds DeepSeek failover.
     """
     return genai.Client(
         api_key=GEMINI_API_KEY,
         http_options={"timeout": LLM_HTTP_TIMEOUT_MS},
     )
+
+
+def _llm_generate_text(prompt, *, step, system=None, timeout_s=LLM_CHAIN_TIMEOUT_S):
+    """
+    High-availability LLM text: Gemini first, automatic DeepSeek failover.
+
+    Integrates with existing SRE envelopes:
+      * Each provider attempt is wall-clock bounded (same ``timeout_s``).
+      * Raises ``MasterBotScanError`` so ticker isolation / immortal loop
+        paths continue to work unchanged.
+      * Does not alter scoring or execution criteria — text generation only.
+    """
+    try:
+        return llm_chain.generate_text(
+            prompt,
+            step=step,
+            system=system,
+            timeout_s=timeout_s,
+        )
+    except llm_chain.LLMChainError as exc:
+        raise MasterBotScanError(
+            exc.message,
+            step=exc.step or step,
+            is_timeout=exc.is_timeout,
+        ) from exc
+    except MasterBotScanError:
+        raise
+    except Exception as exc:
+        name = type(exc).__name__.lower()
+        msg = str(exc).lower()
+        is_timeout = (
+            "timeout" in name
+            or "timed out" in msg
+            or "timeout" in msg
+            or isinstance(exc, (TimeoutError, requests.Timeout))
+        )
+        raise MasterBotScanError(
+            str(exc) or f"LLM failed at {step}",
+            step=step,
+            is_timeout=is_timeout,
+        ) from exc
 
 
 def _call_with_timeout(fn, *, timeout_s=API_CALL_TIMEOUT_S, step="api_call"):
@@ -359,7 +407,6 @@ def ensure_news_context(ticker, breaker=None):
 
 def run_quant_manager(options_json, ticker_symbol):
     print(f"[{ticker_symbol}] 💼 Quant Manager (AI): Analyzing options chain for setups...")
-    client = _gemini_client()
     prompt = f"""
 You are a Quantitative Analyst. Analyze this options data for {ticker_symbol}.
 Look at the Strike prices, Implied Volatility, Volume, and Open Interest.
@@ -370,20 +417,18 @@ Data:
 {options_json}
 """
     try:
-        def _llm():
-            return client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-            )
-
-        response = _call_with_timeout(
-            _llm,
-            timeout_s=API_CALL_TIMEOUT_S,
-            step=f"gemini_quant:{ticker_symbol}",
+        # Gemini → DeepSeek chain; each leg wall-clock bounded.
+        return _llm_generate_text(
+            prompt,
+            step=f"llm_quant:{ticker_symbol}",
+            timeout_s=LLM_CHAIN_TIMEOUT_S,
         )
-        return response.text.strip()
     except Exception as e:
-        print(f"[{ticker_symbol}] 💼 Quant Manager: Gemini call failed ({e}); using fallback note.")
+        # Both providers failed — soft fallback; strike_selector remains authoritative.
+        print(
+            f"[{ticker_symbol}] 💼 Quant Manager: LLM chain failed ({e}); "
+            "using fallback note."
+        )
         return (f"Quant context unavailable (LLM offline). Deterministic strike selection "
                 f"in strike_selector.py remains authoritative for {ticker_symbol}.")
 
@@ -394,7 +439,6 @@ Data:
 
 def run_cos_synthesis(ticker_symbol, ticker_manager_report, news_report, options_report, quant_report):
     print(f"[{ticker_symbol}] 👔 Chief of Staff (AI): Synthesizing Corporate Brief...")
-    client = _gemini_client()
     prompt = f"""
 You are the Chief of Staff (CoS) of a quantitative hedge fund. Compile a synthesized Corporate Brief for ticker {ticker_symbol}.
 
@@ -420,20 +464,16 @@ Structure the brief as:
 - **CoS Direct Recommendation**: your advice with the deciding metrics named.
 """
     try:
-        def _llm():
-            return client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-            )
-
-        response = _call_with_timeout(
-            _llm,
-            timeout_s=API_CALL_TIMEOUT_S,
-            step=f"gemini_cos:{ticker_symbol}",
+        return _llm_generate_text(
+            prompt,
+            step=f"llm_cos:{ticker_symbol}",
+            timeout_s=LLM_CHAIN_TIMEOUT_S,
         )
-        return response.text.strip()
     except Exception as e:
-        print(f"[{ticker_symbol}] 👔 CoS: Gemini call failed ({e}); using structural fallback.")
+        print(
+            f"[{ticker_symbol}] 👔 CoS: LLM chain failed ({e}); "
+            "using structural fallback."
+        )
         return (f"=== CORPORATE BRIEF {ticker_symbol} (LOCAL FALLBACK) ===\n{options_report}\n"
                 f"{news_report}\nQuant context: {quant_report}")
 
@@ -479,7 +519,6 @@ def format_ceo_deterministic(card, contract=None):
 def run_ceo_decision(corporate_brief, morning_macro_context, card, contract=None):
     ticker = card.ticker
     print(f"[{ticker}] 👑 CEO Agent (AI): Formulating final decision...")
-    client = _gemini_client()
     snapshot = scoring_engine.metrics_snapshot_text(card)
     contract_block = json.dumps(contract, indent=2) if contract else "No contract selected (PASS)."
     prompt = f"""
@@ -509,18 +548,11 @@ OUTPUT RULES (strict):
 4. Do not truncate, summarize away, or omit any of the four bullets.
 """
     try:
-        def _llm():
-            return client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-            )
-
-        response = _call_with_timeout(
-            _llm,
-            timeout_s=API_CALL_TIMEOUT_S,
-            step=f"gemini_ceo:{ticker}",
+        text = _llm_generate_text(
+            prompt,
+            step=f"llm_ceo:{ticker}",
+            timeout_s=LLM_CHAIN_TIMEOUT_S,
         )
-        text = response.text.strip()
         # Schema guard: if the model drifted, fall back to deterministic format
         required = ["### ", "* **Market Context & Gap**", "* **Quantitative Liquidity Metric**",
                     "* **Sentiment Alignment**", "* **Strategic Executive Decision**"]
@@ -529,7 +561,11 @@ OUTPUT RULES (strict):
             return format_ceo_deterministic(card, contract)
         return text
     except Exception as e:
-        print(f"[{ticker}] 👑 CEO Agent: Gemini call failed ({e}); using deterministic formatter.")
+        # Both Gemini and DeepSeek failed — never break the scan; deterministic CEO text.
+        print(
+            f"[{ticker}] 👑 CEO Agent: LLM chain failed ({e}); "
+            "using deterministic formatter."
+        )
         return format_ceo_deterministic(card, contract)
 
 
@@ -641,12 +677,14 @@ def run_portfolio_scan(
             timeout_s=max(API_CALL_TIMEOUT_S, API_CALL_TIMEOUT_S * max(1, len(universe))),
             step="specialist_desk_yfinance",
         )
+        # Wall clock = 2x single-provider budget so Gemini→DeepSeek failover
+        # can complete inside generate_ticker_manager_report without outer kill.
         ticker_manager_report = _call_with_timeout(
             lambda: generate_ticker_manager_report(
                 specialist_briefings, api_key=GEMINI_API_KEY
             ),
-            timeout_s=API_CALL_TIMEOUT_S,
-            step="gemini_ticker_manager",
+            timeout_s=LLM_CHAIN_WALL_CLOCK_S,
+            step="llm_ticker_manager",
         )
     except MasterBotScanError as desk_err:
         print(
@@ -656,42 +694,58 @@ def run_portfolio_scan(
         result["failed_at"] = desk_err.step
         result["error"] = desk_err.message
         result["is_timeout"] = desk_err.is_timeout
-        result["aborted"] = True
-        # Soft-degrade the brief so per-ticker pipeline can still run when
-        # only the portfolio desk timed out.
+        # Soft-degrade the brief — NEVER abort the whole scan for desk failure.
+        # Per-ticker yfinance/LLM isolation still processes the universe.
         ticker_manager_report = (
             f"Portfolio technical report unavailable "
             f"(failed at {desk_err.step}: {desk_err.message})."
         )
-        if desk_err.is_timeout:
-            result["discord_delivered"] = False
-            return result
     except Exception as desk_err:
         print(f"❌ Specialist Desk/Manager error: {desk_err}")
         ticker_manager_report = "Portfolio technical report unavailable this cycle."
 
     def _send_discord(message):
-        """Send Discord alert and track delivery success for this scan."""
+        """Send Discord alert and track delivery success for this scan.
+
+        Delivery is hardened in broadcaster.send_discord_alert (timeout +
+        retries). Never raises — a webhook outage must not kill the scan.
+        """
         text = str(message) if message is not None else ""
         result["discord_attempts"] += 1
-        ok = broadcaster.send_discord_alert(text)
+        try:
+            ok = broadcaster.send_discord_alert(text)
+        except Exception as discord_err:
+            # Absolute last line of defense if broadcaster itself throws.
+            print(
+                f"[master_bot] ERROR: Discord send raised unexpectedly: "
+                f"{discord_err}"
+            )
+            ok = False
         if ok:
             result["discord_successes"] += 1
         return ok
 
-    def _abort_scan(step_err, ticker_summary=None):
-        """Record a hard step failure and stop remaining tickers."""
+    def _isolate_ticker(ticker, ticker_summary, err, *, sleep_after=True):
+        """
+        Record a single-ticker failure and keep scanning the rest of the book.
+
+        Mission rule: one bad yfinance/LLM call must never abort the portfolio.
+        """
+        step = getattr(err, "step", None) or type(err).__name__
+        msg = getattr(err, "message", None) or str(err)
         print(
-            f"❌ Hard scan abort at {step_err.step}: {step_err.message} "
-            f"(timeout={step_err.is_timeout})"
+            f"❌ [{ticker}] Isolated failure at {step}: {msg} "
+            f"— continuing to next ticker"
         )
-        result["failed_at"] = step_err.step
-        result["error"] = step_err.message
-        result["is_timeout"] = step_err.is_timeout
-        result["aborted"] = True
-        if ticker_summary is not None:
-            ticker_summary["error"] = f"{step_err.step}: {step_err.message}"
-            result["results"].append(ticker_summary)
+        ticker_summary["error"] = f"{step}: {msg}"
+        result["results"].append(ticker_summary)
+        # Surface last isolation for ops without marking the whole scan aborted.
+        result["failed_at"] = step
+        result["error"] = msg
+        if getattr(err, "is_timeout", False):
+            result["is_timeout"] = True
+        if sleep_after and idx < len(universe) - 1:
+            time.sleep(inter_ticker_sleep)
 
     for idx, ticker in enumerate(universe):
         print(f"\n------------------------------------------")
@@ -738,20 +792,22 @@ def run_portfolio_scan(
             math_json = calculate_swing_targets(options_json)
 
             # ---- Manager tier (LLM context for the brief) ----
-            # Each call is wall-clock bounded. Soft LLM failures fall back
-            # inside the manager modules; hard timeouts abort this ticker.
+            # Each call is wall-clock bounded (2x single-provider budget so
+            # Gemini→DeepSeek failover inside managers can finish). Soft LLM
+            # failures fall back inside manager modules; hard timeouts isolate
+            # THIS ticker only — never the immortal macro loop.
             try:
                 risk_report = _call_with_timeout(
                     lambda: generate_risk_report(
                         math_json, ticker, api_key=GEMINI_API_KEY
                     ),
-                    timeout_s=API_CALL_TIMEOUT_S,
-                    step=f"gemini_risk:{ticker}",
+                    timeout_s=LLM_CHAIN_WALL_CLOCK_S,
+                    step=f"llm_risk:{ticker}",
                 )
             except MasterBotScanError as llm_err:
                 if llm_err.is_timeout:
-                    _abort_scan(llm_err, ticker_summary)
-                    break
+                    _isolate_ticker(ticker, ticker_summary, llm_err)
+                    continue
                 risk_report = f"Risk report unavailable ({llm_err.message})."
 
             try:
@@ -759,13 +815,13 @@ def run_portfolio_scan(
                     lambda: generate_sentiment_report(
                         news_string, ticker, api_key=GEMINI_API_KEY
                     ),
-                    timeout_s=API_CALL_TIMEOUT_S,
-                    step=f"gemini_sentiment:{ticker}",
+                    timeout_s=LLM_CHAIN_WALL_CLOCK_S,
+                    step=f"llm_sentiment:{ticker}",
                 )
             except MasterBotScanError as llm_err:
                 if llm_err.is_timeout:
-                    _abort_scan(llm_err, ticker_summary)
-                    break
+                    _isolate_ticker(ticker, ticker_summary, llm_err)
+                    continue
                 sentiment_report = f"Sentiment report unavailable ({llm_err.message})."
 
             quant_report = run_quant_manager(math_json, ticker)
@@ -775,13 +831,13 @@ def run_portfolio_scan(
                     lambda: generate_macro_catalyst_vector(
                         ticker, api_key=GEMINI_API_KEY
                     ),
-                    timeout_s=API_CALL_TIMEOUT_S,
-                    step=f"gemini_macro:{ticker}",
+                    timeout_s=LLM_CHAIN_WALL_CLOCK_S,
+                    step=f"llm_macro:{ticker}",
                 )
             except MasterBotScanError as llm_err:
                 if llm_err.is_timeout:
-                    _abort_scan(llm_err, ticker_summary)
-                    break
+                    _isolate_ticker(ticker, ticker_summary, llm_err)
+                    continue
                 macro_vector = "Neutral macroeconomic backdrop (LLM offline)."
 
             # ---- Deterministic weighted scoring (Task 2) ----
@@ -809,13 +865,11 @@ def run_portfolio_scan(
                             "sentiment_score": card.sentiment_score,
                             "raw_metrics": card.metrics,
                         }),
-                        timeout_s=API_CALL_TIMEOUT_S,
-                        step=f"gemini_adversarial:{ticker}",
+                        timeout_s=LLM_CHAIN_WALL_CLOCK_S,
+                        step=f"llm_adversarial:{ticker}",
                     )
                 except MasterBotScanError as llm_err:
-                    if llm_err.is_timeout:
-                        _abort_scan(llm_err, ticker_summary)
-                        break
+                    # Never kill the rest of the book for one adversarial timeout.
                     print(
                         f"[{ticker}] 👹 Devil's Advocate timeout/fail "
                         f"({llm_err.message}); using non-veto fallback."
@@ -920,12 +974,17 @@ def run_portfolio_scan(
                 time.sleep(inter_ticker_sleep)
         except MasterBotScanError as step_err:
             # Hard timeout / network failure on yfinance or LLM for this ticker.
-            _abort_scan(step_err, ticker_summary)
-            break
+            # Isolate: log, continue — do NOT abort the remaining universe.
+            _isolate_ticker(ticker, ticker_summary, step_err)
+            continue
         except Exception as ticker_err:
+            # Catch-all isolation: bad data shape, unexpected library errors, etc.
             print(f"❌ Error processing ticker {ticker}: {ticker_err}")
             ticker_summary["error"] = str(ticker_err)
             result["results"].append(ticker_summary)
+            if idx < len(universe) - 1:
+                time.sleep(inter_ticker_sleep)
+            continue
 
     if result["discord_attempts"] > 0:
         result["discord_delivered"] = (
@@ -954,8 +1013,11 @@ def run_macro_loop():
     """
     24-hour mission-control loop (night harvest / pre-market / 30-min scans).
 
-    Safe to call from main.py as a daemon thread. Network / API failures are
-    logged and the loop continues after a short backoff — they never escape.
+    IMMORTAL daemon contract:
+      * The outer ``while True`` must never exit on an unhandled exception.
+      * Catastrophic cycle failures page Discord with ``[CRITICAL BOT ERROR]``,
+        sleep 60s (anti-spam), then ``continue``.
+      * Flask / secondary trackers may die; this loop must not die silently.
     """
     print("\n--- INITIATING HIERARCHICAL MULTI-AGENT TRADING BOT (v2) ---")
     print(f"Loaded Tickers: {TICKERS}")
@@ -972,7 +1034,9 @@ def run_macro_loop():
     morning_macro_context = ""
     last_briefing_date = None
     scan_interval = 1800  # 30-minute active loop
-    error_backoff = 30    # seconds after an unexpected cycle failure
+    # After an unhandled cycle exception: wait before re-entering the loop.
+    # 60s is intentional — prevents Discord spam if a failure is sticky.
+    CRITICAL_ERROR_BACKOFF_S = 60
 
     while True:
         try:
@@ -1069,9 +1133,47 @@ def run_macro_loop():
                 time.sleep(5)
 
         except Exception as cycle_err:
-            # Network drops, API throttling, scraper crashes — never kill the process
-            print(f"❌ [Macro Loop] Cycle error (will retry in {error_backoff}s): {cycle_err}")
-            time.sleep(error_backoff)
+            # ============================================================
+            # IMMORTAL GUARD: never let an unhandled exception kill the
+            # macro loop. Page Discord, back off 60s, then continue.
+            # ============================================================
+            err_type = type(cycle_err).__name__
+            err_msg = str(cycle_err) or repr(cycle_err)
+            print(
+                f"❌ [CRITICAL BOT ERROR] Macro loop caught {err_type}: {err_msg} "
+                f"— will retry in {CRITICAL_ERROR_BACKOFF_S}s (loop stays alive)"
+            )
+            try:
+                import traceback
+                traceback.print_exc()
+            except Exception:
+                pass
+
+            critical_alert = (
+                f"🚨 **[CRITICAL BOT ERROR]** 🚨\n"
+                f"Master Bot macro loop hit an unhandled exception and is "
+                f"self-recovering (not exiting).\n"
+                f"**Type:** `{err_type}`\n"
+                f"**Error:** {err_msg[:1500]}\n"
+                f"**Action:** sleeping {CRITICAL_ERROR_BACKOFF_S}s then resume."
+            )
+            try:
+                delivered = broadcaster.send_discord_alert(critical_alert)
+                if not delivered:
+                    print(
+                        "[CRITICAL BOT ERROR] Discord delivery failed after "
+                        "retries — alert logged locally only:\n"
+                        f"{critical_alert}"
+                    )
+            except Exception as alert_err:
+                # Webhook path must never compound the failure.
+                print(
+                    f"[CRITICAL BOT ERROR] Discord alert raised: {alert_err} "
+                    f"— local log only:\n{critical_alert}"
+                )
+
+            time.sleep(CRITICAL_ERROR_BACKOFF_S)
+            continue
 
 
 if __name__ == "__main__":
