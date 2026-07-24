@@ -3,1125 +3,119 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#F7F5F0" />
-  <title>Rhizo · Trading Dashboard</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;800&display=swap" rel="stylesheet" />
+  <meta name="theme-color" content="#0a0a0f" />
+  <title>Virtual Hedge Fund</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            ink: {
+              950: '#07070b',
+              900: '#0a0a0f',
+              800: '#12121a',
+              700: '#1a1a26',
+              600: '#242433',
+            },
+            neon: {
+              green: '#22c55e',
+              red: '#ef4444',
+              amber: '#f59e0b',
+              cyan: '#22d3ee',
+            }
+          },
+          fontFamily: {
+            sans: ['ui-sans-serif', 'system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'sans-serif'],
+            mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', 'monospace'],
+          }
+        }
+      }
+    }
+  </script>
   <style>
-    :root {
-      /* Bamboo palette — warm, organic, premium fintech */
-      --bg: #F7F5F0;
-      --bg-elevated: #FFFFFF;
-      --surface: #FFFFFF;
-      --surface-soft: #FFFFFF;
-      --surface-muted: #F3F0EA;
-      --border: rgba(68, 64, 60, 0.08);
-      --border-soft: rgba(68, 64, 60, 0.05);
-      --text: #292524;            /* stone-800 */
-      --text-secondary: #44403c;  /* stone-700 */
-      --muted: #78716c;           /* stone-500 */
-      --muted-dim: #a8a29e;       /* stone-400 */
-      /* Fresh Bamboo — warm leaf green, lively not neon */
-      --accent: #2ecc71;
-      --accent-soft: rgba(46, 204, 113, 0.12);
-      --accent-border: rgba(46, 204, 113, 0.28);
-      --bamboo: #2ecc71;          /* fresh leaf green */
-      --bamboo-deep: #27ae60;     /* slightly deeper for text legibility */
-      --bamboo-bright: #3CB043;   /* warm garden green accent */
-      --mint: #2ecc71;
-      --mint-soft: rgba(46, 204, 113, 0.12);
-      --mint-border: rgba(46, 204, 113, 0.28);
-      --rose: #e11d48;           /* rose-600 — terracotta veto */
-      --rose-soft: rgba(225, 29, 72, 0.08);
-      --rose-border: rgba(225, 29, 72, 0.2);
-      --terracotta: #c2410c;     /* orange-700 soft terracotta */
-      --amber: #d97706;          /* amber-600 */
-      --amber-soft: rgba(217, 119, 6, 0.1);
-      --amber-border: rgba(217, 119, 6, 0.22);
-      --shadow-sm: 0 1px 2px rgba(41, 37, 36, 0.04), 0 1px 3px rgba(41, 37, 36, 0.03);
-      --shadow-md: 0 4px 16px rgba(41, 37, 36, 0.06), 0 1px 4px rgba(41, 37, 36, 0.04);
-      --shadow-lg: 0 12px 32px rgba(41, 37, 36, 0.08), 0 2px 8px rgba(41, 37, 36, 0.04);
-      --radius: 16px;
-      --radius-sm: 12px;
-      --footer-h: 48px;
-      --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
-      --ease-organic: cubic-bezier(0.34, 1.2, 0.64, 1);
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.55); }
+      50% { opacity: 0.85; box-shadow: 0 0 0 8px rgba(34, 197, 94, 0); }
     }
-
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-
-    html {
-      font-size: 17px; /* global base bump for legibility */
+    .live-dot {
+      animation: pulse-dot 1.6s ease-in-out infinite;
     }
-
-    html, body {
-      height: 100%;
-      background: var(--bg);
-      color: var(--text);
-      font-family: "Nunito", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-      -webkit-font-smoothing: antialiased;
-      -moz-osx-font-smoothing: grayscale;
-      overflow-x: hidden;
-    }
-
     body {
-      background: var(--bg);
-      min-height: 100vh;
-      padding-bottom: calc(var(--footer-h) + 1rem);
-    }
-
-    /* ── Layout ───────────────────────────────────────── */
-    .hud {
-      display: grid;
-      grid-template-columns: 1fr 1.15fr 1fr;
-      gap: 2rem;                    /* larger column gaps */
-      max-width: 1600px;
-      margin: 0 auto;
-      padding: 2rem 1.75rem 2.5rem;
-      min-height: calc(100vh - var(--footer-h) - 1rem);
-      align-items: stretch;
-    }
-
-    @media (max-width: 960px) {
-      .hud {
-        grid-template-columns: 1fr;
-        gap: 1.35rem;
-        padding: 1.25rem 1rem 2rem;
-      }
-    }
-
-    .left-col {
-      display: flex;
-      flex-direction: column;
-      gap: 1.35rem;
-      min-width: 0;
-    }
-
-    .panel {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow-md);
-      padding: 2rem 2.25rem;        /* p-8 / p-9 feel */
-      position: relative;
-      overflow: hidden;
-    }
-
-    @media (max-width: 960px) {
-      .panel {
-        padding: 1.5rem 1.35rem;
-      }
-    }
-
-    .panel-label {
-      font-size: 0.85rem;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-      color: var(--muted);
-      font-weight: 800;
-      margin-bottom: 1.35rem;
-      display: flex;
-      align-items: center;
-      gap: 0.7rem;
-    }
-
-    .panel-label::after {
-      content: "";
-      flex: 1;
-      height: 1px;
-      background: linear-gradient(90deg, var(--border), transparent);
-    }
-
-    /* ── Header strip ─────────────────────────────────── */
-    .topbar {
-      grid-column: 1 / -1;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 0.25rem 0.35rem 0.5rem;
-    }
-
-    .brand {
-      font-size: 1.4rem;
-      letter-spacing: 0.04em;
-      color: var(--text);
-      font-weight: 800;
-    }
-
-    .brand span {
-      color: var(--muted);
-      letter-spacing: 0.02em;
-      font-weight: 400;
-      margin-left: 0.45rem;
-      font-size: 1rem;
-    }
-
-    .status-pill {
-      display: flex;
-      align-items: center;
-      gap: 0.55rem;
-      padding: 0.5rem 1.05rem;
-      border-radius: 999px;
-      border: 1px solid var(--mint-border);
-      background: var(--mint-soft);
-      font-size: 0.8rem;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      color: var(--bamboo-deep);
-      font-weight: 600;
-    }
-
-    .status-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: var(--bamboo);
-      box-shadow: 0 0 0 3px rgba(46, 204, 113, 0.2);
-      flex-shrink: 0;
-      animation: live-pulse 2.4s ease-in-out infinite;
-    }
-
-    /* ── Left: Data Streams ───────────────────────────── */
-    .pipeline-list {
-      display: flex;
-      flex-direction: column;
-      gap: 0.15rem;
-    }
-
-    .pipeline-row {
-      display: flex;
-      align-items: center;
-      gap: 0.9rem;
-      padding: 0.85rem 0.55rem;
-      border-radius: var(--radius-sm);
-      transition: background 0.2s ease;
-    }
-
-    .pipeline-row:hover {
-      background: var(--surface-muted);
-    }
-
-    .pipeline-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: var(--bamboo);
-      box-shadow: 0 0 0 3px rgba(46, 204, 113, 0.18);
-      flex-shrink: 0;
-    }
-
-    .pipeline-dot.sync {
-      background: var(--bamboo);
-      animation: live-pulse 2.8s ease-in-out infinite;
-    }
-    .pipeline-dot.idle { background: var(--muted-dim); box-shadow: none; }
-    .pipeline-dot.warn { background: var(--amber); box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.18); }
-
-    .pipeline-name {
-      font-size: 1.1rem;
-      font-weight: 600;
-      color: var(--text-secondary);
-      flex: 1;
-      min-width: 0;
-    }
-
-    .pipeline-status {
-      font-size: 0.9rem;
-      color: var(--muted);
-      font-weight: 400;
-      letter-spacing: 0.01em;
-    }
-
-    /* ── Veto Ledger ──────────────────────────────────── */
-    .panel-graveyard {
-      flex: 1;
-      min-height: 200px;
-      border-color: rgba(225, 29, 72, 0.12);
-    }
-
-    .panel-graveyard .panel-label {
-      color: var(--rose);
-    }
-
-    .panel-graveyard .panel-label::after {
-      background: linear-gradient(90deg, rgba(225, 29, 72, 0.18), transparent);
-    }
-
-    .graveyard-list {
-      display: flex;
-      flex-direction: column;
-      gap: 0.7rem;
-      max-height: 320px;
-      overflow-y: auto;
-      scrollbar-width: thin;
-      scrollbar-color: rgba(225, 29, 72, 0.2) transparent;
-    }
-
-    .grave-card {
-      padding: 1rem 1.15rem;
-      border-radius: var(--radius-sm);
-      background: var(--surface-muted);
-      border: 1px solid rgba(225, 29, 72, 0.1);
-      border-left: 3px solid var(--rose);
-      box-shadow: var(--shadow-sm);
-      animation: card-enter 0.55s var(--ease-organic) both;
-    }
-
-    .grave-top {
-      display: flex;
-      justify-content: space-between;
-      align-items: baseline;
-      gap: 0.5rem;
-      margin-bottom: 0.4rem;
-    }
-
-    .grave-ticker {
-      font-size: 1.05rem;
-      font-weight: 800;
-      letter-spacing: 0.02em;
-      color: var(--rose);
-    }
-
-    .grave-flag {
-      font-size: 0.72rem;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: rgba(225, 29, 72, 0.7);
-      font-weight: 600;
-    }
-
-    .grave-reason {
-      font-size: 0.95rem;
-      line-height: 1.5;
-      color: var(--text-secondary);
-    }
-
-    .grave-meta {
-      margin-top: 0.45rem;
-      font-size: 0.75rem;
-      color: var(--muted-dim);
-      font-weight: 400;
-    }
-
-    .grave-empty {
-      text-align: center;
-      padding: 2rem 1rem;
-      color: var(--muted);
-      font-size: 0.95rem;
-      border: 1px dashed rgba(225, 29, 72, 0.18);
-      border-radius: var(--radius-sm);
-      background: rgba(225, 29, 72, 0.02);
-    }
-
-    /* ── Center: Execution Engine (Robot Heartbeat) ───── */
-    .cortex-stage {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      min-height: 420px;
-      position: relative;
-    }
-
-    /* Heartbeat field — clean, modern AI cardiac core */
-    .cortex {
-      width: 280px;
-      height: 220px;
-      position: relative;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      z-index: 2;
-      transition: transform 0.4s var(--ease-out);
-    }
-
-    .heartbeat-field {
-      position: relative;
-      width: 100%;
-      height: 100%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-
-    /* Soft ambient glow well behind the core */
-    .heartbeat-field::before {
-      content: "";
-      position: absolute;
-      width: 160px;
-      height: 160px;
-      border-radius: 50%;
-      background: radial-gradient(
-        circle,
-        rgba(46, 204, 113, 0.18) 0%,
-        rgba(46, 204, 113, 0.06) 45%,
-        transparent 72%
-      );
-      filter: blur(8px);
-      pointer-events: none;
-      z-index: 0;
-      animation: ambient-glow 2.4s ease-in-out infinite;
-    }
-
-    /* Expanding translucent pulse rings */
-    .pulse-ring {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      width: 72px;
-      height: 72px;
-      margin: -36px 0 0 -36px;
-      border-radius: 50%;
-      border: 1.5px solid rgba(46, 204, 113, 0.55);
-      box-shadow: 0 0 12px rgba(46, 204, 113, 0.15);
-      pointer-events: none;
-      z-index: 1;
-      opacity: 0;
-      animation: ring-expand 2.4s cubic-bezier(0.22, 0.8, 0.36, 1) infinite;
-    }
-
-    .pulse-ring.r2 {
-      animation-delay: 0.18s;
-      border-color: rgba(46, 204, 113, 0.4);
-    }
-
-    .pulse-ring.r3 {
-      animation-delay: 0.36s;
-      border-color: rgba(46, 204, 113, 0.28);
-    }
-
-    /* Central glowing core — mechanical double-pulse */
-    .cortex-core {
-      width: 72px;
-      height: 72px;
-      border-radius: 50%;
-      position: relative;
-      z-index: 4;
       background:
-        radial-gradient(circle at 35% 28%, rgba(255, 255, 255, 0.75), transparent 48%),
-        radial-gradient(circle at 50% 55%, #3CB043 0%, #2ecc71 45%, #27ae60 100%);
-      box-shadow:
-        0 0 24px rgba(46, 204, 113, 0.4),
-        0 0 56px rgba(46, 204, 113, 0.2),
-        0 6px 20px rgba(39, 174, 96, 0.18),
-        inset 0 -5px 14px rgba(0, 0, 0, 0.06),
-        inset 0 4px 12px rgba(255, 255, 255, 0.35);
-      animation: robot-heartbeat 2.4s ease-in-out infinite;
-      will-change: transform, box-shadow;
-    }
-
-    /* Inner highlight node */
-    .cortex-core::after {
-      content: "";
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      width: 14px;
-      height: 14px;
-      margin: -7px 0 0 -7px;
-      border-radius: 50%;
-      background: radial-gradient(circle at 40% 35%, #fff 0%, rgba(255, 255, 255, 0.7) 40%, transparent 70%);
-      opacity: 0.85;
-      pointer-events: none;
-    }
-
-    /* Soft ambient halo on core */
-    .cortex-core::before {
-      content: "";
-      position: absolute;
-      inset: -22px;
-      border-radius: 50%;
-      background: radial-gradient(
-        circle,
-        rgba(46, 204, 113, 0.28) 0%,
-        rgba(46, 204, 113, 0.08) 50%,
-        transparent 72%
-      );
-      filter: blur(4px);
-      opacity: 0.85;
-      pointer-events: none;
-      z-index: -1;
-      animation: core-halo 2.4s ease-in-out infinite;
-    }
-
-    /* ECG-style heartbeat wave through the core */
-    .heartbeat-wave {
-      position: absolute;
-      left: 50%;
-      top: 50%;
-      width: 260px;
-      height: 64px;
-      margin: -32px 0 0 -130px;
-      z-index: 3;
-      overflow: visible;
-      pointer-events: none;
-    }
-
-    .heartbeat-wave path {
-      fill: none;
-      stroke: #2ecc71;
-      stroke-width: 2.25;
-      stroke-linecap: round;
-      stroke-linejoin: round;
-      filter: drop-shadow(0 0 6px rgba(46, 204, 113, 0.55));
-      stroke-dasharray: 320;
-      stroke-dashoffset: 320;
-      animation: wave-draw 2.4s ease-in-out infinite;
-    }
-
-    .heartbeat-wave .wave-ghost {
-      stroke: rgba(46, 204, 113, 0.18);
-      stroke-width: 1.5;
-      filter: none;
-      stroke-dasharray: none;
-      stroke-dashoffset: 0;
-      animation: none;
-    }
-
-    /* Flash ring for execute/close events */
-    .cortex::after {
-      content: "";
-      position: absolute;
-      inset: 28px;
-      border-radius: 50%;
-      opacity: 0;
-      pointer-events: none;
-      z-index: 5;
-      background: radial-gradient(circle, rgba(46, 204, 113, 0.28) 0%, transparent 72%);
-    }
-
-    .cortex.flash-execute::after {
-      background: radial-gradient(circle, rgba(46, 204, 113, 0.36) 0%, transparent 72%);
-      animation: halo-process 1.2s var(--ease-out) forwards;
-    }
-
-    .cortex.flash-close::after {
-      background: radial-gradient(circle, rgba(217, 119, 6, 0.22) 0%, transparent 72%);
-      animation: halo-process 1.2s var(--ease-out) forwards;
-    }
-
-    .cortex.flash-execute,
-    .cortex.flash-close {
-      animation: engine-soft 1.2s var(--ease-out);
-    }
-
-    .cortex-core-label {
-      margin-top: 2.25rem;
-      font-size: 1.05rem;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--text);
-      font-weight: 800;
-      z-index: 2;
-    }
-
-    .cortex-sub {
-      margin-top: 0.5rem;
-      font-size: 0.95rem;
-      color: var(--muted);
-      letter-spacing: 0.01em;
-      font-weight: 400;
-      z-index: 2;
-    }
-
-    /* Mechanical cardiac double-pulse (lub-dub) */
-    @keyframes robot-heartbeat {
-      0%, 100% {
-        transform: scale(1);
-        box-shadow:
-          0 0 24px rgba(46, 204, 113, 0.4),
-          0 0 56px rgba(46, 204, 113, 0.2),
-          0 6px 20px rgba(39, 174, 96, 0.18),
-          inset 0 -5px 14px rgba(0, 0, 0, 0.06),
-          inset 0 4px 12px rgba(255, 255, 255, 0.35);
-      }
-      /* Lub — strong first contraction */
-      8% {
-        transform: scale(1.14);
-        box-shadow:
-          0 0 36px rgba(46, 204, 113, 0.55),
-          0 0 72px rgba(46, 204, 113, 0.3),
-          0 8px 28px rgba(39, 174, 96, 0.28),
-          inset 0 -5px 14px rgba(0, 0, 0, 0.06),
-          inset 0 4px 12px rgba(255, 255, 255, 0.45);
-      }
-      16% {
-        transform: scale(0.96);
-        box-shadow:
-          0 0 20px rgba(46, 204, 113, 0.32),
-          0 0 48px rgba(46, 204, 113, 0.16),
-          0 5px 16px rgba(39, 174, 96, 0.14),
-          inset 0 -5px 14px rgba(0, 0, 0, 0.06),
-          inset 0 4px 12px rgba(255, 255, 255, 0.32);
-      }
-      /* Dub — softer second contraction */
-      24% {
-        transform: scale(1.08);
-        box-shadow:
-          0 0 30px rgba(46, 204, 113, 0.48),
-          0 0 64px rgba(46, 204, 113, 0.24),
-          0 7px 24px rgba(39, 174, 96, 0.22),
-          inset 0 -5px 14px rgba(0, 0, 0, 0.06),
-          inset 0 4px 12px rgba(255, 255, 255, 0.4);
-      }
-      34% {
-        transform: scale(1);
-        box-shadow:
-          0 0 24px rgba(46, 204, 113, 0.4),
-          0 0 56px rgba(46, 204, 113, 0.2),
-          0 6px 20px rgba(39, 174, 96, 0.18),
-          inset 0 -5px 14px rgba(0, 0, 0, 0.06),
-          inset 0 4px 12px rgba(255, 255, 255, 0.35);
-      }
-    }
-
-    @keyframes core-halo {
-      0%, 100% { opacity: 0.55; transform: scale(1); }
-      8%       { opacity: 1;    transform: scale(1.12); }
-      16%      { opacity: 0.5;  transform: scale(0.98); }
-      24%      { opacity: 0.9;  transform: scale(1.08); }
-      34%      { opacity: 0.55; transform: scale(1); }
-    }
-
-    @keyframes ambient-glow {
-      0%, 100% { opacity: 0.65; transform: scale(1); }
-      8%       { opacity: 1;    transform: scale(1.06); }
-      24%      { opacity: 0.85; transform: scale(1.03); }
-      34%, 70% { opacity: 0.6;  transform: scale(1); }
-    }
-
-    @keyframes ring-expand {
-      0% {
-        transform: scale(0.85);
-        opacity: 0;
-      }
-      6% {
-        opacity: 0.7;
-      }
-      8% {
-        opacity: 0.65;
-      }
-      55% {
-        transform: scale(2.6);
-        opacity: 0;
-      }
-      100% {
-        transform: scale(2.6);
-        opacity: 0;
-      }
-    }
-
-    @keyframes wave-draw {
-      0% {
-        stroke-dashoffset: 320;
-        opacity: 0.35;
-      }
-      8% {
-        opacity: 1;
-      }
-      42% {
-        stroke-dashoffset: 0;
-        opacity: 0.95;
-      }
-      70% {
-        stroke-dashoffset: -40;
-        opacity: 0.2;
-      }
-      100% {
-        stroke-dashoffset: -40;
-        opacity: 0.15;
-      }
-    }
-
-    @keyframes halo-process {
-      0%   { opacity: 0; transform: scale(0.9); }
-      30%  { opacity: 1; transform: scale(1.08); }
-      100% { opacity: 0; transform: scale(1.25); }
-    }
-
-    @keyframes engine-soft {
-      0%   { transform: scale(1); }
-      30%  { transform: scale(1.03); }
-      100% { transform: scale(1); }
-    }
-
-    @keyframes live-pulse {
-      0%, 100% { opacity: 1; transform: scale(1); }
-      50%      { opacity: 0.7; transform: scale(0.92); }
-    }
-
-    /* ── Right: The Ledger ────────────────────────────── */
-    .portfolio-value {
-      font-size: clamp(2.75rem, 5.5vw, 3.75rem); /* text-5xl → text-6xl range */
-      font-weight: 800;
-      letter-spacing: -0.03em;
-      line-height: 1.05;
-      font-variant-numeric: tabular-nums;
-      color: var(--text);
-      position: relative;
-      margin-top: 0.15rem;
-    }
-
-    .metric-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1rem;
-      margin: 1.5rem 0 1.75rem;
-    }
-
-    .metric {
-      padding: 1.1rem 1.2rem;
-      border-radius: var(--radius-sm);
-      background: var(--surface-muted);
-      border: 1px solid var(--border-soft);
-      box-shadow: var(--shadow-sm);
-    }
-
-    .metric-label {
-      font-size: 0.75rem;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--muted);
-      margin-bottom: 0.45rem;
-      font-weight: 600;
-    }
-
-    .metric-value {
-      font-size: 1.25rem;
-      font-variant-numeric: tabular-nums;
-      font-weight: 600;
-      color: var(--text-secondary);
-    }
-
-    .metric-value.pos { color: var(--bamboo-deep); }
-    .metric-value.neg { color: var(--rose); }
-
-    .feed-header {
-      font-size: 0.8rem;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--muted);
-      margin-bottom: 0.9rem;
-      font-weight: 800;
-    }
-
-    .trade-feed {
-      display: flex;
-      flex-direction: column;
-      gap: 0.7rem;
-      max-height: 380px;
-      overflow-y: auto;
-      padding-right: 0.25rem;
-      scrollbar-width: thin;
-      scrollbar-color: rgba(120, 113, 108, 0.25) transparent;
-    }
-
-    /* Organic growth: slide up + soft fade (GPU: transform + opacity only) */
-    .trade-card {
-      padding: 1.05rem 1.2rem;
-      border-radius: var(--radius-sm);
-      background: var(--surface-muted);
-      border: 1px solid var(--border-soft);
-      border-left: 3px solid var(--bamboo);
-      box-shadow: var(--shadow-sm);
-      animation: bamboo-grow 0.65s var(--ease-organic) both;
-      will-change: transform, opacity;
-    }
-
-    .trade-card.close { border-left-color: var(--amber); }
-    .trade-card.execute { border-left-color: var(--bamboo); }
-
-    .trade-type {
-      font-size: 0.72rem;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--muted);
-      margin-bottom: 0.3rem;
-      font-weight: 800;
-    }
-
-    .trade-card.execute .trade-type { color: var(--bamboo-deep); }
-    .trade-card.close .trade-type { color: var(--amber); }
-
-    .trade-msg {
-      font-size: 1.05rem;
-      font-weight: 600;
-      letter-spacing: -0.01em;
-      line-height: 1.45;
-      color: var(--text-secondary);
-    }
-
-    .trade-time {
-      font-size: 0.8rem;
-      color: var(--muted-dim);
-      margin-top: 0.5rem;
-      font-weight: 400;
-    }
-
-    .slippage-badge {
-      display: inline-block;
-      margin-top: 0.55rem;
-      padding: 0.25rem 0.65rem;
-      border-radius: 999px;
-      font-size: 0.78rem;
-      font-weight: 600;
-      letter-spacing: 0.02em;
-      font-variant-numeric: tabular-nums;
-    }
-
-    .slippage-badge.bad {
-      color: var(--rose);
-      background: var(--rose-soft);
-      border: 1px solid var(--rose-border);
-    }
-
-    .slippage-badge.good {
-      color: var(--bamboo-deep);
-      background: var(--mint-soft);
-      border: 1px solid var(--mint-border);
-    }
-
-    .feed-empty {
-      text-align: center;
-      padding: 2.25rem 1.15rem;
-      color: var(--muted);
-      font-size: 0.95rem;
-      border: 1px dashed var(--border);
-      border-radius: var(--radius-sm);
-      background: rgba(247, 245, 240, 0.5);
-    }
-
-    /* Bamboo growth: gentle rise from below + soft fade-in */
-    @keyframes bamboo-grow {
-      from {
-        opacity: 0;
-        transform: translate3d(0, 18px, 0);
-      }
-      to {
-        opacity: 1;
-        transform: translate3d(0, 0, 0);
-      }
-    }
-
-    @keyframes card-enter {
-      from {
-        opacity: 0;
-        transform: translate3d(0, 14px, 0);
-      }
-      to {
-        opacity: 1;
-        transform: translate3d(0, 0, 0);
-      }
-    }
-
-    /* ── System footer ────────────────────────────────── */
-    .sys-footer {
-      position: fixed;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      z-index: 55;
-      height: var(--footer-h);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 0.85rem;
-      padding: 0 1.25rem;
-      background: rgba(255, 255, 255, 0.92);
-      border-top: 1px solid var(--border);
-      box-shadow: 0 -2px 12px rgba(41, 37, 36, 0.03);
-      font-size: 0.8rem;
-      letter-spacing: 0.03em;
-      color: var(--muted);
-      font-weight: 400;
-      flex-wrap: wrap;
-    }
-
-    .sys-indicator {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.4rem;
-      white-space: nowrap;
-    }
-
-    .sys-indicator .glow {
-      color: var(--bamboo-deep);
-      font-weight: 600;
-    }
-
-    .sys-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--bamboo);
-      flex-shrink: 0;
-    }
-
-    .sys-dot.warn {
-      background: var(--amber);
-    }
-
-    .sys-dot.bad {
-      background: var(--rose);
-    }
-
-    .sys-sep {
-      color: rgba(168, 162, 158, 0.6);
-      user-select: none;
-    }
-
-    .sse-status {
-      font-size: 0.85rem;
-      letter-spacing: 0.02em;
-      color: var(--muted-dim);
-      margin-top: 1.15rem;
-      font-weight: 400;
-    }
-
-    .section-caption {
-      font-size: 0.78rem;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--muted);
-      margin-bottom: 0.5rem;
-      font-weight: 600;
-    }
-
-    /* ── Boot loading overlay ─────────────────────────── */
-    .boot-overlay {
-      position: fixed;
-      inset: 0;
-      z-index: 9999;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 1.25rem;
-      background: var(--bg);
-      transition: opacity 0.45s var(--ease-out), visibility 0.45s var(--ease-out);
-    }
-
-    .boot-overlay.is-hidden {
-      opacity: 0;
-      visibility: hidden;
-      pointer-events: none;
-    }
-
-    .boot-overlay .boot-core {
-      width: 56px;
-      height: 56px;
-      border-radius: 50%;
-      background:
-        radial-gradient(circle at 35% 28%, rgba(255, 255, 255, 0.75), transparent 48%),
-        radial-gradient(circle at 50% 55%, #3CB043 0%, #2ecc71 45%, #27ae60 100%);
-      box-shadow:
-        0 0 24px rgba(46, 204, 113, 0.4),
-        0 0 48px rgba(46, 204, 113, 0.18);
-      animation: robot-heartbeat 2.4s ease-in-out infinite;
-      will-change: transform, box-shadow;
-    }
-
-    .boot-overlay .boot-label {
-      font-size: 0.85rem;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-      color: var(--muted);
-      font-weight: 800;
-    }
-
-    .boot-overlay .boot-sub {
-      font-size: 0.9rem;
-      color: var(--muted-dim);
-      font-weight: 400;
-      margin-top: -0.5rem;
-    }
-
-    /* Respect reduced motion preferences */
-    @media (prefers-reduced-motion: reduce) {
-      .cortex-core,
-      .cortex-core::before,
-      .pulse-ring,
-      .heartbeat-wave path,
-      .heartbeat-field::before,
-      .status-dot,
-      .pipeline-dot.sync,
-      .boot-overlay .boot-core {
-        animation: none !important;
-      }
-      .pulse-ring {
-        opacity: 0.25;
-        transform: scale(1.6);
-      }
-      .heartbeat-wave path:not(.wave-ghost) {
-        stroke-dashoffset: 0;
-        opacity: 0.7;
-      }
+        radial-gradient(1200px 600px at 10% -10%, rgba(34, 197, 94, 0.08), transparent 50%),
+        radial-gradient(900px 500px at 100% 0%, rgba(34, 211, 238, 0.06), transparent 45%),
+        #0a0a0f;
     }
   </style>
 </head>
-<body>
-  <!-- Boot overlay: dismissed after initial telemetry / portfolio hydrate -->
-  <div class="boot-overlay" id="boot-overlay" role="status" aria-live="polite" aria-busy="true">
-    <div class="boot-core" aria-hidden="true"></div>
-    <div class="boot-label">Rhizo</div>
-    <div class="boot-sub" id="boot-sub">Connecting to ledger…</div>
-  </div>
+<body class="h-full min-h-screen text-zinc-100 font-sans antialiased">
+  <div class="mx-auto max-w-lg md:max-w-2xl px-4 pt-6 pb-16 sm:px-6">
 
-  <div class="hud">
-    <div class="topbar">
-      <div class="brand">Rhizo <span>· Organic Capital</span></div>
-      <div class="status-pill" id="status-pill">
-        <span class="status-dot"></span>
-        <span id="status-label">Stream Live</span>
+    <!-- Status bar -->
+    <header class="flex items-center justify-between mb-8">
+      <div>
+        <p class="text-[11px] uppercase tracking-[0.2em] text-zinc-500 font-medium">Virtual Hedge Fund</p>
+        <h1 class="text-lg sm:text-xl font-semibold text-zinc-100 mt-0.5">Paper Portfolio</h1>
       </div>
-    </div>
+      <div id="status-pill"
+           class="flex items-center gap-2 rounded-full bg-ink-800/80 border border-ink-600 px-3 py-1.5 backdrop-blur">
+        <span class="live-dot inline-block h-2.5 w-2.5 rounded-full bg-neon-green"></span>
+        <span class="text-xs font-medium text-neon-green tracking-wide">System Live</span>
+      </div>
+    </header>
 
-    <!-- LEFT: Data Streams + Veto Ledger -->
-    <div class="left-col">
-      <section class="panel" id="panel-sensory">
-        <div class="panel-label">Data Streams</div>
-        <div class="pipeline-list" role="list">
-          <div class="pipeline-row" role="listitem">
-            <span class="pipeline-dot sync" aria-hidden="true"></span>
-            <span class="pipeline-name">News</span>
-            <span class="pipeline-status">Live</span>
-          </div>
-          <div class="pipeline-row" role="listitem">
-            <span class="pipeline-dot sync" aria-hidden="true"></span>
-            <span class="pipeline-name">Gov Policy</span>
-            <span class="pipeline-status">Live</span>
-          </div>
-          <div class="pipeline-row" role="listitem">
-            <span class="pipeline-dot sync" aria-hidden="true"></span>
-            <span class="pipeline-name">Macro Data</span>
-            <span class="pipeline-status">Live</span>
-          </div>
-          <div class="pipeline-row" role="listitem">
-            <span class="pipeline-dot sync" aria-hidden="true"></span>
-            <span class="pipeline-name">Earnings</span>
-            <span class="pipeline-status">Live</span>
-          </div>
+    <!-- Portfolio hero -->
+    <section class="rounded-2xl border border-ink-600 bg-ink-800/60 p-5 sm:p-6 mb-5 shadow-xl shadow-black/30">
+      <p class="text-xs uppercase tracking-widest text-zinc-500 mb-1">Total Portfolio Value</p>
+      <p id="portfolio-value"
+         class="text-4xl sm:text-5xl font-semibold tracking-tight tabular-nums text-white">
+        $—
+      </p>
+      <div class="mt-5 grid grid-cols-2 gap-3">
+        <div class="rounded-xl bg-ink-900/70 border border-ink-600 px-3 py-3">
+          <p class="text-[10px] uppercase tracking-wider text-zinc-500">Buying Power</p>
+          <p id="buying-power" class="mt-1 text-lg font-medium tabular-nums text-zinc-100">$—</p>
         </div>
-      </section>
+        <div class="rounded-xl bg-ink-900/70 border border-ink-600 px-3 py-3">
+          <p class="text-[10px] uppercase tracking-wider text-zinc-500">Realized PnL</p>
+          <p id="realized-pnl" class="mt-1 text-lg font-medium tabular-nums text-zinc-100">$—</p>
+        </div>
+      </div>
+      <p id="last-refresh" class="mt-4 text-[11px] text-zinc-600 font-mono">Waiting for data…</p>
+    </section>
 
-      <section class="panel panel-graveyard" id="panel-graveyard">
-        <div class="panel-label">Veto Ledger</div>
-        <div class="graveyard-list" id="graveyard-list">
-          <div class="grave-empty" id="grave-empty">No vetoes yet · clean slate</div>
+    <!-- Active positions -->
+    <section>
+      <div class="flex items-center justify-between mb-3 px-0.5">
+        <h2 class="text-sm font-semibold text-zinc-300 tracking-wide">Active Positions</h2>
+        <span id="trade-count"
+              class="text-[11px] font-mono text-zinc-500 bg-ink-800 border border-ink-600 rounded-full px-2 py-0.5">
+          0
+        </span>
+      </div>
+      <div id="positions-list" class="space-y-3">
+        <div class="rounded-xl border border-dashed border-ink-600 bg-ink-800/40 px-4 py-8 text-center text-sm text-zinc-500">
+          Loading positions…
         </div>
-      </section>
-    </div>
-
-    <!-- CENTER: Execution Engine — Robot Heartbeat -->
-    <section class="panel" id="panel-cortex">
-      <div class="panel-label">Execution Engine</div>
-      <div class="cortex-stage">
-        <div class="cortex" id="cortex" title="Master Bot" role="img" aria-label="Execution engine robot heartbeat">
-          <div class="heartbeat-field" aria-hidden="true">
-            <span class="pulse-ring r1"></span>
-            <span class="pulse-ring r2"></span>
-            <span class="pulse-ring r3"></span>
-            <svg class="heartbeat-wave" viewBox="0 0 260 64" xmlns="http://www.w3.org/2000/svg">
-              <!-- Soft baseline ghost -->
-              <path class="wave-ghost" d="M0 32 H260" />
-              <!-- ECG-style mechanical heartbeat through the core -->
-              <path d="M0 32 H52 L62 32 L70 18 L78 48 L88 8 L98 40 L106 32 H154 L162 32 L170 14 L178 50 L188 6 L198 42 L206 32 H260" />
-            </svg>
-            <div class="cortex-core"></div>
-          </div>
-        </div>
-        <div class="cortex-core-label">Master Bot</div>
-        <div class="cortex-sub">Decision core · awaiting signal</div>
-        <p class="sse-status" id="sse-status">SSE: connecting…</p>
       </div>
     </section>
 
-    <!-- RIGHT: The Ledger -->
-    <section class="panel" id="panel-ledger">
-      <div class="panel-label">The Ledger</div>
-      <p class="section-caption">Portfolio Value</p>
-      <div class="portfolio-value" id="portfolio-value">$—</div>
-
-      <div class="metric-grid">
-        <div class="metric">
-          <div class="metric-label">Buying Power</div>
-          <div class="metric-value" id="buying-power">$—</div>
-        </div>
-        <div class="metric">
-          <div class="metric-label">Realized PnL</div>
-          <div class="metric-value" id="realized-pnl">$—</div>
-        </div>
-      </div>
-
-      <div class="feed-header">Execution Feed</div>
-      <div class="trade-feed" id="trade-feed">
-        <div class="feed-empty" id="feed-empty">
-          No executions yet · standing by
-        </div>
-      </div>
-    </section>
+    <footer class="mt-10 text-center text-[11px] text-zinc-600">
+      Safe poll every 30s · No SSE · Virtual ledger (SQLite)
+    </footer>
   </div>
-
-  <footer class="sys-footer" id="sys-footer" aria-label="System telemetry">
-    <span class="sys-indicator">
-      <span class="sys-dot" id="uptime-dot"></span>
-      <span>Uptime: <span class="glow" id="footer-uptime">—</span></span>
-    </span>
-    <span class="sys-sep">|</span>
-    <span class="sys-indicator">
-      <span class="sys-dot" id="news-db-dot"></span>
-      <span>News DB: <span class="glow" id="footer-news-db">—</span></span>
-    </span>
-    <span class="sys-sep">|</span>
-    <span class="sys-indicator">
-      <span class="sys-dot" id="hedge-db-dot"></span>
-      <span>Hedge DB: <span class="glow" id="footer-hedge-db">—</span></span>
-    </span>
-  </footer>
 
   <script>
-    (function () {
-    'use strict';
-
+    // Production-safe interval: never starve gunicorn --workers 1 --threads 8.
+    // (Previous 1s / SSE HUD pinned threads and caused Render 502s.)
+    const REFRESH_MS = 30000;
     const CONTRACT_MULT = 100;
-    const GRAVEYARD_MS = 30000;
-    const TELEMETRY_MS = 15000;
-    const PORTFOLIO_MS = 20000;
-    const BOOT_TIMEOUT_MS = 8000;
 
-    /* ── Boot overlay dismiss ─────────────────────────── */
-    let bootDismissed = false;
-    let bootTimer = null;
-
-    function setBootSub(text) {
-      const el = document.getElementById('boot-sub');
-      if (el) el.textContent = text;
-    }
-
-    function dismissBootOverlay() {
-      if (bootDismissed) return;
-      bootDismissed = true;
-      if (bootTimer) {
-        clearTimeout(bootTimer);
-        bootTimer = null;
-      }
-      const overlay = document.getElementById('boot-overlay');
-      if (!overlay) return;
-      overlay.classList.add('is-hidden');
-      overlay.setAttribute('aria-busy', 'false');
-      // Fully remove after transition so it cannot block interaction
-      setTimeout(function () {
-        if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
-      }, 500);
-    }
-
-    function money(n, opts) {
-      opts = opts || {};
-      var signed = !!opts.signed;
+    function money(n, { signed = false } = {}) {
       if (n === null || n === undefined || Number.isNaN(Number(n))) return '—';
-      var v = Number(n);
-      var abs = Math.abs(v).toLocaleString('en-US', {
+      const v = Number(n);
+      const abs = Math.abs(v).toLocaleString('en-US', {
         style: 'currency',
         currency: 'USD',
         minimumFractionDigits: 2,
@@ -1132,6 +126,38 @@
       return abs;
     }
 
+    function pnlColorClass(n) {
+      const v = Number(n);
+      if (Number.isNaN(v) || v === 0) return 'text-zinc-100';
+      return v > 0 ? 'text-neon-green' : 'text-neon-red';
+    }
+
+    function setText(id, text) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = text;
+    }
+
+    function estimatedActiveValue(trades) {
+      if (!Array.isArray(trades)) return 0;
+      return trades.reduce((sum, t) => {
+        const px = Number(t.entry_price ?? t.entry_premium ?? 0);
+        if (!Number.isFinite(px) || px <= 0) return sum;
+        return sum + px * CONTRACT_MULT;
+      }, 0);
+    }
+
+    function directionBadge(dir) {
+      const d = String(dir || '—').toUpperCase();
+      const isCall = d === 'CALL' || d === 'LONG';
+      const isPut = d === 'PUT' || d === 'SHORT';
+      const cls = isCall
+        ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+        : isPut
+          ? 'bg-rose-500/15 text-rose-400 border-rose-500/30'
+          : 'bg-zinc-500/15 text-zinc-400 border-zinc-500/30';
+      return `<span class="inline-flex items-center rounded-md border px-1.5 py-0.5 text-[10px] font-semibold tracking-wide ${cls}">${d}</span>`;
+    }
+
     function escapeHtml(str) {
       return String(str)
         .replace(/&/g, '&amp;')
@@ -1140,351 +166,155 @@
         .replace(/"/g, '&quot;');
     }
 
+    function renderPositions(trades) {
+      const list = document.getElementById('positions-list');
+      const countEl = document.getElementById('trade-count');
+      if (!list) return;
+
+      if (!Array.isArray(trades) || trades.length === 0) {
+        list.innerHTML = `
+          <div class="rounded-xl border border-dashed border-ink-600 bg-ink-800/40 px-4 py-8 text-center">
+            <p class="text-sm text-zinc-500">No open positions</p>
+            <p class="text-[11px] text-zinc-600 mt-1">The macro bot will paper-buy on EXECUTE</p>
+          </div>`;
+        if (countEl) countEl.textContent = '0';
+        return;
+      }
+
+      if (countEl) countEl.textContent = String(trades.length);
+
+      list.innerHTML = trades.map((t) => {
+        const ticker = escapeHtml(t.ticker || '?');
+        const dir = t.direction || (t.option_contract && t.option_contract.direction) || '—';
+        const entry = t.entry_price ?? t.entry_premium;
+        const strike = t.strike ?? (t.option_contract && t.option_contract.strike);
+        const exp = escapeHtml(
+          t.expiration ?? (t.option_contract && t.option_contract.expiration) || '—'
+        );
+        const tp = t.take_profit ?? t.target_price;
+        const sl = t.stop_loss;
+        const trail = t.trailing_stop;
+        const capital = (Number(entry) || 0) * CONTRACT_MULT;
+        const entryTime = escapeHtml(t.entry_timestamp || t.entry_time || '');
+
+        return `
+          <article class="rounded-xl border border-ink-600 bg-ink-800/70 p-4 shadow-lg shadow-black/20">
+            <div class="flex items-start justify-between gap-3">
+              <div class="min-w-0">
+                <div class="flex items-center gap-2 flex-wrap">
+                  <span class="text-lg font-semibold tracking-tight text-white">${ticker}</span>
+                  ${directionBadge(dir)}
+                </div>
+                <p class="mt-1 text-[11px] text-zinc-500 font-mono truncate">
+                  ${strike != null ? 'Strike ' + escapeHtml(String(strike)) : '—'}
+                  · Exp ${exp}
+                </p>
+              </div>
+              <div class="text-right shrink-0">
+                <p class="text-[10px] uppercase tracking-wider text-zinc-500">Entry</p>
+                <p class="text-base font-medium tabular-nums text-zinc-100">${money(entry)}</p>
+              </div>
+            </div>
+            <div class="mt-3 grid grid-cols-3 gap-2 text-center">
+              <div class="rounded-lg bg-ink-900/60 px-2 py-2">
+                <p class="text-[9px] uppercase tracking-wider text-zinc-600">Capital</p>
+                <p class="text-xs font-medium tabular-nums text-zinc-300 mt-0.5">${money(capital)}</p>
+              </div>
+              <div class="rounded-lg bg-ink-900/60 px-2 py-2">
+                <p class="text-[9px] uppercase tracking-wider text-zinc-600">TP</p>
+                <p class="text-xs font-medium tabular-nums text-neon-green mt-0.5">${money(tp)}</p>
+              </div>
+              <div class="rounded-lg bg-ink-900/60 px-2 py-2">
+                <p class="text-[9px] uppercase tracking-wider text-zinc-600">SL</p>
+                <p class="text-xs font-medium tabular-nums text-neon-red mt-0.5">${money(sl)}</p>
+              </div>
+            </div>
+            ${trail != null ? `
+              <p class="mt-2 text-[11px] text-neon-amber font-mono">Trail: ${money(trail)}</p>
+            ` : ''}
+            ${entryTime ? `
+              <p class="mt-2 text-[10px] text-zinc-600 font-mono truncate">In @ ${entryTime}</p>
+            ` : ''}
+          </article>`;
+      }).join('');
+    }
+
     async function fetchJson(url) {
-      var res = await fetch(url, { cache: 'no-store' });
+      const res = await fetch(url, { cache: 'no-store' });
       if (!res.ok) throw new Error(url + ' → ' + res.status);
       return res.json();
     }
 
-    function estimatedActiveValue(trades) {
-      if (!Array.isArray(trades)) return 0;
-      return trades.reduce(function (sum, t) {
-        var px = Number(t.entry_price != null ? t.entry_price : (t.entry_premium != null ? t.entry_premium : 0));
-        if (!Number.isFinite(px) || px <= 0) return sum;
-        return sum + px * CONTRACT_MULT;
-      }, 0);
-    }
-
-    async function refreshPortfolio() {
+    async function refreshDashboard() {
       try {
-        var results = await Promise.all([
+        const [portfolio, trades, status] = await Promise.all([
           fetchJson('/api/portfolio'),
           fetchJson('/api/active_trades'),
+          fetchJson('/api/status'),
         ]);
-        var portfolio = results[0];
-        var trades = results[1];
-        var bp = Number(portfolio.buying_power);
-        var realized = Number(portfolio.total_realized_pnl);
-        var activeVal = estimatedActiveValue(trades);
-        var total = (Number.isFinite(bp) ? bp : 0) + activeVal;
 
-        var pv = document.getElementById('portfolio-value');
-        var bpEl = document.getElementById('buying-power');
-        if (pv) pv.textContent = money(total);
-        if (bpEl) bpEl.textContent = money(bp);
+        const bp = Number(portfolio.buying_power);
+        const realized = Number(portfolio.total_realized_pnl);
+        const activeVal = estimatedActiveValue(trades);
+        const total = (Number.isFinite(bp) ? bp : 0) + activeVal;
 
-        var pnlEl = document.getElementById('realized-pnl');
+        setText('portfolio-value', money(total));
+        setText('buying-power', money(bp));
+
+        const pnlEl = document.getElementById('realized-pnl');
         if (pnlEl) {
           pnlEl.textContent = money(realized, { signed: true });
-          pnlEl.classList.remove('pos', 'neg');
-          if (realized > 0) pnlEl.classList.add('pos');
-          else if (realized < 0) pnlEl.classList.add('neg');
+          pnlEl.className = 'mt-1 text-lg font-medium tabular-nums ' + pnlColorClass(realized);
         }
-        return true;
-      } catch (err) {
-        console.error('Portfolio refresh failed', err);
-        return false;
-      }
-    }
 
-    /* ── Veto Ledger ──────────────────────────────────── */
-    async function refreshGraveyard() {
-      var list = document.getElementById('graveyard-list');
-      if (!list) return false;
-      try {
-        var data = await fetchJson('/api/graveyard');
-        var items = Array.isArray(data) ? data : (data.items || []);
-        if (!items.length) {
-          list.innerHTML = '<div class="grave-empty" id="grave-empty">No vetoes yet · clean slate</div>';
-          return true;
-        }
-        list.innerHTML = items.map(function (item) {
-          var ticker = escapeHtml(item.ticker || '?');
-          var flag = escapeHtml(item.action_flag || item.action || 'SKIP');
-          var reason = escapeHtml(item.reason || 'Vetoed / skipped');
-          var score = item.total_score != null ? Number(item.total_score).toFixed(0) : '—';
-          var ts = item.timestamp
-            ? escapeHtml(String(item.timestamp).replace('T', ' ').slice(0, 19))
-            : '';
-          return (
-            '<article class="grave-card">' +
-              '<div class="grave-top">' +
-                '<span class="grave-ticker">' + ticker + '</span>' +
-                '<span class="grave-flag">' + flag + '</span>' +
-              '</div>' +
-              '<div class="grave-reason">' + reason + '</div>' +
-              '<div class="grave-meta">score ' + score + (ts ? ' · ' + ts : '') + '</div>' +
-            '</article>'
-          );
-        }).join('');
-        return true;
-      } catch (err) {
-        console.error('Graveyard refresh failed', err);
-        list.innerHTML = '<div class="grave-empty">Veto ledger offline · retrying…</div>';
-        return false;
-      }
-    }
+        renderPositions(trades);
 
-    /* ── System telemetry footer ──────────────────────── */
-    function setDot(id, state) {
-      var el = document.getElementById(id);
-      if (!el) return;
-      el.classList.remove('warn', 'bad');
-      if (state === 'warn') el.classList.add('warn');
-      if (state === 'bad') el.classList.add('bad');
-    }
-
-    async function refreshTelemetry() {
-      try {
-        var t = await fetchJson('/api/telemetry');
-        var upEl = document.getElementById('footer-uptime');
-        var newsEl = document.getElementById('footer-news-db');
-        var hedgeEl = document.getElementById('footer-hedge-db');
-
-        if (upEl) upEl.textContent = (t.uptime || '—') + ' 🟢';
-        setDot('uptime-dot', 'ok');
-
-        if (newsEl) {
-          if (t.news_db_mb == null) {
-            newsEl.textContent = 'n/a 🟡';
-            setDot('news-db-dot', 'warn');
+        // Status pill
+        const live = status && status.status === 'live';
+        const pill = document.getElementById('status-pill');
+        if (pill) {
+          const label = pill.querySelector('span:last-child');
+          const dot = pill.querySelector('.live-dot, span:first-child');
+          if (live) {
+            if (label) {
+              label.textContent = 'System Live';
+              label.className = 'text-xs font-medium text-neon-green tracking-wide';
+            }
+            if (dot) {
+              dot.className = 'live-dot inline-block h-2.5 w-2.5 rounded-full bg-neon-green';
+            }
           } else {
-            newsEl.textContent = t.news_db_mb.toFixed(2) + 'MB 🟢';
-            setDot('news-db-dot', 'ok');
+            if (label) {
+              label.textContent = 'Offline';
+              label.className = 'text-xs font-medium text-zinc-400 tracking-wide';
+            }
+            if (dot) {
+              dot.className = 'inline-block h-2.5 w-2.5 rounded-full bg-zinc-500';
+            }
           }
         }
-        if (hedgeEl) {
-          if (t.hedge_db_mb == null) {
-            hedgeEl.textContent = 'n/a 🟡';
-            setDot('hedge-db-dot', 'warn');
-          } else {
-            hedgeEl.textContent = t.hedge_db_mb.toFixed(2) + 'MB 🟢';
-            setDot('hedge-db-dot', 'ok');
+
+        const ts = status && status.timestamp
+          ? new Date(status.timestamp).toLocaleString()
+          : new Date().toLocaleString();
+        setText('last-refresh', 'Updated ' + ts + ' · next poll ~30s');
+      } catch (err) {
+        console.error('Dashboard refresh failed', err);
+        setText('last-refresh', 'Refresh error — retrying in 30s…');
+        const pill = document.getElementById('status-pill');
+        if (pill) {
+          const label = pill.querySelector('span:last-child');
+          if (label) {
+            label.textContent = 'Reconnecting';
+            label.className = 'text-xs font-medium text-neon-amber tracking-wide';
           }
         }
-        return true;
-      } catch (err) {
-        console.error('Telemetry refresh failed', err);
-        var upEl = document.getElementById('footer-uptime');
-        if (upEl) upEl.textContent = 'offline 🔴';
-        setDot('uptime-dot', 'bad');
-        setDot('news-db-dot', 'bad');
-        setDot('hedge-db-dot', 'bad');
-        return false;
       }
     }
 
-    /* ── Engine pulse + ledger cards ──────────────────── */
-    function flashCortex(type) {
-      var cortex = document.getElementById('cortex');
-      if (!cortex) return;
-      cortex.classList.remove('flash-execute', 'flash-close');
-      void cortex.offsetWidth;
-      cortex.classList.add(type === 'CLOSE' ? 'flash-close' : 'flash-execute');
-      setTimeout(function () {
-        cortex.classList.remove('flash-execute', 'flash-close');
-      }, 1250);
-    }
-
-    function slippageBadgeHtml(slippage) {
-      var v = Number(slippage);
-      if (!Number.isFinite(v) || v === 0) return '';
-      // Positive slippage = paid above ask (worse for buyer); negative = better fill
-      var cls = v > 0 ? 'bad' : 'good';
-      var label = 'Slippage: ' + money(v, { signed: true });
-      return '<span class="slippage-badge ' + cls + '">' + escapeHtml(label) + '</span>';
-    }
-
-    function pushTradeCard(event) {
-      var feed = document.getElementById('trade-feed');
-      var empty = document.getElementById('feed-empty');
-      if (!feed) return;
-      if (empty) empty.remove();
-
-      var isClose = event.type === 'CLOSE';
-      var card = document.createElement('article');
-      card.className = 'trade-card ' + (isClose ? 'close' : 'execute');
-      var slipHtml = slippageBadgeHtml(event.slippage);
-      card.innerHTML =
-        '<div class="trade-type">' + (isClose ? 'CLOSE' : 'EXECUTE') + '</div>' +
-        '<div class="trade-msg">' + escapeHtml(event.message || 'Trade event') + '</div>' +
-        slipHtml +
-        '<div class="trade-time">' + new Date().toLocaleTimeString() + '</div>';
-      feed.insertBefore(card, feed.firstChild);
-
-      while (feed.children.length > 40) {
-        feed.removeChild(feed.lastChild);
-      }
-    }
-
-    function handleStreamEvent(event) {
-      if (!event || !event.type) return;
-      if (event.type !== 'EXECUTE' && event.type !== 'CLOSE') return;
-
-      flashCortex(event.type);
-
-      // Gentle delay so engine pulse leads the organic card entrance
-      setTimeout(function () {
-        pushTradeCard(event);
-        refreshPortfolio();
-      }, 180);
-    }
-
-    /* ── SSE: single connection, backoff reconnect ────── */
-    var eventSource = null;
-    var sseReconnectTimer = null;
-    var sseBackoffMs = 1000;
-    var SSE_BACKOFF_MAX = 15000;
-    var pageUnloading = false;
-
-    function closeSSE() {
-      if (sseReconnectTimer) {
-        clearTimeout(sseReconnectTimer);
-        sseReconnectTimer = null;
-      }
-      if (eventSource) {
-        try {
-          eventSource.onopen = null;
-          eventSource.onmessage = null;
-          eventSource.onerror = null;
-          eventSource.close();
-        } catch (e) { /* ignore */ }
-        eventSource = null;
-      }
-    }
-
-    function scheduleSSEReconnect() {
-      if (pageUnloading || document.hidden) return;
-      if (sseReconnectTimer) return;
-      var delay = sseBackoffMs;
-      sseBackoffMs = Math.min(sseBackoffMs * 1.6, SSE_BACKOFF_MAX);
-      sseReconnectTimer = setTimeout(function () {
-        sseReconnectTimer = null;
-        connectSSE();
-      }, delay);
-    }
-
-    function connectSSE() {
-      if (pageUnloading || document.hidden) return null;
-
-      closeSSE();
-
-      var statusEl = document.getElementById('sse-status');
-      var labelEl = document.getElementById('status-label');
-      var es;
-      try {
-        es = new EventSource('/stream');
-      } catch (err) {
-        console.error('EventSource construct failed', err);
-        if (statusEl) statusEl.textContent = 'SSE: unavailable';
-        if (labelEl) labelEl.textContent = 'Stream Offline';
-        scheduleSSEReconnect();
-        return null;
-      }
-      eventSource = es;
-      if (statusEl) statusEl.textContent = 'SSE: connecting…';
-
-      es.onopen = function () {
-        sseBackoffMs = 1000;
-        if (statusEl) statusEl.textContent = 'SSE: connected';
-        if (labelEl) labelEl.textContent = 'Stream Live';
-        // First open is enough to consider the live path healthy
-        dismissBootOverlay();
-      };
-
-      es.onmessage = function (msg) {
-        try {
-          var data = JSON.parse(msg.data);
-          handleStreamEvent(data);
-        } catch (e) {
-          // ignore non-JSON / keepalive comments
-        }
-      };
-
-      es.onerror = function () {
-        if (statusEl) statusEl.textContent = 'SSE: reconnecting…';
-        if (labelEl) labelEl.textContent = 'Reconnecting';
-        try {
-          es.onopen = null;
-          es.onmessage = null;
-          es.onerror = null;
-          es.close();
-        } catch (e) { /* ignore */ }
-        if (eventSource === es) eventSource = null;
-        // Do not keep the overlay up forever if the stream is flaky —
-        // REST telemetry is enough to show the dashboard.
-        dismissBootOverlay();
-        scheduleSSEReconnect();
-      };
-
-      return es;
-    }
-
-    document.addEventListener('visibilitychange', function () {
-      if (document.hidden) {
-        closeSSE();
-        var statusEl = document.getElementById('sse-status');
-        if (statusEl) statusEl.textContent = 'SSE: paused (tab hidden)';
-      } else {
-        sseBackoffMs = 1000;
-        connectSSE();
-      }
-    });
-
-    window.addEventListener('pagehide', function () {
-      pageUnloading = true;
-      closeSSE();
-    });
-
-    window.addEventListener('beforeunload', function () {
-      pageUnloading = true;
-      closeSSE();
-    });
-
-    /* ── Boot: hydrate REST data, open SSE, dismiss overlay ── */
-    async function bootDashboard() {
-      setBootSub('Loading portfolio & telemetry…');
-
-      // Absolute safety net — never leave users stuck on the boot screen
-      bootTimer = setTimeout(function () {
-        setBootSub('Taking longer than usual…');
-        dismissBootOverlay();
-      }, BOOT_TIMEOUT_MS);
-
-      var settled = await Promise.allSettled([
-        refreshPortfolio(),
-        refreshGraveyard(),
-        refreshTelemetry(),
-      ]);
-
-      var anyOk = settled.some(function (r) {
-        return r.status === 'fulfilled' && r.value !== false;
-      });
-
-      if (anyOk) {
-        setBootSub('Opening live stream…');
-      } else {
-        setBootSub('Backend unreachable · showing shell…');
-      }
-
-      // Open SSE after REST so gunicorn thread pool is less likely to starve
-      // the portfolio/telemetry fetches on a single-worker deploy.
-      connectSSE();
-
-      // Dismiss as soon as REST has settled (SSE open is a bonus, not required)
-      dismissBootOverlay();
-
-      setInterval(refreshPortfolio, PORTFOLIO_MS);
-      setInterval(refreshGraveyard, GRAVEYARD_MS);
-      setInterval(refreshTelemetry, TELEMETRY_MS);
-    }
-
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', bootDashboard);
-    } else {
-      bootDashboard();
-    }
-    })();
+    // Static-first: hydrate once, then safe 30s polling. No EventSource / SSE.
+    refreshDashboard();
+    setInterval(refreshDashboard, REFRESH_MS);
   </script>
 </body>
 </html>

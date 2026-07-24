@@ -1,15 +1,20 @@
 """
-main.py — Render master orchestrator.
+main.py — Render master orchestrator (July 20 lightweight baseline).
 
 Single process that:
-  1. Serves Flask health + Virtual Hedge Fund dashboard/API under gunicorn.
+  1. Serves a static-first Flask health + Virtual Hedge Fund dashboard/API.
   2. Runs the macro CEO loop (master_bot, ~30-min trading cadence) on a daemon thread.
   3. Runs the micro tracker loop (tracker_agent, 5-min cadence) on a daemon thread.
+
+Design constraints (100% market-hours uptime):
+  * No Server-Sent Events (/stream), no long-polling, no 1s UI churn.
+  * Dashboard uses short REST fetches only; clients poll every ~30s.
+  * --workers MUST stay 1 so macro/micro bots start exactly once per deploy.
 
 Either background thread may hit network drops or API throttling; failures are
 logged and the thread backs off without taking down this process.
 
-Serve with (workers MUST be 1 — see prepare_process):
+Serve with:
   gunicorn main:app --workers 1 --threads 8 --bind 0.0.0.0:$PORT --timeout 120
 """
 
@@ -17,16 +22,14 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, Thread
 
-from flask import Flask, Response, jsonify, render_template
+from flask import Flask, jsonify, render_template
 
-import config
 import virtual_broker
 
 # ---------------------------------------------------------------------------
@@ -45,83 +48,13 @@ ACTIVE_TRADES_PATH = Path(
 MACRO_RESTART_SLEEP = int(os.environ.get("MACRO_RESTART_SLEEP", "60"))
 MICRO_RESTART_SLEEP = int(os.environ.get("MICRO_RESTART_SLEEP", "30"))
 
-# Process start for /api/telemetry uptime (dashboard-only observability).
-START_TIME = time.time()
-
 # Exactly-once guard for process bootstrap + macro/micro daemon threads
 # (must survive concurrent prepare_process / start_background_loops under gthread).
-# Use a single non-reentrant Lock; never call start_background_loops while holding it
-# from a nested path without releasing first.
 _init_lock = Lock()
 _background_loops_started = False
 _process_prepared = False
 
 app = Flask(__name__)
-
-
-def _db_size_mb(path: str | os.PathLike[str]) -> float | None:
-    """Return file size in MB, or None if the path is missing/unreadable."""
-    try:
-        return round(os.path.getsize(path) / (1024 * 1024), 2)
-    except OSError:
-        return None
-
-
-def _format_uptime(seconds: float) -> str:
-    """Human-readable uptime, e.g. '2h 14m' or '45m 12s'."""
-    total = max(0, int(seconds))
-    days, rem = divmod(total, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes, secs = divmod(rem, 60)
-    parts: list[str] = []
-    if days:
-        parts.append(f"{days}d")
-    if hours or days:
-        parts.append(f"{hours}h")
-    parts.append(f"{minutes}m")
-    if not days and not hours:
-        parts.append(f"{secs}s")
-    return " ".join(parts)
-
-
-def _reason_from_telemetry_row(row: sqlite3.Row) -> str:
-    """Best-effort human reason for a vetoed/skipped scan."""
-    # Prefer explicit reasons list from scoring
-    raw_reasons = row["reasons_json"] if "reasons_json" in row.keys() else None
-    if raw_reasons:
-        try:
-            parsed = json.loads(raw_reasons)
-            if isinstance(parsed, list) and parsed:
-                return "; ".join(str(x) for x in parsed[:4])
-            if isinstance(parsed, str) and parsed.strip():
-                return parsed.strip()
-            if isinstance(parsed, dict) and parsed:
-                return "; ".join(f"{k}: {v}" for k, v in list(parsed.items())[:4])
-        except (TypeError, json.JSONDecodeError):
-            if isinstance(raw_reasons, str) and raw_reasons.strip():
-                return raw_reasons.strip()[:240]
-
-    # Adversarial block detail as fallback
-    raw_adv = row["adversarial_json"] if "adversarial_json" in row.keys() else None
-    if raw_adv:
-        try:
-            adv = json.loads(raw_adv)
-            if isinstance(adv, dict):
-                for key in ("reason", "verdict", "summary", "message"):
-                    if adv.get(key):
-                        return str(adv[key])
-                if adv.get("blocked") or adv.get("veto"):
-                    return "Adversarial veto"
-        except (TypeError, json.JSONDecodeError):
-            pass
-
-    flag = row["action_flag"] if "action_flag" in row.keys() else None
-    score = row["total_score"] if "total_score" in row.keys() else None
-    if flag and score is not None:
-        return f"{flag} (score {score})"
-    if flag:
-        return str(flag)
-    return "Vetoed / skipped"
 
 
 # ===========================================================================
@@ -251,12 +184,14 @@ def start_background_loops() -> None:
 
 
 # ===========================================================================
-# WEB SERVICE (dashboard + Render health checks)
+# WEB SERVICE (static-first dashboard + Render health checks)
 # ===========================================================================
+# Keep this surface tiny. Heavy SSE / 1s polling starved gunicorn
+# (--workers 1 --threads 8) and caused 502s under Render health checks.
 
 @app.route("/")
 def index():
-    """Mobile-first Virtual Hedge Fund dashboard."""
+    """Lightweight Virtual Hedge Fund dashboard (client polls REST every 30s)."""
     return render_template("index.html")
 
 
@@ -289,109 +224,6 @@ def api_status():
     })
 
 
-@app.route("/api/graveyard")
-def api_graveyard():
-    """
-    Read-only: last 5 non-EXECUTE scans from backtest_telemetry (vetoes / skips).
-
-    Observability only — does not affect trading, scoring, or scrapers.
-    """
-    db_path = config.HEDGE_DB_PATH
-    try:
-        if not os.path.exists(db_path):
-            return jsonify([])
-
-        with sqlite3.connect(db_path, timeout=10.0) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """
-                SELECT
-                    id,
-                    timestamp,
-                    ticker,
-                    action_flag,
-                    total_score,
-                    adversarial_penalty,
-                    reasons_json,
-                    adversarial_json
-                FROM backtest_telemetry
-                WHERE action_flag IS NOT NULL
-                  AND UPPER(TRIM(action_flag)) != 'EXECUTE'
-                ORDER BY timestamp DESC, id DESC
-                LIMIT 5
-                """
-            ).fetchall()
-
-        out = []
-        for row in rows:
-            out.append({
-                "id": row["id"],
-                "timestamp": row["timestamp"],
-                "ticker": row["ticker"] or "?",
-                "action": row["action_flag"],
-                "action_flag": row["action_flag"],
-                "total_score": row["total_score"],
-                "adversarial_penalty": row["adversarial_penalty"],
-                "reason": _reason_from_telemetry_row(row),
-            })
-        return jsonify(out)
-    except Exception as e:
-        return jsonify({"error": str(e), "items": []}), 500
-
-
-@app.route("/api/telemetry")
-def api_telemetry():
-    """
-    Lightweight system health for the Jarvis footer.
-
-    Returns process uptime and SQLite file sizes (MB). Read-only paths only.
-    """
-    uptime_s = max(0.0, time.time() - START_TIME)
-    news_mb = _db_size_mb(config.NEWS_DB_PATH)
-    hedge_mb = _db_size_mb(config.HEDGE_DB_PATH)
-    return jsonify({
-        "uptime_seconds": int(uptime_s),
-        "uptime": _format_uptime(uptime_s),
-        "start_time": datetime.fromtimestamp(START_TIME, tz=timezone.utc).isoformat(),
-        "news_db_mb": news_mb,
-        "hedge_db_mb": hedge_mb,
-        "news_db_path": str(config.NEWS_DB_PATH),
-        "hedge_db_path": str(config.HEDGE_DB_PATH),
-    })
-
-
-@app.route("/stream")
-def stream():
-    """
-    Server-Sent Events stream for the Jarvis HUD.
-
-    Polls virtual_broker.ui_event_queue non-blockingly; yields EXECUTE/CLOSE
-    events as they are emitted by paper_buy / paper_sell. Sleeps 1s when idle
-    to avoid CPU thrashing. Does not touch trading logic.
-    """
-
-    def event_generator():
-        while True:
-            event = virtual_broker.get_ui_event()
-            if event is not None:
-                payload = json.dumps(event, default=str)
-                yield f"data: {payload}\n\n"
-            else:
-                # Keep connection warm for proxies without flooding the client
-                yield ": keepalive\n\n"
-                time.sleep(1)
-
-    return Response(
-        event_generator(),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )
-
-
 @app.route("/health")
 def health():
     """Render health check — must stay cheap and always succeed if process is up."""
@@ -400,7 +232,7 @@ def health():
 
 @app.route("/status")
 def status():
-    """Optional ops endpoint: active trade count + thread names (best-effort)."""
+    """Optional ops endpoint: active trade count + state file path (best-effort)."""
     trade_count = 0
     try:
         if ACTIVE_TRADES_PATH.exists():
@@ -434,11 +266,8 @@ def status():
 # Do NOT add --preload: the master would start daemon threads, then fork;
 # children inherit _background_loops_started=True but not live threads → no bots.
 #
-# --threads 8 keeps /health answering while /stream SSE holds other threads
-# (Flask app.run() blocked on SSE → Render 502 + restarts). Residual risk:
-# each open /stream tab occupies one thread until disconnect; leave headroom
-# for Render health checks (avoid 7+ simultaneous SSE clients on threads=8).
-# --timeout 120 covers long portfolio scans / Gemini calls on daemon threads
+# --threads 8 keeps /health answering while a slow REST request holds a thread.
+# --timeout 120 covers long portfolio scans / LLM calls on daemon threads
 # without killing the worker mid-cycle.
 
 def prepare_process() -> None:
@@ -461,7 +290,7 @@ def prepare_process() -> None:
         start_background_loops()
         return
 
-    print("\n=== RENDER ORCHESTRATOR (main.py) ===")
+    print("\n=== RENDER ORCHESTRATOR (main.py) — July 20 lightweight baseline ===")
     ensure_active_trades_file()
     try:
         virtual_broker.ensure_ledger()
@@ -474,7 +303,7 @@ def prepare_process() -> None:
     port = os.environ.get("PORT", "10000")
     print(
         f"[main] Process ready under gunicorn gthread "
-        f"(workers=1 required) — PORT={port}"
+        f"(workers=1 required) — PORT={port} — no SSE"
     )
 
 
@@ -486,8 +315,7 @@ if __name__ != "__main__":
 
 
 if __name__ == "__main__":
-    # Do not use Flask's development server in production — it single-threads
-    # poorly under SSE (/stream) and reverse proxies return 502 Bad Gateway.
+    # Do not use Flask's development server in production.
     port = os.environ.get("PORT", "10000")
     print(
         "[main] Refusing app.run(). Start the production WSGI server:\n"
@@ -496,5 +324,5 @@ if __name__ == "__main__":
     )
     raise SystemExit(
         "Use gunicorn (see Procfile / message above). "
-        "Flask app.run() was removed to prevent SSE 502s."
+        "Flask app.run() is not the production entrypoint."
     )

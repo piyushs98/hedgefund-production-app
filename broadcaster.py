@@ -46,10 +46,22 @@ def _chunk_message(message, limit=MAX_CHUNK):
 
 
 def _post_chunk(chunk):
+    """
+    POST one Discord chunk with strict timeout + retry.
+
+    - timeout=REQUEST_TIMEOUT (10s) so a hung Discord host cannot freeze Master Bot
+    - up to MAX_RETRIES attempts for network errors, 5xx, and HTTP 429
+    - never raises: returns False after exhaustion so the trading thread moves on
+    """
     data = {"content": chunk, "username": "Options AI 🤖"}
+    last_err = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = requests.post(WEBHOOK_URL, json=data, timeout=REQUEST_TIMEOUT)
+            resp = requests.post(
+                WEBHOOK_URL,
+                json=data,
+                timeout=REQUEST_TIMEOUT,  # hard cap — never hang the bot
+            )
             if resp.status_code in (200, 204):
                 return True
             if resp.status_code == 429:        # rate limited — honor retry_after
@@ -60,43 +72,88 @@ def _post_chunk(chunk):
                 print(f"[Broadcaster] Rate limited; waiting {wait:.1f}s "
                       f"(attempt {attempt}/{MAX_RETRIES})...")
                 time.sleep(wait + 0.25)
+                last_err = f"HTTP 429 retry_after={wait}"
                 continue
             print(f"[Broadcaster] Discord returned HTTP {resp.status_code}: "
                   f"{resp.text[:200]}")
+            last_err = f"HTTP {resp.status_code}"
             if 500 <= resp.status_code < 600:
                 time.sleep(1.5 * attempt)
                 continue
             return False                       # 4xx other than 429: don't retry
-        except requests.RequestException as e:
-            print(f"[Broadcaster] Network error (attempt {attempt}/{MAX_RETRIES}): {e}")
+        except requests.Timeout as e:
+            last_err = e
+            print(
+                f"[Broadcaster] Timeout after {REQUEST_TIMEOUT}s "
+                f"(attempt {attempt}/{MAX_RETRIES}): {e}"
+            )
             time.sleep(1.5 * attempt)
+        except requests.RequestException as e:
+            last_err = e
+            print(
+                f"[Broadcaster] Network error "
+                f"(attempt {attempt}/{MAX_RETRIES}): {e}"
+            )
+            time.sleep(1.5 * attempt)
+        except Exception as e:
+            # Absolute safety: never let an unexpected error bubble into master_bot.
+            last_err = e
+            print(
+                f"[Broadcaster] Unexpected post error "
+                f"(attempt {attempt}/{MAX_RETRIES}): {e}"
+            )
+            time.sleep(1.5 * attempt)
+
+    # All retries exhausted — local fallback so ops still has a signal.
+    print(
+        f"[Broadcaster] ERROR: all {MAX_RETRIES} Discord delivery attempts failed "
+        f"({last_err}). Falling back to local log. Chunk preview:\n"
+        f"{str(chunk)[:500]}"
+    )
     return False
 
 
 def send_discord_alert(message):
     """Send a message to Discord, chunking as needed. Returns True only if
     every chunk delivered. Never raises — a webhook outage must not be able
-    to crash the trading loop."""
-    if not message or not str(message).strip():
-        return False
-    if not WEBHOOK_URL:
-        print("[Broadcaster] DISCORD_WEBHOOK env var not set — printing locally instead:")
-        print(str(message)[:2000])
-        return False
+    to crash the trading loop (Master Bot survival > alert delivery)."""
+    try:
+        if not message or not str(message).strip():
+            return False
+        if not WEBHOOK_URL:
+            print(
+                "[Broadcaster] ERROR: DISCORD_WEBHOOK env var not set — "
+                "printing alert locally instead:"
+            )
+            print(str(message)[:2000])
+            return False
 
-    chunks = _chunk_message(str(message))
-    ok = True
-    for i, chunk in enumerate(chunks, 1):
-        if len(chunks) > 1:
-            print(f"[Broadcaster] Sending chunk {i}/{len(chunks)} "
-                  f"({len(chunk)} chars)...")
-        if not _post_chunk(chunk):
-            ok = False
-        if i < len(chunks):
-            time.sleep(0.6)                    # gentle pacing between chunks
-    print("[Broadcaster] Delivery complete." if ok
-          else "[Broadcaster] Delivery finished with errors.")
-    return ok
+        chunks = _chunk_message(str(message))
+        ok = True
+        for i, chunk in enumerate(chunks, 1):
+            if len(chunks) > 1:
+                print(f"[Broadcaster] Sending chunk {i}/{len(chunks)} "
+                      f"({len(chunk)} chars)...")
+            if not _post_chunk(chunk):
+                ok = False
+            if i < len(chunks):
+                time.sleep(0.6)                    # gentle pacing between chunks
+        if ok:
+            print("[Broadcaster] Delivery complete.")
+        else:
+            print(
+                "[Broadcaster] ERROR: Delivery finished with errors after retries. "
+                "Alert retained in process logs only."
+            )
+        return ok
+    except Exception as e:
+        # Final never-raise envelope for Master Bot immortal contract.
+        print(f"[Broadcaster] ERROR: send_discord_alert failed open: {e}")
+        try:
+            print(str(message)[:2000])
+        except Exception:
+            pass
+        return False
 
 
 if __name__ == "__main__":

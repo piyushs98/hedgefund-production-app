@@ -40,6 +40,14 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 
+# Public dashboard (Discord alert deep-links). Override via env if the Render
+# service name ever changes; default is the production service URL.
+DASHBOARD_URL = (
+    os.environ.get("DASHBOARD_URL")
+    or os.environ.get("RENDER_EXTERNAL_URL")
+    or "https://hedgefund-production-app.onrender.com"
+).rstrip("/")
+
 
 def assert_secrets(require_discord=True):
     """Call once at startup. Crashes early with a clear message instead of

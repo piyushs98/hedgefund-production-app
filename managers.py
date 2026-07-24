@@ -1,9 +1,12 @@
 import os
 import json
-from google import genai
+
+import llm_chain
 
 # Load Gemini API Key from environment variable with fallback
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+LLM_TIMEOUT_S = int(os.environ.get("LLM_CALL_TIMEOUT_S", "20"))
+
 
 def generate_risk_report(math_options_json, ticker_symbol, api_key=None):
     """
@@ -11,19 +14,10 @@ def generate_risk_report(math_options_json, ticker_symbol, api_key=None):
     Reads options chain data (with mathematician's swing targets) and outputs
     a strict Risk Report assessing liquidity, spreads, volume, and target viability.
 
-    Args:
-        math_options_json (str): Options JSON containing the pre-calculated swing_targets.
-        ticker_symbol (str): The stock ticker being analyzed.
-        api_key (str, optional): Overriding Gemini API key.
-
-    Returns:
-        str: Text risk assessment report.
+    LLM path: Gemini first, automatic DeepSeek failover via llm_chain.
     """
-    key = api_key or GEMINI_API_KEY
     print(f"[{ticker_symbol}] 💼 Risk Manager (AI): Synthesizing Risk Report...")
-    
-    client = genai.Client(api_key=key)
-    
+
     prompt = f"""
 You are the Risk Manager of a quantitative hedge fund. Analyze this options chain and price data for {ticker_symbol}, which includes mathematician-calculated 'swing_targets' (entry premium, 20% stop-loss, and 50% take-profit).
 
@@ -41,22 +35,22 @@ Keep your response concise, professional, and strictly focused on risk. Do not r
 """
 
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
+        return llm_chain.generate_text(
+            prompt,
+            step=f"risk:{ticker_symbol}",
+            timeout_s=LLM_TIMEOUT_S,
         )
-        return response.text.strip()
     except Exception as e:
-        print(f"[{ticker_symbol}] 💼 Risk Manager: Warning: Gemini call failed ({e}). Using local fallback report.")
+        print(f"[{ticker_symbol}] 💼 Risk Manager: Warning: LLM chain failed ({e}). Using local fallback report.")
         try:
             parsed = json.loads(math_options_json)
             targets = parsed.get("swing_targets", {})
             entry = targets.get("entry_premium", "N/A")
             sl = targets.get("stop_loss", "N/A")
             tp = targets.get("take_profit", "N/A")
-        except:
+        except Exception:
             entry, sl, tp = "N/A", "N/A", "N/A"
-            
+
         return (
             f"=== RISK REPORT FOR {ticker_symbol} (LOCAL FALLBACK) ===\n"
             f"Liquidity Assessment: Near-the-money options display moderate bid/ask spreads. Friction risks are acceptable.\n"
@@ -69,22 +63,13 @@ Keep your response concise, professional, and strictly focused on risk. Do not r
 def generate_sentiment_report(historical_news, ticker_symbol, api_key=None):
     """
     Sentiment Manager (AI) - Manager Tier:
-    Reads historical news context (up to 90 days) and synthesizes a high-level 
+    Reads historical news context (up to 90 days) and synthesizes a high-level
     "Macro & Sentiment Briefing" containing a sentiment rating and trend analysis.
 
-    Args:
-        historical_news (str): Bullet list of historical headlines retrieved from database.
-        ticker_symbol (str): The stock ticker being analyzed.
-        api_key (str, optional): Overriding Gemini API key.
-
-    Returns:
-        str: High-level Macro & Sentiment Briefing text.
+    LLM path: Gemini first, automatic DeepSeek failover via llm_chain.
     """
-    key = api_key or GEMINI_API_KEY
     print(f"[{ticker_symbol}] 📰 Sentiment Manager (AI): Synthesizing Macro & Sentiment Briefing...")
-    
-    client = genai.Client(api_key=key)
-    
+
     prompt = f"""
 You are the Sentiment Manager of a quantitative hedge fund. Analyze the past 3 months of historical news headlines for {ticker_symbol}.
 
@@ -101,13 +86,13 @@ Keep the entire briefing concise, structured with bullet points, and under 4 sen
 """
 
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
+        return llm_chain.generate_text(
+            prompt,
+            step=f"sentiment:{ticker_symbol}",
+            timeout_s=LLM_TIMEOUT_S,
         )
-        return response.text.strip()
     except Exception as e:
-        print(f"[{ticker_symbol}] 📰 Sentiment Manager: Warning: Gemini call failed ({e}). Using local fallback report.")
+        print(f"[{ticker_symbol}] 📰 Sentiment Manager: Warning: LLM chain failed ({e}). Using local fallback report.")
         count = historical_news.count("-") or 1
         return (
             f"=== SENTIMENT REPORT FOR {ticker_symbol} (LOCAL FALLBACK) ===\n"
@@ -123,23 +108,15 @@ def generate_ticker_manager_report(specialist_briefing_payload, api_key=None):
     Synthesizes the technical briefings from the Ticker Specialist Desk
     and generates a single cohesive report highlighting the strongest trading setups.
 
-    Args:
-        specialist_briefing_payload (dict): Dict of ticker -> specialist_briefing.
-        api_key (str, optional): Overriding Gemini API key.
-
-    Returns:
-        str: cohesive technical setup report.
+    LLM path: Gemini first, automatic DeepSeek failover via llm_chain.
     """
-    key = api_key or GEMINI_API_KEY
     print("[Ticker Team Manager] 💼 Ticker Team Manager (AI): Synthesizing Technical Specialist Briefings...")
-    
-    client = genai.Client(api_key=key)
-    
-    # Format the briefings dictionary payload for the Gemini prompt
+
+    # Format the briefings dictionary payload for the prompt
     briefings_str = ""
     for ticker, brief in specialist_briefing_payload.items():
         briefings_str += f"=== {ticker} Specialist Briefing ===\n{brief}\n\n"
-        
+
     prompt = f"""
 You are the Ticker Team Manager of a quantitative hedge fund. Analyze the aggregated technical briefings from your Ticker Specialist Desk.
 
@@ -156,13 +133,13 @@ Keep your report professional, highly structured, and under 5 sentences per sect
 """
 
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
+        return llm_chain.generate_text(
+            prompt,
+            step="ticker_manager",
+            timeout_s=LLM_TIMEOUT_S,
         )
-        return response.text.strip()
     except Exception as e:
-        print(f"[Ticker Team Manager] Warning: Gemini call failed ({e}). Using local fallback report.")
+        print(f"[Ticker Team Manager] Warning: LLM chain failed ({e}). Using local fallback report.")
         strong_setups = []
         warning_flags = []
         for ticker, brief in specialist_briefing_payload.items():
@@ -170,7 +147,7 @@ Keep your report professional, highly structured, and under 5 sentences per sect
                 warning_flags.append(ticker)
             else:
                 strong_setups.append(ticker)
-                
+
         strong_str = ", ".join(strong_setups) if strong_setups else "None"
         warning_str = ", ".join(warning_flags) if warning_flags else "None"
         return (
@@ -179,46 +156,3 @@ Keep your report professional, highly structured, and under 5 sentences per sect
             f"2. Technical Warning Flags: {warning_str} are trading below daily pivot or showing technical weakness.\n"
             f"3. Firm Executive Advice: Allocate capital conservatively across setups with clear support levels."
         )
-
-
-# ==========================================
-# 🧪 TEST THE AGENT
-# ==========================================
-if __name__ == "__main__":
-    test_options_file = "data/options_data_with_math.json"
-    test_ticker = "AAPL"
-    
-    print("[Managers Test] Standalone running managers check...")
-    
-    # Generate mock news headlines
-    mock_headlines = (
-        "- Apple announces new AI integrations for macOS (Bloomberg)\n"
-        "- Apple supply chain sees increased shipments in Asia (Reuters)\n"
-        "- Global tech stocks slide amid rising interest rate worries (Wall Street Journal)"
-    )
-    
-    mock_specialists = {
-        "AAPL": "Trading BELOW daily pivot ($307.42). Ranges show support at $303.91 and resistance at $309.83. News shows positive AI sentiment.",
-        "TSLA": "Trading BELOW daily pivot ($420.30). Ranges show support at $411.01 and resistance at $425.18. Supply chain resolution is bullish."
-    }
-    
-    # Check if mock options data is available
-    if os.path.exists(test_options_file):
-        with open(test_options_file, "r") as file:
-            sample_math_json = file.read()
-            
-        print("\n--- Running Risk Manager AI ---")
-        risk_report = generate_risk_report(sample_math_json, test_ticker)
-        print(risk_report)
-        
-        print("\n--- Running Sentiment Manager AI ---")
-        sentiment_report = generate_sentiment_report(mock_headlines, test_ticker)
-        print(sentiment_report)
-        
-        print("\n--- Running Ticker Team Manager AI ---")
-        ticker_report = generate_ticker_manager_report(mock_specialists)
-        print(ticker_report)
-        
-        print("\n[Managers Test] Standalone managers run completed successfully!")
-    else:
-        print(f"❌ Error: {test_options_file} not found. Please run math_agent.py first to generate test data.")

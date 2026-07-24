@@ -926,7 +926,16 @@ def run_portfolio_scan(
             ticker_summary["veto_reason"] = veto_reason
 
             # Live path: always broadcast CEO decision; record vetoes.
-            _send_discord(trade_decision)
+            # Append production dashboard deep-link for ops follow-through.
+            dashboard_url = getattr(
+                config, "DASHBOARD_URL", "https://hedgefund-production-app.onrender.com"
+            )
+            discord_payload = (
+                f"{trade_decision}\n\nDashboard: {dashboard_url}"
+                if trade_decision
+                else f"Dashboard: {dashboard_url}"
+            )
+            _send_discord(discord_payload)
             if vetoed:
                 result["vetoes"].append({
                     "ticker": ticker,
@@ -1149,13 +1158,17 @@ def run_macro_loop():
             except Exception:
                 pass
 
+            dashboard_url = getattr(
+                config, "DASHBOARD_URL", "https://hedgefund-production-app.onrender.com"
+            )
             critical_alert = (
                 f"🚨 **[CRITICAL BOT ERROR]** 🚨\n"
                 f"Master Bot macro loop hit an unhandled exception and is "
                 f"self-recovering (not exiting).\n"
                 f"**Type:** `{err_type}`\n"
                 f"**Error:** {err_msg[:1500]}\n"
-                f"**Action:** sleeping {CRITICAL_ERROR_BACKOFF_S}s then resume."
+                f"**Action:** sleeping {CRITICAL_ERROR_BACKOFF_S}s then resume.\n"
+                f"Dashboard: {dashboard_url}"
             )
             try:
                 delivered = broadcaster.send_discord_alert(critical_alert)

@@ -45,6 +45,19 @@ GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent"
 )
+try:
+    import config as _dash_config
+    DASHBOARD_URL = getattr(
+        _dash_config,
+        "DASHBOARD_URL",
+        "https://hedgefund-production-app.onrender.com",
+    )
+except Exception:
+    DASHBOARD_URL = (
+        os.environ.get("DASHBOARD_URL")
+        or "https://hedgefund-production-app.onrender.com"
+    )
+DASHBOARD_URL = str(DASHBOARD_URL).rstrip("/")
 
 LOOP_SECONDS = int(os.environ.get("TRACKER_LOOP_SECONDS", "300"))  # 5 minutes
 REQUEST_TIMEOUT = 15
@@ -920,7 +933,8 @@ def _format_alert(
         )
     if rationale:
         lines.append(f"\n{rationale}")
-    lines.append(f"\n_UTC {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}_")
+    lines.append(f"\nDashboard: {DASHBOARD_URL}")
+    lines.append(f"_UTC {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}_")
     return "\n".join(lines)
 
 
@@ -1073,6 +1087,7 @@ def run_micro_loop() -> None:
         "Tracker Agent Online - Monitoring Active Trades"
         f"\nState file: `{ACTIVE_TRADES_PATH}`"
         f"\nOpen positions at boot: **{trade_count}**"
+        f"\nDashboard: {DASHBOARD_URL}"
         f"\nUTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
     )
     print("[Tracker] Posting boot heartbeat to Discord...")
