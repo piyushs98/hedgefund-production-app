@@ -4,14 +4,14 @@ main.py — Render master orchestrator (July 20 lightweight baseline).
 Single process that:
   1. Serves a static-first Flask health + Virtual Hedge Fund dashboard/API.
   2. Runs the macro CEO loop (master_bot, ~30-min trading cadence) on a daemon thread.
-  3. Runs the micro tracker loop (tracker_agent, 5-min cadence) on a daemon thread.
+  3. Micro tracker loop (tracker_agent) is intentionally NOT started here.
 
 Design constraints (100% market-hours uptime):
   * No Server-Sent Events (/stream), no long-polling, no 1s UI churn.
   * Dashboard uses short REST fetches only; clients poll every ~30s.
-  * --workers MUST stay 1 so macro/micro bots start exactly once per deploy.
+  * --workers MUST stay 1 so Master Bot starts exactly once per deploy.
 
-Either background thread may hit network drops or API throttling; failures are
+The Master Bot thread may hit network drops or API throttling; failures are
 logged and the thread backs off without taking down this process.
 
 Serve with:
@@ -145,14 +145,16 @@ def _micro_worker() -> None:
 
 def start_background_loops() -> None:
     """
-    Launch macro + micro agents as daemon threads (die with the process).
+    Launch Master Bot (macro loop) as a daemon thread (dies with the process).
 
     Thread-safe and idempotent: under gunicorn gthread, only the first caller
-    in this process starts the bots. Subsequent calls are no-ops so we never
-    double-spawn Master Bot / Tracker (duplicate paper trades / Discord).
+    in this process starts the bot. Subsequent calls are no-ops so we never
+    double-spawn Master Bot (duplicate paper trades / Discord).
+
+    Tracker (micro) thread is intentionally not started from main.py.
 
     NOTE: This is per-process. --workers MUST remain 1; a second OS worker
-    would import this module independently and start its own pair of bots.
+    would import this module independently and start its own Master Bot.
     """
     global _background_loops_started
     with _init_lock:
@@ -163,23 +165,24 @@ def start_background_loops() -> None:
             )
             return
         # Set flag BEFORE .start() so a re-entrant call during thread bootstrap
-        # cannot race another pair of daemons into existence.
+        # cannot race another daemon into existence.
         _background_loops_started = True
         macro = Thread(
             target=_macro_worker,
             name="macro-master-bot",
             daemon=True,
         )
-        micro = Thread(
-            target=_micro_worker,
-            name="micro-tracker-agent",
-            daemon=True,
-        )
+        # Micro tracker intentionally disabled — main.py boots Master Bot only.
+        # micro = Thread(
+        #     target=_micro_worker,
+        #     name="micro-tracker-agent",
+        #     daemon=True,
+        # )
         macro.start()
-        micro.start()
+        # micro.start()
         print(
-            "[main] Background daemon threads started exactly once: "
-            f"{macro.name}, {micro.name}"
+            "[main] Background daemon thread started exactly once: "
+            f"{macro.name} (tracker_agent not started)"
         )
 
 
@@ -260,7 +263,7 @@ def status():
 #   gunicorn main:app --workers 1 --threads 8 --bind 0.0.0.0:$PORT --timeout 120
 #
 # CRITICAL: --workers MUST stay 1. Each worker is a separate OS process that
-# re-imports this module and would start its own macro/micro pair → duplicate
+# re-imports this module and would start its own Master Bot → duplicate
 # trades. The in-process Lock only prevents double-init *within* one worker.
 #
 # Do NOT add --preload: the master would start daemon threads, then fork;
@@ -274,7 +277,7 @@ def prepare_process() -> None:
     """
     One-shot process init for the gunicorn worker.
 
-    Ledger/files init is idempotent; macro/micro daemons are started exactly
+    Ledger/files init is idempotent; Master Bot daemon is started exactly
     once per OS process via the locked flag in start_background_loops().
     """
     global _process_prepared
