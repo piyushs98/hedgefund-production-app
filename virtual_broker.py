@@ -4,7 +4,7 @@ virtual_broker.py — Virtual SQLite paper ledger for the hedge fund dashboard.
 Replaces an external paper broker: buying power and realized PnL live in
 `news_room.db` (config.NEWS_DB_PATH). Options use the standard 100x multiplier.
 
-Does not touch scoring, AI prompts, or DeepSeek logic.
+Does not touch scoring, AI prompts, or LLM provider routing.
 """
 
 from __future__ import annotations

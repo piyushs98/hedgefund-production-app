@@ -29,7 +29,9 @@ except Exception:
     GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
     DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 
-GEMINI_MODEL = os.environ.get("LLM_GEMINI_MODEL", "gemini-2.5-flash")
+# gemini-2.5-flash returns 404 for many free-tier / new keys ("no longer available
+# to new users"). Prefer the stable free-tier alias; override via LLM_GEMINI_MODEL.
+GEMINI_MODEL = os.environ.get("LLM_GEMINI_MODEL", "gemini-flash-latest")
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = os.environ.get("LLM_DEEPSEEK_MODEL", "deepseek-chat")
 
@@ -65,10 +67,22 @@ def _run_with_deadline(fn, *, timeout_s, step):
             ) from exc
 
 
-def _gemini_generate(prompt, *, system=None):
+def _resolve_keys():
+    """Re-read env/config each call so Render/runtime secrets always apply."""
+    try:
+        import config as _config
+        gemini = getattr(_config, "GEMINI_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
+        deepseek = getattr(_config, "DEEPSEEK_API_KEY", "") or os.environ.get("DEEPSEEK_API_KEY", "")
+    except Exception:
+        gemini = os.environ.get("GEMINI_API_KEY", "")
+        deepseek = os.environ.get("DEEPSEEK_API_KEY", "")
+    return (gemini or "").strip(), (deepseek or "").strip()
+
+
+def _gemini_generate_sdk(prompt, *, system=None, key=None):
     from google import genai
 
-    key = (GEMINI_API_KEY or "").strip()
+    key = (key or "").strip()
     if not key:
         raise RuntimeError("GEMINI_API_KEY not set")
 
@@ -87,8 +101,97 @@ def _gemini_generate(prompt, *, system=None):
     return text
 
 
+def _gemini_generate_rest(prompt, *, system=None, key=None, http_timeout_s=None):
+    """
+    Direct generateContent HTTPS — no google-genai SDK required.
+    Used when the SDK is missing, and as a same-provider retry before DeepSeek.
+    """
+    key = (key or "").strip()
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY not set")
+
+    contents = prompt if not system else f"{system}\n\n{prompt}"
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent"
+    )
+    timeout = http_timeout_s
+    if timeout is None:
+        timeout = max(1.0, GEMINI_HTTP_TIMEOUT_MS / 1000.0)
+    resp = requests.post(
+        url,
+        params={"key": key},
+        json={"contents": [{"parts": [{"text": contents}]}]},
+        timeout=timeout,
+    )
+    if not resp.ok:
+        snippet = (resp.text or "")[:300]
+        raise RuntimeError(f"Gemini REST HTTP {resp.status_code}: {snippet}")
+
+    payload = resp.json()
+    try:
+        parts = (
+            payload.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [])
+        )
+        # Skip thoughtSignature-only parts; join text parts.
+        texts = []
+        for part in parts:
+            if isinstance(part, dict) and part.get("text"):
+                texts.append(part["text"])
+        text = "".join(texts).strip()
+    except Exception as exc:
+        raise RuntimeError(f"Gemini REST parse failed: {exc}") from exc
+
+    if not text:
+        raise RuntimeError("Gemini returned empty text")
+    return text
+
+
+def _gemini_generate(prompt, *, system=None):
+    """
+    Gemini primary path: SDK first, REST same-model fallback if SDK is unavailable
+    or errors. Only after both Gemini transports fail does generate_text route
+    to DeepSeek.
+    """
+    key, _ = _resolve_keys()
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY not set")
+
+    sdk_err = None
+    try:
+        return _gemini_generate_sdk(prompt, system=system, key=key)
+    except ImportError as exc:
+        sdk_err = exc
+        print(f"[LLM] Gemini SDK unavailable ({exc}); trying REST ({GEMINI_MODEL})...")
+    except Exception as exc:
+        sdk_err = exc
+        print(
+            f"[LLM] Gemini SDK failed ({exc}); trying REST ({GEMINI_MODEL}) "
+            "before DeepSeek..."
+        )
+
+    try:
+        return _gemini_generate_rest(
+            prompt,
+            system=system,
+            key=key,
+            http_timeout_s=max(1.0, GEMINI_HTTP_TIMEOUT_MS / 1000.0),
+        )
+    except Exception as rest_err:
+        if sdk_err is not None:
+            raise RuntimeError(
+                f"Gemini SDK+REST failed: sdk={sdk_err}; rest={rest_err}"
+            ) from rest_err
+        raise
+
+
 def _deepseek_generate(prompt, *, system=None, http_timeout_s=DEFAULT_TIMEOUT_S):
-    key = (DEEPSEEK_API_KEY or "").strip()
+    _, key = _resolve_keys()
+    if not key:
+        # Module-level cache may still hold a key from import time.
+        key = (DEEPSEEK_API_KEY or "").strip()
     if not key:
         raise RuntimeError("DEEPSEEK_API_KEY not set — cannot failover")
     if key.lower().startswith("bearer "):
@@ -157,11 +260,13 @@ def generate_text(
 
     gemini_err = None
     try:
-        return _run_with_deadline(
+        text = _run_with_deadline(
             lambda: _gemini_generate(prompt, system=system),
             timeout_s=timeout_s,
             step=f"{step}:gemini",
         )
+        print(f"[LLM] Gemini ok ({step}) model={GEMINI_MODEL}")
+        return text
     except LLMChainError as exc:
         gemini_err = exc
         print(
@@ -175,7 +280,8 @@ def generate_text(
             "routing to DeepSeek..."
         )
 
-    if not (DEEPSEEK_API_KEY or "").strip():
+    _, deepseek_key = _resolve_keys()
+    if not deepseek_key and not (DEEPSEEK_API_KEY or "").strip():
         print(
             f"[LLM FAILOVER] DEEPSEEK_API_KEY missing — cannot failover for {step}"
         )

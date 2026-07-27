@@ -1,11 +1,12 @@
 import sqlite3
 import json
 import os
-from google import genai
+
 import broadcaster
+import llm_chain
 
 DB_PATH = "data/news_room.db"
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+LLM_TIMEOUT_S = int(os.environ.get("LLM_CALL_TIMEOUT_S", "40"))
 
 def run_saturday_audit():
     """
@@ -44,7 +45,7 @@ def run_saturday_audit():
             "trade_sample_size": total_trades
         }
         
-        client = genai.Client(api_key=GEMINI_API_KEY)
+        # Gemini primary free-tier model; DeepSeek only if Gemini fails.
         prompt = f"""
 You are an advanced meta-optimization instance for a quantitative hedge fund.
 Evaluate the following weekly portfolio metrics and determine if the market shifted regimes (e.g., from high-momentum breakout to sideways mean-reverting).
@@ -59,20 +60,26 @@ You must output a strictly formatted JSON object mirroring this EXACT structure:
 Ensure the total sum equals exactly 100.
 Do not output anything other than raw JSON.
 """
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-        )
-        raw_text = response.text.strip()
-        
+        try:
+            raw_text = llm_chain.generate_text(
+                prompt,
+                step="saturday_audit",
+                timeout_s=LLM_TIMEOUT_S,
+            ).strip()
+        except Exception as llm_err:
+            print(f"LLM chain failed for Saturday audit ({llm_err}). Using fallback weights.")
+            raw_text = ""
+
         if raw_text.startswith("```json"):
             raw_text = raw_text.replace("```json", "", 1).strip()
         if raw_text.endswith("```"):
             raw_text = raw_text[:-3].strip()
-            
+
         try:
-            weights = json.loads(raw_text)
-        except json.JSONDecodeError:
+            weights = json.loads(raw_text) if raw_text else {}
+            if "recommended_weights" not in weights:
+                raise ValueError("missing recommended_weights")
+        except (json.JSONDecodeError, ValueError):
             print("Failed to decode LLM JSON. Using fallback weights.")
             weights = {"recommended_weights": {"liquidity": 30, "technical": 40, "sentiment": 30}}
 

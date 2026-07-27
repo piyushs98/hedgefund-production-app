@@ -3,13 +3,12 @@ import re
 import sqlite3
 import traceback
 
-import requests
 import broadcaster
+import llm_chain
 
-# Centralized API Key loading
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
-DEEPSEEK_MODEL = "deepseek-chat"
+# Gemini primary (free tier via llm_chain); DeepSeek only as failover backup.
+# Keys live in env / config — never hardcode.
+LLM_TIMEOUT_S = int(os.environ.get("LLM_CALL_TIMEOUT_S", "90"))
 
 # Prefer shared config path when available; fall back to script-relative DB.
 try:
@@ -36,7 +35,7 @@ def get_overnight_data(hours_ago=15):
     """
     Query overnight headlines (news/futures) AND innovation_data (China macro,
     gov policy, earnings scrapes) from the last N hours. Returns a single
-    labeled context string for DeepSeek / fallback briefings.
+    labeled context string for Gemini / DeepSeek / fallback briefings.
     """
     db_path = NEWS_DB_PATH
     if not os.path.exists(db_path):
@@ -229,35 +228,8 @@ def _build_live_data_briefing(overnight_context: str) -> str:
     )
 
 
-def _extract_deepseek_text(payload: dict) -> str:
-    """
-    Safely extract assistant content from a DeepSeek chat completions JSON body.
-    """
-    try:
-        choices = payload.get("choices") or []
-        if not choices:
-            return ""
-        message = choices[0].get("message") or {}
-        content = message.get("content")
-        if content is None:
-            return ""
-        return str(content).strip()
-    except Exception as e:
-        print(
-            f"[Chief of Staff] DeepSeek response parse failed: "
-            f"{type(e).__name__}: {e}"
-        )
-        traceback.print_exc()
-        return ""
-
-
-def _call_deepseek(api_key: str, overnight_context: str) -> str:
-    """
-    Call DeepSeek chat completions and return briefing text, or raise on hard failure.
-
-    `overnight_context` includes both headlines/futures and innovation_data
-    (China macro, gov policy, earnings) from get_overnight_data().
-    """
+def _morning_briefing_prompts(overnight_context: str):
+    """System + user prompts for the CoS morning briefing (provider-agnostic)."""
     system_instruction = (
         "You are the Chief of Staff (CoS) of a quantitative hedge fund. "
         "This morning briefing is designed to warn the CEO trading bot of potential "
@@ -309,64 +281,28 @@ def _call_deepseek(api_key: str, overnight_context: str) -> str:
         "Do NOT invent event times that are not supported by the data; if "
         "timing is ambiguous, say so clearly.\n"
     )
-
-    # Strict Bearer formatting: strip key and never double-prefix "Bearer "
-    key = (api_key or "").strip()
-    if key.lower().startswith("bearer "):
-        key = key[7:].strip()
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-    }
-    body = {
-        "model": DEEPSEEK_MODEL,
-        "messages": [
-            {"role": "system", "content": system_instruction},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.3,
-        "stream": False,
-    }
-
-    response = requests.post(
-        DEEPSEEK_API_URL,
-        headers=headers,
-        json=body,
-        timeout=90,
-    )
-    # Raise for non-2xx so callers hit the except fallback path
-    if not response.ok:
-        # Include a short body snippet for diagnosis without dumping secrets
-        snippet = (response.text or "")[:500]
-        err = RuntimeError(
-            f"DeepSeek HTTP {response.status_code}: {snippet}"
-        )
-        # Attach status for verbose except logging in generate_morning_briefing
-        err.http_status = response.status_code  # type: ignore[attr-defined]
-        raise err
-
-    payload = response.json()
-    return _extract_deepseek_text(payload)
+    return system_instruction, user_prompt
 
 
 def generate_morning_briefing(api_key=None):
     """
     Chief of Staff (CoS) Agent - Executive Tier:
     Queries SQLite for overnight data, synthesizes an executive summary briefing
-    using DeepSeek, and broadcasts the formatted alert to Discord.
+    via Gemini (primary free-tier) with automatic DeepSeek failover, and
+    broadcasts the formatted alert to Discord.
 
     Scheduled by master_bot.run_macro_loop() during the 09:15–09:29 EST
-    pre-market prep window (once per trading day). DeepSeek HTTP timeouts /
-    API errors fall back to a live overnight-data briefing so the prep
-    meeting never crashes the macro loop.
+    pre-market prep window (once per trading day). LLM failures fall back to a
+    live overnight-data briefing so the prep meeting never crashes the macro loop.
 
     Args:
-        api_key: Optional DeepSeek key override.
+        api_key: Unused (kept for call-site compatibility). Keys come from env
+            via llm_chain (GEMINI_API_KEY primary, DEEPSEEK_API_KEY backup).
 
     Returns:
-        str: Synthesized briefing text (DeepSeek or DB fallback).
+        str: Synthesized briefing text (Gemini, DeepSeek, or DB fallback).
     """
-    key = (api_key or DEEPSEEK_API_KEY or "").strip()
+    _ = api_key  # legacy kwarg; llm_chain owns provider keys
     print("[Chief of Staff] 📋 CoS Agent (AI): Querying database for overnight data...")
 
     # 1. Fetch overnight news and futures
@@ -376,61 +312,52 @@ def generate_morning_briefing(api_key=None):
         f"from {NEWS_DB_PATH}"
     )
 
-    print("[Chief of Staff] 📋 CoS Agent (AI): Synthesizing Morning Briefing with DeepSeek...")
+    print(
+        "[Chief of Staff] 📋 CoS Agent (AI): Synthesizing Morning Briefing "
+        f"(Gemini primary → DeepSeek backup, model={llm_chain.GEMINI_MODEL})..."
+    )
     briefing_text = None
+    system_instruction, user_prompt = _morning_briefing_prompts(overnight_context)
 
-    if not key:
-        print(
-            "[Chief of Staff] ERROR: DEEPSEEK_API_KEY is empty — cannot call DeepSeek. "
-            "Building live data-driven briefing from overnight DB instead."
+    try:
+        briefing_text = llm_chain.generate_text(
+            user_prompt,
+            step="pre_market_cos",
+            system=system_instruction,
+            timeout_s=LLM_TIMEOUT_S,
         )
-        briefing_text = _build_live_data_briefing(overnight_context)
-    else:
-        try:
-            briefing_text = _call_deepseek(key, overnight_context)
-            if not briefing_text:
-                print(
-                    "[Chief of Staff] ERROR: DeepSeek returned empty text after "
-                    "successful call."
-                )
-                print(
-                    "[Chief of Staff] Falling back to live overnight-data briefing "
-                    "(not the hardcoded template)."
-                )
-                briefing_text = _build_live_data_briefing(overnight_context)
-            else:
-                print(
-                    f"[Chief of Staff] DeepSeek briefing OK ({len(briefing_text)} chars)."
-                )
-        except Exception as e:
-            # Covers requests timeouts (timeout=90), HTTP errors, JSON failures.
-            http_status = getattr(e, "http_status", None)
-            if http_status is None:
-                resp = getattr(e, "response", None)
-                if resp is not None:
-                    http_status = getattr(resp, "status_code", None)
-            status_suffix = (
-                f" | HTTP status code: {http_status}"
-                if http_status is not None
-                else ""
-            )
-            print(f"[Pre-Market] DeepSeek Call Failed: {e}{status_suffix}")
-            traceback.print_exc()
+        if not briefing_text:
             print(
-                "[Chief of Staff] Generating live data-driven briefing from overnight "
-                "DB (Fallback Mode label only if data also empty)."
+                "[Chief of Staff] ERROR: LLM chain returned empty text after "
+                "successful call path."
+            )
+            print(
+                "[Chief of Staff] Falling back to live overnight-data briefing "
+                "(not the hardcoded template)."
             )
             briefing_text = _build_live_data_briefing(overnight_context)
-            # Only tag Fallback Mode when we truly have no overnight tape
-            if (
-                "No news headlines" in overnight_context
-                or "does not exist" in overnight_context
-            ):
-                briefing_text = briefing_text.replace(
-                    "📊 **MORNING HEDGE FUND BRIEFING**",
-                    "📊 **MORNING HEDGE FUND BRIEFING (Fallback Mode)**",
-                    1,
-                )
+        else:
+            print(
+                f"[Chief of Staff] Morning briefing OK ({len(briefing_text)} chars)."
+            )
+    except Exception as e:
+        print(f"[Pre-Market] LLM chain failed: {e}")
+        traceback.print_exc()
+        print(
+            "[Chief of Staff] Generating live data-driven briefing from overnight "
+            "DB (Fallback Mode label only if data also empty)."
+        )
+        briefing_text = _build_live_data_briefing(overnight_context)
+        # Only tag Fallback Mode when we truly have no overnight tape
+        if (
+            "No news headlines" in overnight_context
+            or "does not exist" in overnight_context
+        ):
+            briefing_text = briefing_text.replace(
+                "📊 **MORNING HEDGE FUND BRIEFING**",
+                "📊 **MORNING HEDGE FUND BRIEFING (Fallback Mode)**",
+                1,
+            )
 
     # 2. Broadcast to Discord (never raises; returns False on webhook failure)
     print("[Chief of Staff] 📋 CoS Agent (AI): Broadcasting morning briefing to Discord...")

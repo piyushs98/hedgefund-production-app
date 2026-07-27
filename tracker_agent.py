@@ -40,7 +40,8 @@ import virtual_broker
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 TRACKER_DISCORD_WEBHOOK = os.environ.get("TRACKER_DISCORD_WEBHOOK", "")
-GEMINI_MODEL = os.environ.get("TRACKER_GEMINI_MODEL", "gemini-2.5-flash")
+# Align with llm_chain free-tier default; gemini-2.5-flash is 404 for many new keys.
+GEMINI_MODEL = os.environ.get("TRACKER_GEMINI_MODEL", "gemini-flash-latest")
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent"
