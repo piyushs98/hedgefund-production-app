@@ -1,10 +1,9 @@
 """
-virtual_broker.py — Virtual SQLite paper ledger for the hedge fund dashboard.
+virtual_broker.py — Virtual SQLite paper ledger for Master Bot EXECUTE trades.
 
-Replaces an external paper broker: buying power and realized PnL live in
-`news_room.db` (config.NEWS_DB_PATH). Options use the standard 100x multiplier.
-
-Does not touch scoring, AI prompts, or LLM provider routing.
+Buying power and realized PnL live in news_room.db (config.NEWS_DB_PATH).
+Options use the standard 100x multiplier. Used by master_bot only — not a
+web dashboard. Does not touch scoring, AI prompts, or LLM provider routing.
 """
 
 from __future__ import annotations

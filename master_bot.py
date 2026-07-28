@@ -1026,7 +1026,7 @@ def run_macro_loop():
       * The outer ``while True`` must never exit on an unhandled exception.
       * Catastrophic cycle failures page Discord with ``[CRITICAL BOT ERROR]``,
         sleep 60s (anti-spam), then ``continue``.
-      * Flask / secondary trackers may die; this loop must not die silently.
+      * Flask in main.py is health-only; this loop must not die silently.
     """
     print("\n--- INITIATING HIERARCHICAL MULTI-AGENT TRADING BOT (v2) ---")
     print(f"Loaded Tickers: {TICKERS}")
