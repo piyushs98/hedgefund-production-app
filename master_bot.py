@@ -482,9 +482,13 @@ Structure the brief as:
 # 👑 CEO AGENT — strict schema + deterministic numeric fallback (Task 1)
 # ==========================================
 
-def format_ceo_deterministic(card, contract=None):
+def format_ceo_deterministic(card, contract=None, *, include_session_open_context=False):
     """Fills the exact required schema from real numbers. Used when Gemini
-    is unavailable AND appended as ground truth beneath the LLM output."""
+    is unavailable AND appended as ground truth beneath the LLM output.
+
+    include_session_open_context: only the first scan of the session may cite
+    overnight futures %; later scans stay ticker-local (spot/pivot/ATR).
+    """
     lm = card.metrics.get("liquidity", {})
     tm = card.metrics.get("technical", {})
     sm = card.metrics.get("sentiment", {})
@@ -496,11 +500,15 @@ def format_ceo_deterministic(card, contract=None):
                  f"IV {contract['implied_volatility']}, spread {contract['bid_ask_spread_pct']}%).")
     elif contract and "error" in contract:
         strat = f" Strike selection aborted: {contract['error']}"
+    if include_session_open_context:
+        gap_tail = f"; overnight futures {sm.get('futures_pct')}%.\n"
+    else:
+        gap_tail = ".\n"
     return (
         f"### {card.ticker} - {card.action_flag}\n"
         f"* **Market Context & Gap**: Spot {tm.get('close')} vs pivot {tm.get('pivot')} "
         f"(R1 {tm.get('r1')} / S1 {tm.get('s1')}); day change {tm.get('pct_change')}%; "
-        f"ATR% {tm.get('atr_pct')}; overnight futures {sm.get('futures_pct')}%.\n"
+        f"ATR% {tm.get('atr_pct')}{gap_tail}"
         f"* **Quantitative Liquidity Metric**: Median ATM spread {lm.get('median_atm_spread_pct')}%, "
         f"ATM volume {lm.get('total_atm_volume')}, open interest {lm.get('total_atm_open_interest')} "
         f"across {lm.get('atm_contracts')} contracts.\n"
@@ -516,11 +524,54 @@ def format_ceo_deterministic(card, contract=None):
     )
 
 
-def run_ceo_decision(corporate_brief, morning_macro_context, card, contract=None):
+def run_ceo_decision(
+    corporate_brief,
+    morning_macro_context,
+    card,
+    contract=None,
+    *,
+    include_session_open_context=False,
+):
+    """
+    CEO Discord text for one ticker.
+
+    Session-open macro (full pre-market brief + ES/NQ gap) is only injected on
+    the first portfolio scan of the trading day so later messages stay lean
+    and ticker-specific.
+    """
     ticker = card.ticker
-    print(f"[{ticker}] 👑 CEO Agent (AI): Formulating final decision...")
-    snapshot = scoring_engine.metrics_snapshot_text(card)
+    print(
+        f"[{ticker}] 👑 CEO Agent (AI): Formulating final decision "
+        f"(session_open_context={'on' if include_session_open_context else 'off'})..."
+    )
+    snapshot = scoring_engine.metrics_snapshot_text(
+        card, include_futures=include_session_open_context
+    )
     contract_block = json.dumps(contract, indent=2) if contract else "No contract selected (PASS)."
+
+    if include_session_open_context and (morning_macro_context or "").strip():
+        morning_block = (
+            "--- MORNING PRE-MARKET BRIEFING (session open — cite ES/NQ gap only if material) ---\n"
+            f"{morning_macro_context}\n"
+        )
+        context_rule = (
+            "5. **Market Context & Gap** = THIS ticker vs its pivot/R1/S1, spot, day change, ATR%. "
+            "You MAY add one short clause on session-open ES/NQ gap from the morning briefing "
+            "if it materially frames the trade. Do not paste the full pre-market futures block."
+        )
+    else:
+        morning_block = (
+            "--- SESSION OPEN MACRO ---\n"
+            "Pre-market ES/NQ gap and futures status were already broadcast at the open "
+            "(or on the first scan). Do NOT restate them.\n"
+        )
+        context_rule = (
+            "5. **Market Context & Gap** means THIS TICKER only: spot vs pivot/R1/S1, "
+            "day change, ATR%. FORBIDDEN in every bullet: ES=F, NQ=F, S&P 500 futures %, "
+            "Nasdaq futures %, \"Gap Up\"/\"Gap Down\" as a market-wide pre-market label, "
+            "or overnight futures percentages. Those are open-only context."
+        )
+
     prompt = f"""
 You are the CEO of a quantitative hedge fund making the final call on {ticker}.
 The weighted scoring engine result is AUTHORITATIVE: {card.total_score}/100 -> {card.action_flag}. You may not change the flag.
@@ -530,9 +581,7 @@ The weighted scoring engine result is AUTHORITATIVE: {card.total_score}/100 -> {
 --- SELECTED CONTRACT (deterministic strike selector) ---
 {contract_block}
 
---- MORNING PRE-MARKET BRIEFING ---
-{morning_macro_context}
-
+{morning_block}
 --- CHIEF OF STAFF CORPORATE BRIEF ---
 {corporate_brief}
 
@@ -546,6 +595,7 @@ OUTPUT RULES (strict):
 2. Every bullet MUST quote the exact numbers from the RAW METRICS SNAPSHOT above (spreads, volumes, pivots, headline counts). Generic phrases without numbers are a formatting failure.
 3. The Strategic Executive Decision bullet must be 2-3 sentences, cite the {card.total_score}/100 total with its pillar breakdown, and — if a contract was selected — name its strike, expiration, entry premium, stop-loss, and take-profit.
 4. Do not truncate, summarize away, or omit any of the four bullets.
+{context_rule}
 """
     try:
         text = _llm_generate_text(
@@ -558,7 +608,9 @@ OUTPUT RULES (strict):
                     "* **Sentiment Alignment**", "* **Strategic Executive Decision**"]
         if not all(tag in text for tag in required):
             print(f"[{ticker}] 👑 CEO output failed schema check — using deterministic formatter.")
-            return format_ceo_deterministic(card, contract)
+            return format_ceo_deterministic(
+                card, contract, include_session_open_context=include_session_open_context
+            )
         return text
     except Exception as e:
         # Both Gemini and DeepSeek failed — never break the scan; deterministic CEO text.
@@ -566,7 +618,9 @@ OUTPUT RULES (strict):
             f"[{ticker}] 👑 CEO Agent: LLM chain failed ({e}); "
             "using deterministic formatter."
         )
-        return format_ceo_deterministic(card, contract)
+        return format_ceo_deterministic(
+            card, contract, include_session_open_context=include_session_open_context
+        )
 
 
 # ==========================================
@@ -615,6 +669,8 @@ def run_portfolio_scan(
     breaker,
     inter_ticker_sleep=10,
     tickers=None,
+    *,
+    include_session_open_context=False,
 ):
     """
     One full pass across a ticker universe.
@@ -627,16 +683,28 @@ def run_portfolio_scan(
       Discord (+ virtual broker on EXECUTE).
 
     Args:
-        morning_macro_context: Pre-market briefing text for the CEO.
+        morning_macro_context: Pre-market briefing text (used on first scan only).
         breaker: CircuitBreaker instance.
         inter_ticker_sleep: Seconds between tickers (rate-limit cushion).
         tickers: Universe override; defaults to config TICKERS.
+        include_session_open_context: If True (first scan of the day), CEO may
+            cite morning ES/NQ gap once. Later scans omit that block.
 
     Returns:
         dict with scan_id, tickers_scanned, results, vetoes, trades,
         discord_delivered, circuit_breaker_open.
     """
     universe = list(tickers) if tickers is not None else list(TICKERS)
+    if include_session_open_context:
+        print(
+            "[System] Portfolio scan: session-open macro context ON "
+            "(CEO may cite pre-market ES/NQ gap once)."
+        )
+    else:
+        print(
+            "[System] Portfolio scan: session-open macro context OFF "
+            "(no repeated ES/NQ gap in ticker CEO messages)."
+        )
     result = {
         "scan_id": None,
         "tickers_scanned": universe,
@@ -908,7 +976,12 @@ def run_portfolio_scan(
             corporate_brief = run_cos_synthesis(
                 ticker, ticker_manager_report, sentiment_report, risk_report, quant_report)
             trade_decision = run_ceo_decision(
-                corporate_brief, morning_macro_context, card, contract)
+                corporate_brief,
+                morning_macro_context,
+                card,
+                contract,
+                include_session_open_context=include_session_open_context,
+            )
             print(f"\n--- CEO DECISION OUTPUT ---\n{trade_decision}\n---------------------------")
 
             # ---- Telemetry (Task 3c) + broadcast ----
@@ -1042,6 +1115,9 @@ def run_macro_loop():
 
     morning_macro_context = ""
     last_briefing_date = None
+    # Date of the scan that already injected pre-market ES/NQ into CEO prompts.
+    # First trading scan of each calendar day gets session-open context once.
+    last_session_open_context_date = None
     scan_interval = 1800  # 30-minute active loop
     # After an unhandled cycle exception: wait before re-entering the loop.
     # 60s is intentional — prevents Discord spam if a failure is sticky.
@@ -1065,7 +1141,13 @@ def run_macro_loop():
                     print(f"❌ [Bypass Sim] Briefing error: {err}")
                 time.sleep(2)
                 print("\n[System State] 📈 [Bypass Sim] ACTIVE TRADING MODE...")
-                run_portfolio_scan(morning_macro_context, breaker, inter_ticker_sleep=5)
+                # Single scan acts as the "open" — include morning context once.
+                run_portfolio_scan(
+                    morning_macro_context,
+                    breaker,
+                    inter_ticker_sleep=5,
+                    include_session_open_context=True,
+                )
                 print("\n🔬 DEVELOPER BYPASS RUN: Completed. Exiting loop.")
                 break
 
@@ -1129,7 +1211,27 @@ def run_macro_loop():
                         print(f"❌ Fallback briefing error: {brief_err}")
                         morning_macro_context = "No morning briefing context available."
 
-                run_portfolio_scan(morning_macro_context, breaker)
+                # First scan of the calendar trading day: allow ES/NQ gap in CEO text.
+                # Later 30-min scans: ticker-only context (saves tokens, no stale reprints).
+                include_open = last_session_open_context_date != now.date()
+                if include_open:
+                    print(
+                        "[System State] First portfolio scan of the session — "
+                        "injecting morning gap/futures into CEO prompts once."
+                    )
+                else:
+                    print(
+                        "[System State] Intraday scan — omitting repeated "
+                        "pre-market ES/NQ gap from CEO prompts."
+                    )
+
+                run_portfolio_scan(
+                    morning_macro_context,
+                    breaker,
+                    include_session_open_context=include_open,
+                )
+                if include_open:
+                    last_session_open_context_date = now.date()
 
                 print(f"Sleeping up to {scan_interval // 60} minutes before next scan...")
                 for _ in range(scan_interval // 60):

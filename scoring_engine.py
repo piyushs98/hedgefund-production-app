@@ -264,20 +264,36 @@ def apply_adversarial_penalty(card, penalty=15.0, reason=""):
     return card
 
 
-def metrics_snapshot_text(card):
+def metrics_snapshot_text(card, *, include_futures=True):
     """Compact, exact-numbers snapshot injected into the CEO prompt so the
-    final broadcast can cite real metrics instead of generic prose (Task 1)."""
+    final broadcast can cite real metrics instead of generic prose (Task 1).
+
+    include_futures:
+      True  — session-open scan; overnight ES futures % may be cited once.
+      False — later scans; omit futures % so CEO does not reprint pre-market gap.
+    """
     lm = card.metrics.get("liquidity", {})
     tm = card.metrics.get("technical", {})
     sm = card.metrics.get("sentiment", {})
+    if include_futures:
+        sentiment_line = (
+            f"- Headlines scanned: {sm.get('headline_count')} ({sm.get('bullish_hits')} bullish / "
+            f"{sm.get('bearish_hits')} bearish) | Futures: {sm.get('futures_pct')}% | "
+            f"Macro: {sm.get('macro_note')}\n"
+        )
+    else:
+        sentiment_line = (
+            f"- Headlines scanned: {sm.get('headline_count')} ({sm.get('bullish_hits')} bullish / "
+            f"{sm.get('bearish_hits')} bearish) | Macro: {sm.get('macro_note')}\n"
+            f"- Session-open ES/NQ futures already briefed earlier; do not restate them.\n"
+        )
     return (
         f"RAW METRICS SNAPSHOT for {card.ticker} (cite these numbers verbatim):\n"
         f"- Spot: {tm.get('close')} | Pivot: {tm.get('pivot')} | R1: {tm.get('r1')} | "
         f"S1: {tm.get('s1')} | Day change: {tm.get('pct_change')}% | ATR%: {tm.get('atr_pct')}\n"
         f"- Median ATM spread: {lm.get('median_atm_spread_pct')}% | ATM volume: "
         f"{lm.get('total_atm_volume')} | ATM open interest: {lm.get('total_atm_open_interest')}\n"
-        f"- Headlines scanned: {sm.get('headline_count')} ({sm.get('bullish_hits')} bullish / "
-        f"{sm.get('bearish_hits')} bearish) | Futures: {sm.get('futures_pct')}% | Macro: {sm.get('macro_note')}\n"
+        f"{sentiment_line}"
         f"- Pillar scores: Liquidity {card.liquidity_score}/{card.weights.get('liquidity')} | "
         f"Technical {card.technical_score}/{card.weights.get('technical')} | "
         f"Sentiment {card.sentiment_score}/{card.weights.get('sentiment')} | "
