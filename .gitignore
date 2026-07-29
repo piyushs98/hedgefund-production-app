@@ -8,6 +8,10 @@ env/
 .env.*
 !.env.example
 
+# Runtime session baseline (midday delta vs morning brief)
+data/session_baseline.json
+data/session_baseline.json.tmp
+
 # Python cache and operational garbage
 __pycache__/
 *.pyc

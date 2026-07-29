@@ -362,6 +362,14 @@ def generate_morning_briefing(api_key=None):
     # 2. Broadcast to Discord (never raises; returns False on webhook failure)
     print("[Chief of Staff] 📋 CoS Agent (AI): Broadcasting morning briefing to Discord...")
     broadcaster.send_discord_alert(briefing_text)
+
+    # 3. Persist morning baseline for zero-Gemini midday delta scans
+    try:
+        from midday_delta import store_morning_briefing
+        store_morning_briefing(briefing_text)
+    except Exception as base_err:
+        print(f"[Chief of Staff] WARNING: could not store midday baseline: {base_err}")
+
     return briefing_text
 
 

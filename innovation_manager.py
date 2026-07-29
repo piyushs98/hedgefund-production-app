@@ -7,21 +7,44 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 LLM_TIMEOUT_S = int(os.environ.get("LLM_CALL_TIMEOUT_S", "20"))
 
 
-def generate_macro_catalyst_vector(ticker, api_key=None):
+def generate_macro_catalyst_vector_local(ticker, innovation_data=None):
+    """
+    Local keyword macro vector (no Gemini). Used by midday delta path and as
+    offline fallback so scoring tags stay available without API burn.
+    """
+    if innovation_data is None:
+        innovation_data = get_innovation_context(ticker, days=7) or ""
+    if not (innovation_data or "").strip():
+        return "No specific macro or supply-chain catalysts identified for this ticker."
+    low = innovation_data.lower()
+    if "supply-chain bottlenecks" in low or "bottleneck" in low:
+        return "SUPPLY_CHAIN_BOTTLENECK: Detected critical hardware component delays from Shenzhen."
+    if "rate cut" in low or "subsidize" in low or "subsidy" in low:
+        return "EXPANSIONARY_TAILWIND: Federal Reserve signals accommodative policy."
+    if "earnings scheduled" in low or "earnings" in low:
+        return "EARNINGS_IMMINENT: Catalyst event pending shortly."
+    return "Neutral macroeconomic backdrop. No critical tailwinds or bottlenecks detected."
+
+
+def generate_macro_catalyst_vector(ticker, api_key=None, *, allow_llm=True):
     """
     Innovation Manager Agent:
     Acts as an elite macro-analyst. Extracts raw database rows from the
     innovation scrapers (Gov, China, Earnings) and outputs a high-impact,
     ticker-specific 'Macro Catalyst Vector'.
 
-    LLM path: Gemini first, automatic DeepSeek failover via llm_chain.
+    LLM path: Gemini first only when allow_llm=True (pre-market / explicit full scan).
+    Midday path must call with allow_llm=False or use generate_macro_catalyst_vector_local.
     """
-    print(f"[{ticker}] 🔬 Innovation Manager (AI): Synthesizing Macro Catalyst Vector...")
+    print(f"[{ticker}] 🔬 Innovation Manager: Synthesizing Macro Catalyst Vector...")
 
     innovation_data = get_innovation_context(ticker, days=7)
 
     if not innovation_data.strip():
         return "No specific macro or supply-chain catalysts identified for this ticker."
+
+    if not allow_llm:
+        return generate_macro_catalyst_vector_local(ticker, innovation_data)
 
     prompt = f"""
 You are an elite macro-analyst working for an aggressive quantitative hedge fund.
@@ -50,16 +73,7 @@ Output a 2-3 sentence summary detailing explicit tailwinds or headwinds for the 
             f"[{ticker}] 🔬 Innovation Manager: Warning: LLM chain failed ({e}). "
             "Using local fallback vector."
         )
-
-        # Local fallback simulation
-        if "supply-chain bottlenecks" in innovation_data.lower():
-            return "SUPPLY_CHAIN_BOTTLENECK: Detected critical hardware component delays from Shenzhen."
-        elif "rate cut" in innovation_data.lower() or "subsidize" in innovation_data.lower():
-            return "EXPANSIONARY_TAILWIND: Federal Reserve signals accommodative policy."
-        elif "earnings scheduled" in innovation_data.lower():
-            return "EARNINGS_IMMINENT: Catalyst event pending shortly."
-
-        return "Neutral macroeconomic backdrop. No critical tailwinds or bottlenecks detected."
+        return generate_macro_catalyst_vector_local(ticker, innovation_data)
 
 
 if __name__ == "__main__":

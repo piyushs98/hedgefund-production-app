@@ -1158,7 +1158,11 @@ def run_portfolio_scan(
 
 def run_macro_loop():
     """
-    24-hour mission-control loop (night harvest / pre-market / 30-min scans).
+    24-hour mission-control loop:
+
+      * Night harvest (scrapers, no Gemini)
+      * Pre-market 09:15–09:29 ET — **only Gemini-heavy path** (CoS briefing)
+      * Trading 09:30–16:00 ET — **zero-Gemini midday delta** every ~30 min
 
     IMMORTAL daemon contract:
       * The outer ``while True`` must never exit on an unhandled exception.
@@ -1166,9 +1170,18 @@ def run_macro_loop():
         sleep 60s (anti-spam), then ``continue``.
       * Flask in main.py is health-only; this loop must not die silently.
     """
-    print("\n--- INITIATING HIERARCHICAL MULTI-AGENT TRADING BOT (v2) ---")
+    from midday_delta import run_midday_delta_scan
+
+    # Optional escape hatch: FULL_LLM_INTRADAY=true restores the old heavy scan.
+    full_llm_intraday = os.environ.get("FULL_LLM_INTRADAY", "false").lower() == "true"
+
+    print("\n--- INITIATING MASTER BOT (pre-market Gemini + midday delta) ---")
     print(f"Loaded Tickers: {TICKERS}")
-    config.assert_secrets(require_discord=False)   # Gemini mandatory; webhook warns via broadcaster
+    print(
+        f"[System] Intraday mode: "
+        f"{'FULL LLM (escape hatch)' if full_llm_intraday else 'MIDDAY DELTA (Gemini OFF)'}"
+    )
+    config.assert_secrets(require_discord=False)   # Gemini for pre-market; webhook warns via broadcaster
     telemetry.init_telemetry_table()
     breaker = CircuitBreaker(failure_threshold=5, cooldown_seconds=900)
 
@@ -1180,9 +1193,6 @@ def run_macro_loop():
 
     morning_macro_context = ""
     last_briefing_date = None
-    # Date of the scan that already injected pre-market ES/NQ into CEO prompts.
-    # First trading scan of each calendar day gets session-open context once.
-    last_session_open_context_date = None
     scan_interval = 1800  # 30-minute active loop
     # After an unhandled cycle exception: wait before re-entering the loop.
     # 60s is intentional — prevents Discord spam if a failure is sticky.
@@ -1193,26 +1203,32 @@ def run_macro_loop():
             now = datetime.now(est_tz)
             current_time = now.time()
 
-            # Developer test sequence: night harvest -> briefing -> one scan -> exit
+            # Developer test sequence: night harvest -> briefing -> one delta scan -> exit
             if BYPASS_MARKET_HOURS:
                 print("\n🔬 DEVELOPER BYPASS RUN: Simulating 24-Hour Cycle")
                 print("\n[System State] 🌙 [Bypass Sim] NIGHT MODE...")
                 run_night_harvest()
                 time.sleep(2)
-                print("\n[System State] 📊 [Bypass Sim] PREP MEETING...")
+                print("\n[System State] 📊 [Bypass Sim] PREP MEETING (Gemini once)...")
                 try:
                     morning_macro_context = generate_morning_briefing()
                 except Exception as err:
                     print(f"❌ [Bypass Sim] Briefing error: {err}")
                 time.sleep(2)
-                print("\n[System State] 📈 [Bypass Sim] ACTIVE TRADING MODE...")
-                # Single scan acts as the "open" — include morning context once.
-                run_portfolio_scan(
-                    morning_macro_context,
-                    breaker,
-                    inter_ticker_sleep=5,
-                    include_session_open_context=True,
-                )
+                print("\n[System State] 📈 [Bypass Sim] MIDDAY DELTA (no Gemini)...")
+                if full_llm_intraday:
+                    run_portfolio_scan(
+                        morning_macro_context,
+                        breaker,
+                        inter_ticker_sleep=5,
+                        include_session_open_context=True,
+                    )
+                else:
+                    run_midday_delta_scan(
+                        breaker,
+                        inter_ticker_sleep=5,
+                        morning_macro_context=morning_macro_context,
+                    )
                 print("\n🔬 DEVELOPER BYPASS RUN: Completed. Exiting loop.")
                 break
 
@@ -1253,6 +1269,7 @@ def run_macro_loop():
 
             elif is_prep_meeting:
                 print(f"\n[System State] 📊 PRE-MARKET PREP MEETING (EST {now.strftime('%H:%M:%S')})")
+                print("[System State] Gemini allowed: morning CoS briefing only.")
                 if last_briefing_date != now.date():
                     try:
                         morning_macro_context = generate_morning_briefing()
@@ -1268,7 +1285,21 @@ def run_macro_loop():
             elif is_trading_mode:
                 print(f"\n[System State] 📈 ACTIVE TRADING MODE (EST {now.strftime('%H:%M:%S')})")
                 if not morning_macro_context:
-                    print("[System State] Missing pre-market briefing context. Generating now...")
+                    # Prefer baseline on disk over re-calling Gemini mid-session
+                    try:
+                        from midday_delta import load_baseline
+                        bl = load_baseline()
+                        if bl.get("date") == now.strftime("%Y-%m-%d") and bl.get("morning_briefing"):
+                            morning_macro_context = bl["morning_briefing"]
+                            last_briefing_date = now.date()
+                            print("[System State] Loaded morning brief from session baseline (no Gemini).")
+                    except Exception:
+                        pass
+                if not morning_macro_context and not full_llm_intraday:
+                    morning_macro_context = "No morning briefing on file (delta path continues without Gemini)."
+                    print("[System State] No morning brief — continuing delta path without Gemini re-run.")
+                elif not morning_macro_context and full_llm_intraday:
+                    print("[System State] FULL_LLM_INTRADAY: generating morning brief via Gemini...")
                     try:
                         morning_macro_context = generate_morning_briefing()
                         last_briefing_date = now.date()
@@ -1276,27 +1307,22 @@ def run_macro_loop():
                         print(f"❌ Fallback briefing error: {brief_err}")
                         morning_macro_context = "No morning briefing context available."
 
-                # First scan of the calendar trading day: allow ES/NQ gap in CEO text.
-                # Later 30-min scans: ticker-only context (saves tokens, no stale reprints).
-                include_open = last_session_open_context_date != now.date()
-                if include_open:
-                    print(
-                        "[System State] First portfolio scan of the session — "
-                        "injecting morning gap/futures into CEO prompts once."
+                if full_llm_intraday:
+                    print("[System State] FULL_LLM_INTRADAY=true — heavy portfolio scan (not default).")
+                    run_portfolio_scan(
+                        morning_macro_context,
+                        breaker,
+                        include_session_open_context=True,
                     )
                 else:
                     print(
-                        "[System State] Intraday scan — omitting repeated "
-                        "pre-market ES/NQ gap from CEO prompts."
+                        "[System State] Midday delta scan — Gemini OFF; "
+                        "report only changes vs morning baseline."
                     )
-
-                run_portfolio_scan(
-                    morning_macro_context,
-                    breaker,
-                    include_session_open_context=include_open,
-                )
-                if include_open:
-                    last_session_open_context_date = now.date()
+                    run_midday_delta_scan(
+                        breaker,
+                        morning_macro_context=morning_macro_context,
+                    )
 
                 print(f"Sleeping up to {scan_interval // 60} minutes before next scan...")
                 for _ in range(scan_interval // 60):
