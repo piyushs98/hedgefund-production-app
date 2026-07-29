@@ -1,14 +1,17 @@
 """
-llm_chain.py — Gemini → DeepSeek high-availability text generation.
+llm_chain.py — Cost-aware dual-provider text generation.
 
-Used by master_bot and manager-tier modules during market hours so a single
-provider outage does not blind technical / macro / adversarial evaluation.
+Routing policy (callers set ``primary``):
+  * Meetings (pre-market, midday synthesis): primary="gemini" (free tier),
+    DeepSeek backup on failure.
+  * Trade scans (CEO/quant/CoS/managers/adversarial): primary="deepseek",
+    Gemini optional backup on failure.
 
 Design:
-  1. Attempt Gemini (google-genai) under a hard wall-clock budget.
-  2. On any failure, log ``[LLM FAILOVER]`` and retry the same prompt on DeepSeek.
-  3. DeepSeek uses the same wall-clock budget (requests timeout + ThreadPoolExecutor).
-  4. If both fail, raise — callers isolate the ticker / soft-fallback as appropriate.
+  1. Attempt the primary provider under a hard wall-clock budget.
+  2. On any failure, log ``[LLM FAILOVER] primary→backup`` and retry.
+  3. Each leg uses the same wall-clock budget (requests + ThreadPoolExecutor).
+  4. If both fail, raise LLMChainError — callers isolate / soft-fallback.
 
 Does not own trading logic. Never hangs indefinitely.
 """
@@ -104,7 +107,7 @@ def _gemini_generate_sdk(prompt, *, system=None, key=None):
 def _gemini_generate_rest(prompt, *, system=None, key=None, http_timeout_s=None):
     """
     Direct generateContent HTTPS — no google-genai SDK required.
-    Used when the SDK is missing, and as a same-provider retry before DeepSeek.
+    Used when the SDK is missing, and as a same-provider retry before failover.
     """
     key = (key or "").strip()
     if not key:
@@ -151,9 +154,8 @@ def _gemini_generate_rest(prompt, *, system=None, key=None, http_timeout_s=None)
 
 def _gemini_generate(prompt, *, system=None):
     """
-    Gemini primary path: SDK first, REST same-model fallback if SDK is unavailable
-    or errors. Only after both Gemini transports fail does generate_text route
-    to DeepSeek.
+    Gemini path: SDK first, REST same-model fallback if SDK is unavailable
+    or errors. Failover to the other provider is handled by generate_text.
     """
     key, _ = _resolve_keys()
     if not key:
@@ -169,7 +171,7 @@ def _gemini_generate(prompt, *, system=None):
         sdk_err = exc
         print(
             f"[LLM] Gemini SDK failed ({exc}); trying REST ({GEMINI_MODEL}) "
-            "before DeepSeek..."
+            "before provider failover..."
         )
 
     try:
@@ -193,7 +195,7 @@ def _deepseek_generate(prompt, *, system=None, http_timeout_s=DEFAULT_TIMEOUT_S)
         # Module-level cache may still hold a key from import time.
         key = (DEEPSEEK_API_KEY or "").strip()
     if not key:
-        raise RuntimeError("DEEPSEEK_API_KEY not set — cannot failover")
+        raise RuntimeError("DEEPSEEK_API_KEY not set")
     if key.lower().startswith("bearer "):
         key = key[7:].strip()
 
@@ -238,98 +240,155 @@ def _deepseek_generate(prompt, *, system=None, http_timeout_s=DEFAULT_TIMEOUT_S)
     return text
 
 
+def _has_gemini_key():
+    gemini, _ = _resolve_keys()
+    return bool(gemini)
+
+
+def _has_deepseek_key():
+    _, deepseek = _resolve_keys()
+    return bool(deepseek or (DEEPSEEK_API_KEY or "").strip())
+
+
+def _try_gemini(prompt, *, system, timeout_s, step):
+    """Run Gemini under deadline; raise LLMChainError or Exception on failure."""
+    return _run_with_deadline(
+        lambda: _gemini_generate(prompt, system=system),
+        timeout_s=timeout_s,
+        step=f"{step}:gemini",
+    )
+
+
+def _try_deepseek(prompt, *, system, timeout_s, step):
+    """Run DeepSeek under deadline; raise LLMChainError or Exception on failure."""
+    return _run_with_deadline(
+        lambda: _deepseek_generate(
+            prompt,
+            system=system,
+            http_timeout_s=max(1.0, float(timeout_s) - 0.5),
+        ),
+        timeout_s=timeout_s,
+        step=f"{step}:deepseek",
+    )
+
+
 def generate_text(
     prompt,
     *,
     step="llm",
     system=None,
     timeout_s=DEFAULT_TIMEOUT_S,
+    primary: str = "gemini",
 ):
     """
-    Gemini first; automatic DeepSeek failover on any Gemini failure.
+    Cost-aware dual-provider generation.
 
-    Each leg is independently wall-clock bounded by ``timeout_s`` (same budget
-    for both providers). Total worst-case latency ≈ 2 * timeout_s.
+    Args:
+        primary: ``"gemini"`` (default) — meetings / free-tier first, DeepSeek backup.
+                 ``"deepseek"`` — trade scans first, Gemini backup.
+
+    Each leg is independently wall-clock bounded by ``timeout_s``.
+    Total worst-case latency ≈ 2 * timeout_s.
+
+    Logs always name the provider that succeeded:
+      ``[LLM] provider=gemini ok (step) model=...``
+      ``[LLM FAILOVER] gemini→deepseek`` / ``deepseek→gemini``
 
     Raises:
-        LLMChainError: when both providers fail (or DeepSeek key missing after Gemini fail).
+        LLMChainError: when both providers fail (or backup key missing after primary fail).
     """
     prompt = str(prompt or "")
     if not prompt.strip():
         raise LLMChainError("Empty prompt", step=step)
 
-    gemini_err = None
+    primary = (primary or "gemini").strip().lower()
+    if primary not in ("gemini", "deepseek"):
+        print(f"[LLM] Unknown primary={primary!r}; defaulting to gemini")
+        primary = "gemini"
+
+    if primary == "gemini":
+        first, second = "gemini", "deepseek"
+        first_fn = _try_gemini
+        second_fn = _try_deepseek
+        first_model = GEMINI_MODEL
+        second_model = DEEPSEEK_MODEL
+        first_key_ok = _has_gemini_key
+        second_key_ok = _has_deepseek_key
+    else:
+        first, second = "deepseek", "gemini"
+        first_fn = _try_deepseek
+        second_fn = _try_gemini
+        first_model = DEEPSEEK_MODEL
+        second_model = GEMINI_MODEL
+        first_key_ok = _has_deepseek_key
+        second_key_ok = _has_gemini_key
+
+    first_err = None
     try:
-        text = _run_with_deadline(
-            lambda: _gemini_generate(prompt, system=system),
-            timeout_s=timeout_s,
-            step=f"{step}:gemini",
-        )
-        print(f"[LLM] Gemini ok ({step}) model={GEMINI_MODEL}")
+        text = first_fn(prompt, system=system, timeout_s=timeout_s, step=step)
+        print(f"[LLM] provider={first} ok ({step}) model={first_model}")
         return text
     except LLMChainError as exc:
-        gemini_err = exc
+        first_err = exc
         print(
-            f"[LLM FAILOVER] Gemini failed ({step}): {exc.message}, "
-            "routing to DeepSeek..."
+            f"[LLM FAILOVER] {first}→{second} ({step}): {exc.message}"
         )
     except Exception as exc:
-        gemini_err = exc
+        first_err = exc
         print(
-            f"[LLM FAILOVER] Gemini failed ({step}): {exc}, "
-            "routing to DeepSeek..."
+            f"[LLM FAILOVER] {first}→{second} ({step}): {exc}"
         )
 
-    _, deepseek_key = _resolve_keys()
-    if not deepseek_key and not (DEEPSEEK_API_KEY or "").strip():
+    if not second_key_ok():
         print(
-            f"[LLM FAILOVER] DEEPSEEK_API_KEY missing — cannot failover for {step}"
+            f"[LLM FAILOVER] {second} key missing — cannot failover for {step}"
         )
         raise LLMChainError(
-            f"Gemini failed and DeepSeek key missing: {gemini_err}",
+            f"{first} failed and {second} key missing: {first_err}",
             step=step,
-            is_timeout=getattr(gemini_err, "is_timeout", False),
-            gemini_error=gemini_err,
-        ) from (gemini_err if isinstance(gemini_err, BaseException) else None)
+            is_timeout=getattr(first_err, "is_timeout", False),
+            gemini_error=first_err if first == "gemini" else None,
+            deepseek_error=first_err if first == "deepseek" else None,
+        ) from (first_err if isinstance(first_err, BaseException) else None)
 
     try:
-        text = _run_with_deadline(
-            lambda: _deepseek_generate(
-                prompt,
-                system=system,
-                http_timeout_s=max(1.0, float(timeout_s) - 0.5),
-            ),
-            timeout_s=timeout_s,
-            step=f"{step}:deepseek",
-        )
-        print(f"[LLM FAILOVER] DeepSeek succeeded for {step}")
-        return text
-    except LLMChainError as deep_err:
+        text = second_fn(prompt, system=system, timeout_s=timeout_s, step=step)
         print(
-            f"[LLM FAILOVER] Both Gemini and DeepSeek failed for {step}: "
-            f"gemini={gemini_err}; deepseek={deep_err.message}"
+            f"[LLM FAILOVER] {first}→{second} succeeded ({step}) "
+            f"model={second_model}"
         )
+        print(f"[LLM] provider={second} ok ({step}) model={second_model} (failover)")
+        return text
+    except LLMChainError as second_err:
+        print(
+            f"[LLM FAILOVER] Both {first} and {second} failed for {step}: "
+            f"{first}={first_err}; {second}={second_err.message}"
+        )
+        gemini_e = first_err if first == "gemini" else second_err
+        deepseek_e = first_err if first == "deepseek" else second_err
         raise LLMChainError(
-            f"LLM chain exhausted: gemini={gemini_err}; deepseek={deep_err.message}",
+            f"LLM chain exhausted: {first}={first_err}; {second}={second_err.message}",
             step=step,
             is_timeout=bool(
-                getattr(gemini_err, "is_timeout", False) or deep_err.is_timeout
+                getattr(first_err, "is_timeout", False) or second_err.is_timeout
             ),
-            gemini_error=gemini_err,
-            deepseek_error=deep_err,
-        ) from deep_err
-    except Exception as deep_err:
+            gemini_error=gemini_e,
+            deepseek_error=deepseek_e,
+        ) from second_err
+    except Exception as second_err:
         print(
-            f"[LLM FAILOVER] Both Gemini and DeepSeek failed for {step}: "
-            f"gemini={gemini_err}; deepseek={deep_err}"
+            f"[LLM FAILOVER] Both {first} and {second} failed for {step}: "
+            f"{first}={first_err}; {second}={second_err}"
         )
+        gemini_e = first_err if first == "gemini" else second_err
+        deepseek_e = first_err if first == "deepseek" else second_err
         raise LLMChainError(
-            f"LLM chain exhausted: gemini={gemini_err}; deepseek={deep_err}",
+            f"LLM chain exhausted: {first}={first_err}; {second}={second_err}",
             step=step,
-            is_timeout=getattr(gemini_err, "is_timeout", False),
-            gemini_error=gemini_err,
-            deepseek_error=deep_err,
-        ) from deep_err
+            is_timeout=getattr(first_err, "is_timeout", False),
+            gemini_error=gemini_e,
+            deepseek_error=deepseek_e,
+        ) from second_err
 
 
 # Worst-case wall clock when master_bot wraps a call that itself runs the chain.

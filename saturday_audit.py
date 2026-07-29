@@ -63,6 +63,7 @@ Do not output anything other than raw JSON.
         try:
             raw_text = llm_chain.generate_text(
                 prompt,
+                primary="gemini",
                 step="saturday_audit",
                 timeout_s=LLM_TIMEOUT_S,
             ).strip()

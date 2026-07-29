@@ -322,6 +322,7 @@ def generate_morning_briefing(api_key=None):
     try:
         briefing_text = llm_chain.generate_text(
             user_prompt,
+            primary="gemini",
             step="pre_market_cos",
             system=system_instruction,
             timeout_s=LLM_TIMEOUT_S,

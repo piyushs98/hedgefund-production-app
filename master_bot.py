@@ -10,8 +10,9 @@ Key design notes:
   * Single run_portfolio_scan() used by the live 30-min market-hours loop
     and the optional BYPASS_MARKET_HOURS developer one-shot.
   * scoring_engine.py grades pillars from raw numbers + dynamic weights.
-  * CEO output uses a strict per-ticker Markdown schema; Gemini failure
-    falls back to a deterministic numeric formatter.
+  * CEO output uses a strict per-ticker Markdown schema; DeepSeek primary
+    (Gemini backup) falls back to a deterministic numeric formatter.
+  * Meetings (pre-market / midday) use Gemini primary; trade scans use DeepSeek.
   * CircuitBreaker, telemetry, and strike_selector handle resilience,
     backtest logging, and contract selection on EXECUTE.
   * Secrets are env-only (config.assert_secrets crashes early).
@@ -47,7 +48,7 @@ from yf_client import SESSION
 API_CALL_TIMEOUT_S = 20
 # google-genai HttpOptions.timeout is in milliseconds.
 LLM_HTTP_TIMEOUT_MS = 20_000
-# Gemini → DeepSeek chain may use two sequential provider attempts.
+# Provider chain may use two sequential attempts (primary + backup).
 LLM_CHAIN_TIMEOUT_S = API_CALL_TIMEOUT_S
 LLM_CHAIN_WALL_CLOCK_S = API_CALL_TIMEOUT_S * 2
 
@@ -123,9 +124,20 @@ def _gemini_client():
     )
 
 
-def _llm_generate_text(prompt, *, step, system=None, timeout_s=LLM_CHAIN_TIMEOUT_S):
+def _llm_generate_text(
+    prompt,
+    *,
+    step,
+    system=None,
+    timeout_s=LLM_CHAIN_TIMEOUT_S,
+    primary="deepseek",
+):
     """
-    High-availability LLM text: Gemini first, automatic DeepSeek failover.
+    High-availability LLM text for trade-path calls.
+
+    Default ``primary="deepseek"`` (CEO / quant / CoS ticker work).
+    Meetings use llm_chain.generate_text(..., primary="gemini") directly
+    (pre_market_meeting / midday_delta).
 
     Integrates with existing SRE envelopes:
       * Each provider attempt is wall-clock bounded (same ``timeout_s``).
@@ -139,6 +151,7 @@ def _llm_generate_text(prompt, *, step, system=None, timeout_s=LLM_CHAIN_TIMEOUT
             step=step,
             system=system,
             timeout_s=timeout_s,
+            primary=primary,
         )
     except llm_chain.LLMChainError as exc:
         raise MasterBotScanError(
@@ -419,11 +432,12 @@ Data (ATM-compacted; full chain scored offline):
 {compact}
 """
     try:
-        # Gemini → DeepSeek chain; each leg wall-clock bounded.
+        # DeepSeek primary (trade path); Gemini backup; wall-clock bounded.
         return _llm_generate_text(
             prompt,
             step=f"llm_quant:{ticker_symbol}",
             timeout_s=LLM_CHAIN_TIMEOUT_S,
+            primary="deepseek",
         )
     except Exception as e:
         # Both providers failed — soft fallback; strike_selector remains authoritative.
@@ -477,6 +491,7 @@ Structure the brief as:
             prompt,
             step=f"llm_cos:{ticker_symbol}",
             timeout_s=LLM_CHAIN_TIMEOUT_S,
+            primary="deepseek",
         )
     except Exception as e:
         print(
@@ -494,8 +509,8 @@ Structure the brief as:
 # ==========================================
 
 def format_ceo_deterministic(card, contract=None, *, include_session_open_context=False):
-    """Fills the exact required schema from real numbers. Used when Gemini
-    is unavailable AND appended as ground truth beneath the LLM output.
+    """Fills the exact required schema from real numbers. Used when trade-path
+    LLMs fail AND as ground truth beneath LLM output when needed.
 
     include_session_open_context: only the first scan of the session may cite
     overnight futures %; later scans stay ticker-local (spot/pivot/ATR).
@@ -613,6 +628,7 @@ OUTPUT RULES (strict):
             prompt,
             step=f"llm_ceo:{ticker}",
             timeout_s=LLM_CHAIN_TIMEOUT_S,
+            primary="deepseek",
         )
         # Schema guard: if the model drifted, fall back to deterministic format
         required = ["### ", "* **Market Context & Gap**", "* **Quantitative Liquidity Metric**",
@@ -624,7 +640,7 @@ OUTPUT RULES (strict):
             )
         return text
     except Exception as e:
-        # Both Gemini and DeepSeek failed — never break the scan; deterministic CEO text.
+        # Both providers failed — never break the scan; deterministic CEO text.
         print(
             f"[{ticker}] 👑 CEO Agent: LLM chain failed ({e}); "
             "using deterministic formatter."
@@ -1160,9 +1176,14 @@ def run_macro_loop():
     """
     24-hour mission-control loop:
 
-      * Night harvest (scrapers, no Gemini)
-      * Pre-market 09:15–09:29 ET — **only Gemini-heavy path** (CoS briefing)
-      * Trading 09:30–16:00 ET — **zero-Gemini midday delta** every ~30 min
+      * Night harvest (scrapers, no LLM)
+      * Pre-market 09:15–09:29 ET — **Gemini primary** CoS briefing
+        (DeepSeek backup)
+      * Trading 09:30–16:00 ET — midday delta every ~30 min:
+          - **Gemini primary** one-shot meeting synthesis (what changed)
+          - **DeepSeek primary** slim trade notes on EXECUTE / material deltas
+      * FULL_LLM_INTRADAY=true — heavy portfolio scan (DeepSeek primary for
+        trade-path LLMs: quant/CoS/CEO/managers/adversarial)
 
     IMMORTAL daemon contract:
       * The outer ``while True`` must never exit on an unhandled exception.
@@ -1175,11 +1196,11 @@ def run_macro_loop():
     # Optional escape hatch: FULL_LLM_INTRADAY=true restores the old heavy scan.
     full_llm_intraday = os.environ.get("FULL_LLM_INTRADAY", "false").lower() == "true"
 
-    print("\n--- INITIATING MASTER BOT (pre-market Gemini + midday delta) ---")
+    print("\n--- INITIATING MASTER BOT (Gemini meetings + DeepSeek trade scans) ---")
     print(f"Loaded Tickers: {TICKERS}")
     print(
         f"[System] Intraday mode: "
-        f"{'FULL LLM (escape hatch)' if full_llm_intraday else 'MIDDAY DELTA (Gemini OFF)'}"
+        f"{'FULL LLM (DeepSeek trade path)' if full_llm_intraday else 'MIDDAY DELTA (Gemini meeting + DeepSeek trades)'}"
     )
     config.assert_secrets(require_discord=False)   # Gemini for pre-market; webhook warns via broadcaster
     telemetry.init_telemetry_table()
@@ -1215,7 +1236,7 @@ def run_macro_loop():
                 except Exception as err:
                     print(f"❌ [Bypass Sim] Briefing error: {err}")
                 time.sleep(2)
-                print("\n[System State] 📈 [Bypass Sim] MIDDAY DELTA (no Gemini)...")
+                print("\n[System State] 📈 [Bypass Sim] MIDDAY DELTA (Gemini meeting + DeepSeek trades)...")
                 if full_llm_intraday:
                     run_portfolio_scan(
                         morning_macro_context,
@@ -1316,8 +1337,8 @@ def run_macro_loop():
                     )
                 else:
                     print(
-                        "[System State] Midday delta scan — Gemini OFF; "
-                        "report only changes vs morning baseline."
+                        "[System State] Midday delta scan — Gemini meeting + "
+                        "DeepSeek trade notes; deltas vs morning baseline."
                     )
                     run_midday_delta_scan(
                         breaker,

@@ -15,7 +15,7 @@ def generate_risk_report(math_options_json, ticker_symbol, api_key=None):
     Reads options chain data (with mathematician's swing targets) and outputs
     a strict Risk Report assessing liquidity, spreads, volume, and target viability.
 
-    LLM path: Gemini first, automatic DeepSeek failover via llm_chain.
+    LLM path: DeepSeek primary (trade scan), Gemini backup via llm_chain.
     Payload is ATM-compacted (full chain still used offline for scoring).
     """
     print(f"[{ticker_symbol}] 💼 Risk Manager (AI): Synthesizing Risk Report...")
@@ -40,6 +40,7 @@ Keep your response concise, professional, and strictly focused on risk. Do not r
     try:
         return llm_chain.generate_text(
             prompt,
+            primary="deepseek",
             step=f"risk:{ticker_symbol}",
             timeout_s=LLM_TIMEOUT_S,
         )
@@ -69,7 +70,7 @@ def generate_sentiment_report(historical_news, ticker_symbol, api_key=None):
     Reads historical news context (up to 90 days) and synthesizes a high-level
     "Macro & Sentiment Briefing" containing a sentiment rating and trend analysis.
 
-    LLM path: Gemini first, automatic DeepSeek failover via llm_chain.
+    LLM path: DeepSeek primary (trade scan), Gemini backup via llm_chain.
     """
     print(f"[{ticker_symbol}] 📰 Sentiment Manager (AI): Synthesizing Macro & Sentiment Briefing...")
     # Scoring uses the full headline string offline; LLM only needs a recent cap.
@@ -93,6 +94,7 @@ Keep the entire briefing concise, structured with bullet points, and under 4 sen
     try:
         return llm_chain.generate_text(
             prompt,
+            primary="deepseek",
             step=f"sentiment:{ticker_symbol}",
             timeout_s=LLM_TIMEOUT_S,
         )
@@ -113,7 +115,7 @@ def generate_ticker_manager_report(specialist_briefing_payload, api_key=None):
     Synthesizes the technical briefings from the Ticker Specialist Desk
     and generates a single cohesive report highlighting the strongest trading setups.
 
-    LLM path: Gemini first, automatic DeepSeek failover via llm_chain.
+    LLM path: DeepSeek primary (trade scan), Gemini backup via llm_chain.
     """
     print("[Ticker Team Manager] 💼 Ticker Team Manager (AI): Synthesizing Technical Specialist Briefings...")
 
@@ -140,6 +142,7 @@ Keep your report professional, highly structured, and under 5 sentences per sect
     try:
         return llm_chain.generate_text(
             prompt,
+            primary="deepseek",
             step="ticker_manager",
             timeout_s=LLM_TIMEOUT_S,
         )

@@ -35,10 +35,12 @@ HEDGE_DB_PATH = os.environ.get("HEDGE_DB_PATH", "data/hedge_fund.db")
 # Secrets — environment variables ONLY. Fail loudly, never silently
 # fall back to a committed key.
 #
-# LLM policy (llm_chain.generate_text):
-#   * GEMINI_API_KEY  — primary free-tier model (default gemini-flash-latest)
-#   * DEEPSEEK_API_KEY — backup only; used when Gemini fails
-#   * Override model via LLM_GEMINI_MODEL / LLM_DEEPSEEK_MODEL
+# LLM policy (llm_chain.generate_text primary=...):
+#   * Meetings (pre-market CoS, midday delta meeting): primary="gemini"
+#     free-tier (GEMINI_API_KEY / gemini-flash-latest); DeepSeek backup.
+#   * Trade scans (CEO/quant/CoS/managers/adversarial/trade notes):
+#     primary="deepseek" (DEEPSEEK_API_KEY); Gemini optional backup.
+#   * Override models via LLM_GEMINI_MODEL / LLM_DEEPSEEK_MODEL
 # ------------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")

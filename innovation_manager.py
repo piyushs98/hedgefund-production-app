@@ -65,6 +65,7 @@ Output a 2-3 sentence summary detailing explicit tailwinds or headwinds for the 
     try:
         return llm_chain.generate_text(
             prompt,
+            primary="deepseek",
             step=f"macro:{ticker}",
             timeout_s=LLM_TIMEOUT_S,
         )

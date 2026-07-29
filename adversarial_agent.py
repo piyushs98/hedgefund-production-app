@@ -12,8 +12,8 @@ class DevilsAdvocate:
     Hyper-detailed Adversarial Agent acting as a cold, cynical short-seller.
     Evaluates trades before execution to find hidden risks.
 
-    LLM path: Gemini first, automatic DeepSeek failover via llm_chain so a
-    provider outage cannot skip adversarial review without an explicit fallback.
+    LLM path: DeepSeek primary (trade/risk path), Gemini backup via llm_chain
+    so a provider outage cannot skip adversarial review without an explicit fallback.
     """
     def __init__(self, api_key=None):
         self.api_key = api_key or GEMINI_API_KEY
@@ -46,6 +46,7 @@ Only output the raw JSON. Do not include markdown code blocks or any other text.
         try:
             raw_text = llm_chain.generate_text(
                 prompt,
+                primary="deepseek",
                 step=f"adversarial:{ticker}",
                 timeout_s=LLM_TIMEOUT_S,
             )

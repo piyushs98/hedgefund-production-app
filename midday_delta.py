@@ -1,12 +1,15 @@
 """
-midday_delta.py — Zero-Gemini intraday book updates.
+midday_delta.py — Cost-aware intraday book updates.
 
 Architecture split:
-  * Pre-market (once/day): heavy Gemini CoS briefing in pre_market_meeting.py
-  * Midday / 30-min cadence: deterministic fetch → score → delta vs morning baseline
+  * Pre-market (once/day): Gemini CoS briefing in pre_market_meeting.py
+  * Midday / 30-min cadence:
+      1. Deterministic fetch → score → delta vs morning baseline
+         (scoring accuracy unchanged — no LLM in scoring path)
+      2. ONE Gemini-primary midday meeting (what changed, short Discord)
+      3. DeepSeek-primary slim trade notes on EXECUTE / material deltas
 
-No llm_chain / Gemini calls here. Same scoring_engine + strike_selector as the
-full path, so EXECUTE/PASS accuracy is unchanged.
+Gemini free-tier is reserved for meetings; DeepSeek handles trade-path text.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from typing import Any
 
 import config
 import broadcaster
+import llm_chain
 import scoring_engine
 import strike_selector
 import telemetry
@@ -38,6 +42,7 @@ BASELINE_PATH = os.environ.get(
 # Material-change thresholds for Discord (keeps noise low)
 SCORE_DELTA_MIN = float(os.environ.get("DELTA_SCORE_MIN", "5"))
 PCT_CHANGE_DELTA_MIN = float(os.environ.get("DELTA_PCT_MIN", "0.75"))
+LLM_TIMEOUT_S = int(os.environ.get("LLM_CALL_TIMEOUT_S", "20"))
 
 
 def macro_vector_local(ticker: str) -> str:
@@ -173,13 +178,13 @@ def format_delta_discord(
     trades: list[dict],
 ) -> str:
     """
-    Minimal Discord payload — no repeated ES/NQ essay, no per-ticker novels.
+    Deterministic Discord payload — used when Gemini midday meeting fails.
 
-    Token/API: zero LLM. Webhook chars kept short.
+    No ES/NQ essay, no per-ticker novels.
     """
     lines = [
         f"**📊 MIDDAY DELTA** `{scan_id}`",
-        "_No Gemini — deterministic score vs morning baseline_",
+        "_Deterministic score vs morning baseline_",
     ]
     if open_baseline:
         lines.append("_Open baseline established (first book scan of the session)._")
@@ -216,6 +221,165 @@ def format_delta_discord(
     return text
 
 
+def run_midday_meeting_gemini(
+    scan_id: str,
+    morning_excerpt: str,
+    open_baseline: bool,
+    rows: list[dict],
+    trades: list[dict],
+    *,
+    timeout_s: int = LLM_TIMEOUT_S,
+) -> str:
+    """
+    ONE Gemini-primary call: short Discord midday meeting (what changed only).
+
+    DeepSeek is automatic backup if Gemini fails. On total LLM failure, falls
+    back to format_delta_discord (deterministic).
+    """
+    brief = " ".join((morning_excerpt or "").split())[:400]
+    table_lines = []
+    for r in rows:
+        ch = ", ".join(r.get("changes") or []) or "—"
+        table_lines.append(
+            f"{r.get('ticker')} | {r.get('action_flag')} | "
+            f"{r.get('total_score')}/100 | spot {r.get('spot')} | "
+            f"pivot {r.get('pivot')} | Δ: {ch}"
+        )
+    table = "\n".join(table_lines) if table_lines else "(no tickers)"
+    trade_bits = []
+    for t in trades or []:
+        trade_bits.append(
+            f"{t.get('ticker')} {t.get('direction')} {t.get('strike')} "
+            f"exp {t.get('expiration')} @ ${t.get('entry_premium')}"
+        )
+    trades_block = "; ".join(trade_bits) if trade_bits else "none"
+
+    system = (
+        "You are the hedge fund midday meeting facilitator. Write a tight Discord "
+        "update. Only mention what changed vs the morning baseline. Do NOT reprint "
+        "ES/NQ futures gap essays. No filler."
+    )
+    prompt = f"""Scan id: {scan_id}
+Open baseline this scan: {open_baseline}
+
+Morning brief excerpt (≤400 chars, context only — do not paste wholesale):
+{brief or "(none on file)"}
+
+Ticker table (one line each: ticker | flag | score | spot | pivot | deltas):
+{table}
+
+Paper EXECUTEs this pass: {trades_block}
+
+Write a short Discord midday meeting (MAX 800 characters):
+- Lead with **📊 MIDDAY MEETING** and the scan id
+- Only material changes / EXECUTE flags; say "stable" if nothing moved
+- No ES=F / NQ=F / overnight gap reprint
+- Keep bullets tight; no long essays
+"""
+    print(
+        f"[midday] 📋 Midday meeting LLM (Gemini primary → DeepSeek backup, "
+        f"model={llm_chain.GEMINI_MODEL})..."
+    )
+    try:
+        text = llm_chain.generate_text(
+            prompt,
+            primary="gemini",
+            step="midday_meeting",
+            system=system,
+            timeout_s=timeout_s,
+        )
+        text = (text or "").strip()
+        if not text:
+            raise RuntimeError("empty midday meeting text")
+        if len(text) > 800:
+            text = text[:780] + "\n…(truncated)"
+        return text
+    except Exception as exc:
+        print(f"[midday] Midday meeting LLM failed ({exc}); deterministic digest.")
+        return format_delta_discord(
+            scan_id, morning_excerpt, open_baseline, rows, trades
+        )
+
+
+def run_trade_delta_note(
+    ticker: str,
+    *,
+    spot=None,
+    pivot=None,
+    score=None,
+    action_flag=None,
+    changes=None,
+    contract=None,
+    card=None,
+    timeout_s: int = LLM_TIMEOUT_S,
+) -> str:
+    """
+    Slim DeepSeek-primary trade note for EXECUTE or material delta tickers.
+
+    Metrics only — no full morning brief, no full options chain. Max ~150 words.
+    On failure: format_ceo_deterministic when card is available.
+    """
+    # Import inside function to avoid circular imports at module load.
+    contract_json = ""
+    if contract and isinstance(contract, dict) and "error" not in contract:
+        slim = {
+            k: contract.get(k)
+            for k in (
+                "direction",
+                "strike",
+                "expiration",
+                "entry_premium",
+                "stop_loss",
+                "take_profit",
+                "implied_volatility",
+                "bid_ask_spread_pct",
+            )
+            if contract.get(k) is not None
+        }
+        contract_json = json.dumps(slim, separators=(",", ":"))
+    else:
+        contract_json = "none"
+
+    delta_list = ", ".join(changes or []) or "none"
+    prompt = f"""Ticker {ticker} midday trade note. Metrics only:
+spot={spot} pivot={pivot} score={score}/100 flag={action_flag}
+deltas: {delta_list}
+contract: {contract_json}
+
+Write ≤150 words for Discord: decisive CEO-style note with the numbers above.
+No morning brief, no ES/NQ gap, no full options chain.
+"""
+    print(f"[{ticker}] 👑 Trade delta note (DeepSeek primary)...")
+    try:
+        text = llm_chain.generate_text(
+            prompt,
+            primary="deepseek",
+            step=f"trade_delta:{ticker}",
+            timeout_s=timeout_s,
+        )
+        text = (text or "").strip()
+        if not text:
+            raise RuntimeError("empty trade note")
+        # Soft cap ~150 words / webhook safety
+        words = text.split()
+        if len(words) > 160:
+            text = " ".join(words[:150]) + "…"
+        return text
+    except Exception as exc:
+        print(f"[{ticker}] Trade delta LLM failed ({exc}); deterministic CEO.")
+        if card is not None:
+            from master_bot import format_ceo_deterministic
+
+            return format_ceo_deterministic(
+                card, contract, include_session_open_context=False
+            )
+        return (
+            f"### {ticker} - {action_flag}\n"
+            f"* Spot {spot} vs pivot {pivot}; score {score}/100; "
+            f"deltas: {delta_list}."
+        )
+
+
 def run_midday_delta_scan(
     breaker: CircuitBreaker,
     *,
@@ -224,9 +388,10 @@ def run_midday_delta_scan(
     morning_macro_context: str = "",
 ):
     """
-    Lightweight book pass: market data + deterministic scoring + delta Discord.
+    Lightweight book pass: market data + deterministic scoring + delta vs baseline,
+    then Gemini midday meeting + DeepSeek trade notes on material/EXECUTE rows.
 
-    **Zero Gemini / llm_chain calls.**
+    Scoring path remains fully deterministic (no LLM).
     """
     from master_bot import (  # local import avoids circular init issues
         TICKERS,
@@ -244,11 +409,14 @@ def run_midday_delta_scan(
     result = {
         "scan_id": scan_id,
         "mode": "midday_delta",
-        "llm": False,
+        "llm": True,
+        "llm_policy": "gemini_meeting+deepseek_trades",
         "tickers_scanned": universe,
         "results": [],
         "trades": [],
         "discord_delivered": None,
+        "meeting_delivered": None,
+        "trade_notes": [],
         "aborted": False,
     }
 
@@ -275,7 +443,8 @@ def run_midday_delta_scan(
     futures_pct = get_latest_futures_pct("ES=F")
     print(
         f"\n🚀 MIDDAY DELTA SCAN {scan_id} | tickers={len(universe)} | "
-        f"open_baseline={open_baseline} | Gemini=OFF | ES=F {futures_pct}%"
+        f"open_baseline={open_baseline} | "
+        f"LLM=Gemini-meeting+DeepSeek-trades | ES=F {futures_pct}%"
     )
 
     new_ticker_state = dict(baseline.get("tickers") or {})
@@ -304,7 +473,7 @@ def run_midday_delta_scan(
             )
             atr_abs, atr_pct = fetch_atr(ticker, breaker)
             news_string = ensure_news_context(ticker, breaker)
-            # Score-critical macro tags without Gemini
+            # Score-critical macro tags without LLM
             macro_vector = macro_vector_local(ticker)
 
             card = scoring_engine.score_ticker(
@@ -365,13 +534,17 @@ def run_midday_delta_scan(
             changes = compute_deltas(ticker, prev, snap)
             new_ticker_state[ticker] = snap
 
-            # Discord line for this ticker
+            # In-memory row for meeting + trade notes (card not serialized)
             delta_rows.append({
                 "ticker": ticker,
                 "action_flag": card.action_flag,
                 "total_score": card.total_score,
                 "spot": snap.get("spot"),
+                "pivot": snap.get("pivot"),
+                "pct_change": snap.get("pct_change"),
                 "changes": changes,
+                "contract": contract,
+                "card": card,
             })
 
             try:
@@ -380,7 +553,10 @@ def run_midday_delta_scan(
                     card,
                     adversarial_result=adv,
                     selected_contract=contract,
-                    agent_params={"mode": "midday_delta", "llm": False},
+                    agent_params={
+                        "mode": "midday_delta",
+                        "llm_policy": "gemini_meeting+deepseek_trades",
+                    },
                 )
             except Exception:
                 pass
@@ -391,16 +567,6 @@ def run_midday_delta_scan(
                 "changes": changes,
             })
             result["results"].append(row)
-
-            # Optional compact per-EXECUTE CEO-style line (deterministic, no Gemini)
-            if card.action_flag == "EXECUTE" and contract:
-                from master_bot import format_ceo_deterministic
-                msg = format_ceo_deterministic(
-                    card, contract, include_session_open_context=False
-                )
-                broadcaster.send_discord_alert(
-                    f"**EXECUTE (delta path, no Gemini)**\n{msg}"
-                )
 
         except MasterBotScanError as e:
             print(f"[{ticker}] isolated: {e.step}: {e.message}")
@@ -423,14 +589,58 @@ def run_midday_delta_scan(
     baseline["last_delta_at"] = datetime.utcnow().isoformat() + "Z"
     save_baseline(baseline)
 
-    digest = format_delta_discord(
+    morning_text = baseline.get("morning_briefing") or morning_macro_context or ""
+
+    # --- Gemini-primary midday meeting (one call) ---
+    meeting_text = run_midday_meeting_gemini(
         scan_id,
-        baseline.get("morning_briefing") or morning_macro_context or "",
+        morning_text,
         open_baseline,
         delta_rows,
         result["trades"],
     )
-    ok = broadcaster.send_discord_alert(digest)
-    result["discord_delivered"] = bool(ok)
-    print(f"✅ MIDDAY DELTA {scan_id} complete | discord={ok}")
+    ok_meeting = broadcaster.send_discord_alert(meeting_text)
+    result["meeting_delivered"] = bool(ok_meeting)
+    result["discord_delivered"] = bool(ok_meeting)
+    print(f"[midday] Meeting Discord delivered={ok_meeting}")
+
+    # --- DeepSeek-primary trade notes: EXECUTE or material changes ---
+    for r in delta_rows:
+        is_execute = r.get("action_flag") == "EXECUTE"
+        is_material = bool(r.get("changes"))
+        if not (is_execute or is_material):
+            continue
+        # Skip pure "NEW baseline" noise on open baseline for non-EXECUTE
+        if (
+            not is_execute
+            and open_baseline
+            and r.get("changes")
+            and all(str(c).startswith("NEW baseline") for c in r["changes"])
+        ):
+            continue
+
+        note = run_trade_delta_note(
+            r["ticker"],
+            spot=r.get("spot"),
+            pivot=r.get("pivot"),
+            score=r.get("total_score"),
+            action_flag=r.get("action_flag"),
+            changes=r.get("changes"),
+            contract=r.get("contract"),
+            card=r.get("card"),
+        )
+        label = "EXECUTE" if is_execute else "DELTA"
+        ok_note = broadcaster.send_discord_alert(
+            f"**{label} trade note (DeepSeek path)**\n{note}"
+        )
+        result["trade_notes"].append({
+            "ticker": r["ticker"],
+            "delivered": bool(ok_note),
+            "action_flag": r.get("action_flag"),
+        })
+
+    print(
+        f"✅ MIDDAY DELTA {scan_id} complete | meeting={ok_meeting} | "
+        f"trade_notes={len(result['trade_notes'])}"
+    )
     return result
