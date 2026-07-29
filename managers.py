@@ -2,6 +2,7 @@ import os
 import json
 
 import llm_chain
+from llm_payloads import compact_options_for_llm, clip_text_for_llm
 
 # Load Gemini API Key from environment variable with fallback
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -15,14 +16,16 @@ def generate_risk_report(math_options_json, ticker_symbol, api_key=None):
     a strict Risk Report assessing liquidity, spreads, volume, and target viability.
 
     LLM path: Gemini first, automatic DeepSeek failover via llm_chain.
+    Payload is ATM-compacted (full chain still used offline for scoring).
     """
     print(f"[{ticker_symbol}] 💼 Risk Manager (AI): Synthesizing Risk Report...")
+    compact = compact_options_for_llm(math_options_json)
 
     prompt = f"""
 You are the Risk Manager of a quantitative hedge fund. Analyze this options chain and price data for {ticker_symbol}, which includes mathematician-calculated 'swing_targets' (entry premium, 20% stop-loss, and 50% take-profit).
 
-Options Chain Data (with mathematician targets):
-{math_options_json}
+Options Chain Data (ATM-compacted with mathematician targets):
+{compact}
 
 Your Task:
 Generate a strict, structured Risk Report. Your analysis MUST include:
@@ -69,12 +72,14 @@ def generate_sentiment_report(historical_news, ticker_symbol, api_key=None):
     LLM path: Gemini first, automatic DeepSeek failover via llm_chain.
     """
     print(f"[{ticker_symbol}] 📰 Sentiment Manager (AI): Synthesizing Macro & Sentiment Briefing...")
+    # Scoring uses the full headline string offline; LLM only needs a recent cap.
+    news_for_llm = clip_text_for_llm(historical_news, max_chars=6000, max_lines=50)
 
     prompt = f"""
-You are the Sentiment Manager of a quantitative hedge fund. Analyze the past 3 months of historical news headlines for {ticker_symbol}.
+You are the Sentiment Manager of a quantitative hedge fund. Analyze recent historical news headlines for {ticker_symbol} (most recent first; older rows may be omitted for size).
 
 Historical News headlines:
-{historical_news}
+{news_for_llm}
 
 Your Task:
 Synthesize a high-level "Macro & Sentiment Briefing" to present to the CEO. Your briefing must include:

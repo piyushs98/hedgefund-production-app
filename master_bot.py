@@ -407,14 +407,16 @@ def ensure_news_context(ticker, breaker=None):
 
 def run_quant_manager(options_json, ticker_symbol):
     print(f"[{ticker_symbol}] 💼 Quant Manager (AI): Analyzing options chain for setups...")
+    from llm_payloads import compact_options_for_llm
+    compact = compact_options_for_llm(options_json)
     prompt = f"""
 You are a Quantitative Analyst. Analyze this options data for {ticker_symbol}.
 Look at the Strike prices, Implied Volatility, Volume, and Open Interest.
 Identify ONE high-probability options trade (either a Call or a Put) with unusual volume or a compelling setup.
 Provide the strike, expiration, and a 1-sentence quantitative rationale.
 
-Data:
-{options_json}
+Data (ATM-compacted; full chain scored offline):
+{compact}
 """
     try:
         # Gemini → DeepSeek chain; each leg wall-clock bounded.
@@ -429,21 +431,27 @@ Data:
             f"[{ticker_symbol}] 💼 Quant Manager: LLM chain failed ({e}); "
             "using fallback note."
         )
-        return (f"Quant context unavailable (LLM offline). Deterministic strike selection "
-                f"in strike_selector.py remains authoritative for {ticker_symbol}.")
+        from llm_payloads import quant_local_note
+        return quant_local_note(options_json, ticker_symbol)
 
 
 # ==========================================
 # 👔 CHIEF OF STAFF SYNTHESIS
 # ==========================================
 
-def run_cos_synthesis(ticker_symbol, ticker_manager_report, news_report, options_report, quant_report):
+def run_cos_synthesis(ticker_symbol, technical_context, news_report, options_report, quant_report):
+    """
+    CoS brief for one ticker.
+
+    technical_context should be lean (this ticker's specialist brief + a short
+    portfolio tip) — never re-inject the full 10-ticker manager report.
+    """
     print(f"[{ticker_symbol}] 👔 Chief of Staff (AI): Synthesizing Corporate Brief...")
     prompt = f"""
 You are the Chief of Staff (CoS) of a quantitative hedge fund. Compile a synthesized Corporate Brief for ticker {ticker_symbol}.
 
---- 1. TICKER TEAM MANAGER REPORT ---
-{ticker_manager_report}
+--- 1. TECHNICAL CONTEXT (this ticker + short portfolio tip) ---
+{technical_context}
 
 --- 2. SENTIMENT/NEWS MANAGER REPORT ---
 {news_report}
@@ -457,6 +465,7 @@ You are the Chief of Staff (CoS) of a quantitative hedge fund. Compile a synthes
 CRITICAL FIDELITY RULES:
 - PRESERVE every specific number present in the manager reports (spreads, strikes, premiums, support/resistance, IV). Do NOT round them away or replace them with adjectives.
 - Never write generic filler like "conditions look favorable" — every claim must carry its metric.
+- Focus on {ticker_symbol} only; do not restate the whole book.
 
 Structure the brief as:
 - **Technical & Market Alignment**: exact levels and how they align with sentiment.
@@ -474,8 +483,10 @@ Structure the brief as:
             f"[{ticker_symbol}] 👔 CoS: LLM chain failed ({e}); "
             "using structural fallback."
         )
-        return (f"=== CORPORATE BRIEF {ticker_symbol} (LOCAL FALLBACK) ===\n{options_report}\n"
-                f"{news_report}\nQuant context: {quant_report}")
+        from llm_payloads import structural_cos_brief
+        return structural_cos_brief(
+            ticker_symbol, technical_context, news_report, options_report, quant_report
+        )
 
 
 # ==========================================
@@ -737,6 +748,7 @@ def run_portfolio_scan(
     # Portfolio-level technical color (LLM, for the CoS brief only).
     # Wall-clock bound: a hung yfinance desk + Gemini manager must not pin
     # the trading thread past API_CALL_TIMEOUT_S * stages.
+    specialist_briefings = {}
     try:
         print("\n[System State] 👷 Running Ticker Specialist Desk...")
         specialist_briefings = _call_with_timeout(
@@ -744,7 +756,7 @@ def run_portfolio_scan(
             # Desk fans out one yfinance pull per ticker; budget scales lightly.
             timeout_s=max(API_CALL_TIMEOUT_S, API_CALL_TIMEOUT_S * max(1, len(universe))),
             step="specialist_desk_yfinance",
-        )
+        ) or {}
         # Wall clock = 2x single-provider budget so Gemini→DeepSeek failover
         # can complete inside generate_ticker_manager_report without outer kill.
         ticker_manager_report = _call_with_timeout(
@@ -768,9 +780,17 @@ def run_portfolio_scan(
             f"Portfolio technical report unavailable "
             f"(failed at {desk_err.step}: {desk_err.message})."
         )
+        if not isinstance(specialist_briefings, dict):
+            specialist_briefings = {}
     except Exception as desk_err:
         print(f"❌ Specialist Desk/Manager error: {desk_err}")
         ticker_manager_report = "Portfolio technical report unavailable this cycle."
+        if not isinstance(specialist_briefings, dict):
+            specialist_briefings = {}
+
+    # Short shared tip once — never re-inject the full multi-ticker manager
+    # report into every CoS prompt (was ~10× token duplication).
+    portfolio_tip = (ticker_manager_report or "")[:500]
 
     def _send_discord(message):
         """Send Discord alert and track delivery success for this scan.
@@ -859,41 +879,8 @@ def run_portfolio_scan(
             news_string = ensure_news_context(ticker, breaker)
             math_json = calculate_swing_targets(options_json)
 
-            # ---- Manager tier (LLM context for the brief) ----
-            # Each call is wall-clock bounded (2x single-provider budget so
-            # Gemini→DeepSeek failover inside managers can finish). Soft LLM
-            # failures fall back inside manager modules; hard timeouts isolate
-            # THIS ticker only — never the immortal macro loop.
-            try:
-                risk_report = _call_with_timeout(
-                    lambda: generate_risk_report(
-                        math_json, ticker, api_key=GEMINI_API_KEY
-                    ),
-                    timeout_s=LLM_CHAIN_WALL_CLOCK_S,
-                    step=f"llm_risk:{ticker}",
-                )
-            except MasterBotScanError as llm_err:
-                if llm_err.is_timeout:
-                    _isolate_ticker(ticker, ticker_summary, llm_err)
-                    continue
-                risk_report = f"Risk report unavailable ({llm_err.message})."
-
-            try:
-                sentiment_report = _call_with_timeout(
-                    lambda: generate_sentiment_report(
-                        news_string, ticker, api_key=GEMINI_API_KEY
-                    ),
-                    timeout_s=LLM_CHAIN_WALL_CLOCK_S,
-                    step=f"llm_sentiment:{ticker}",
-                )
-            except MasterBotScanError as llm_err:
-                if llm_err.is_timeout:
-                    _isolate_ticker(ticker, ticker_summary, llm_err)
-                    continue
-                sentiment_report = f"Sentiment report unavailable ({llm_err.message})."
-
-            quant_report = run_quant_manager(math_json, ticker)
-
+            # ---- Score-critical path first (macro can move sentiment pillar) ----
+            # Risk/Quant/CoS are narrative color only — not used by scoring_engine.
             try:
                 macro_vector = _call_with_timeout(
                     lambda: generate_macro_catalyst_vector(
@@ -918,11 +905,74 @@ def run_portfolio_scan(
                   f"T {card.technical_score} + S {card.sentiment_score} = "
                   f"{card.total_score}/100 -> {card.action_flag}")
 
+            is_execute = card.action_flag == "EXECUTE"
+            from llm_payloads import (
+                quant_local_note,
+                risk_local_note,
+                structural_cos_brief,
+            )
+
+            # ---- Manager tier (LLM context for the brief) ----
+            # PASS: skip Risk/Quant/CoS LLMs (score already final; saves ~3 calls).
+            # EXECUTE: full narrative stack with ATM-compacted options payloads.
+            # Soft LLM failures fall back inside manager modules; hard timeouts
+            # isolate THIS ticker only — never the immortal macro loop.
+            if is_execute:
+                try:
+                    risk_report = _call_with_timeout(
+                        lambda: generate_risk_report(
+                            math_json, ticker, api_key=GEMINI_API_KEY
+                        ),
+                        timeout_s=LLM_CHAIN_WALL_CLOCK_S,
+                        step=f"llm_risk:{ticker}",
+                    )
+                except MasterBotScanError as llm_err:
+                    if llm_err.is_timeout:
+                        _isolate_ticker(ticker, ticker_summary, llm_err)
+                        continue
+                    risk_report = f"Risk report unavailable ({llm_err.message})."
+
+                try:
+                    sentiment_report = _call_with_timeout(
+                        lambda: generate_sentiment_report(
+                            news_string, ticker, api_key=GEMINI_API_KEY
+                        ),
+                        timeout_s=LLM_CHAIN_WALL_CLOCK_S,
+                        step=f"llm_sentiment:{ticker}",
+                    )
+                except MasterBotScanError as llm_err:
+                    if llm_err.is_timeout:
+                        _isolate_ticker(ticker, ticker_summary, llm_err)
+                        continue
+                    sentiment_report = f"Sentiment report unavailable ({llm_err.message})."
+
+                quant_report = run_quant_manager(math_json, ticker)
+            else:
+                print(
+                    f"[{ticker}] 💸 Cost path PASS: skipping Risk/Quant/CoS LLMs "
+                    f"(score already {card.total_score}/100)."
+                )
+                risk_report = risk_local_note(math_json, ticker)
+                quant_report = quant_local_note(math_json, ticker)
+                try:
+                    sentiment_report = _call_with_timeout(
+                        lambda: generate_sentiment_report(
+                            news_string, ticker, api_key=GEMINI_API_KEY
+                        ),
+                        timeout_s=LLM_CHAIN_WALL_CLOCK_S,
+                        step=f"llm_sentiment:{ticker}",
+                    )
+                except MasterBotScanError as llm_err:
+                    if llm_err.is_timeout:
+                        _isolate_ticker(ticker, ticker_summary, llm_err)
+                        continue
+                    sentiment_report = f"Sentiment report unavailable ({llm_err.message})."
+
             # ---- Devil's Advocate intercept ----
             adv_result = None
             vetoed = False
             veto_reason = None
-            if card.action_flag == "EXECUTE":
+            if is_execute:
                 advocate = DevilsAdvocate(api_key=GEMINI_API_KEY)
                 try:
                     adv_result = _call_with_timeout(
@@ -952,6 +1002,7 @@ def run_portfolio_scan(
                     scoring_engine.apply_adversarial_penalty(
                         card, 15.0, veto_reason)
                     vetoed = True
+                    is_execute = card.action_flag == "EXECUTE"
                     print(f"[{ticker}] 🛑 Devil's Advocate veto -15 -> "
                           f"{card.total_score}/100 ({card.action_flag}).")
                 else:
@@ -959,7 +1010,7 @@ def run_portfolio_scan(
 
             # ---- Strike selection on EXECUTE (Task 3a) ----
             contract = None
-            if card.action_flag == "EXECUTE":
+            if is_execute:
                 contract = strike_selector.select_optimal_contract(
                     options_dict, pivot_data, atr_abs=atr_abs)
                 if "error" in contract:
@@ -967,14 +1018,28 @@ def run_portfolio_scan(
                           f"{contract['error']} — downgrading to PASS.")
                     card.action_flag = "PASS"
                     card.reasons.append(f"Downgraded: {contract['error']}")
+                    is_execute = False
                 else:
                     print(f"[{ticker}] 🎯 Contract: {contract['direction']} "
                           f"{contract['strike']} {contract['expiration']} @ "
                           f"${contract['entry_premium']}")
 
+            # Lean technical context: this ticker's specialist brief + short tip
+            tech_context = (
+                f"Portfolio tip (shared, truncated): {portfolio_tip}\n\n"
+                f"=== {ticker} Specialist ===\n"
+                f"{(specialist_briefings or {}).get(ticker, 'No specialist briefing.')}"
+            )
+
             # ---- Executive tier ----
-            corporate_brief = run_cos_synthesis(
-                ticker, ticker_manager_report, sentiment_report, risk_report, quant_report)
+            if is_execute:
+                corporate_brief = run_cos_synthesis(
+                    ticker, tech_context, sentiment_report, risk_report, quant_report
+                )
+            else:
+                corporate_brief = structural_cos_brief(
+                    ticker, tech_context, sentiment_report, risk_report, quant_report
+                )
             trade_decision = run_ceo_decision(
                 corporate_brief,
                 morning_macro_context,
