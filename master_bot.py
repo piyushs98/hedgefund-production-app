@@ -1179,11 +1179,11 @@ def run_macro_loop():
       * Night harvest (scrapers, no LLM)
       * Pre-market 09:15–09:29 ET — **Gemini primary** CoS briefing
         (DeepSeek backup)
-      * Trading 09:30–16:00 ET — midday delta every ~30 min:
-          - **Gemini primary** one-shot meeting synthesis (what changed)
-          - **DeepSeek primary** slim trade notes on EXECUTE / material deltas
-      * FULL_LLM_INTRADAY=true — heavy portfolio scan (DeepSeek primary for
-        trade-path LLMs: quant/CoS/CEO/managers/adversarial)
+      * Trading 09:30–16:00 ET — **30-min scans** (table Discord; DeepSeek
+        KEY TELEMETRY only; no Midday Macro headers)
+      * **11:00 AM CDT only (once/day)** — Midday Macro & News Update
+        (Gemini primary, DeepSeek backup), isolated from 30-min payloads
+      * FULL_LLM_INTRADAY=true — heavy portfolio scan escape hatch
 
     IMMORTAL daemon contract:
       * The outer ``while True`` must never exit on an unhandled exception.
@@ -1191,18 +1191,24 @@ def run_macro_loop():
         sleep 60s (anti-spam), then ``continue``.
       * Flask in main.py is health-only; this loop must not die silently.
     """
-    from midday_delta import run_midday_delta_scan
+    from midday_delta import (
+        run_thirty_min_scan,
+        run_midday_macro_meeting,
+        is_midday_macro_window,
+        load_baseline,
+        cdt_clock_str,
+    )
 
     # Optional escape hatch: FULL_LLM_INTRADAY=true restores the old heavy scan.
     full_llm_intraday = os.environ.get("FULL_LLM_INTRADAY", "false").lower() == "true"
 
-    print("\n--- INITIATING MASTER BOT (Gemini meetings + DeepSeek trade scans) ---")
+    print("\n--- INITIATING MASTER BOT (30-min radar + 11:00 CDT midday macro) ---")
     print(f"Loaded Tickers: {TICKERS}")
     print(
         f"[System] Intraday mode: "
-        f"{'FULL LLM (DeepSeek trade path)' if full_llm_intraday else 'MIDDAY DELTA (Gemini meeting + DeepSeek trades)'}"
+        f"{'FULL LLM escape hatch' if full_llm_intraday else '30-MIN SCAN table + isolated 11:00 CDT macro'}"
     )
-    config.assert_secrets(require_discord=False)   # Gemini for pre-market; webhook warns via broadcaster
+    config.assert_secrets(require_discord=False)
     telemetry.init_telemetry_table()
     breaker = CircuitBreaker(failure_threshold=5, cooldown_seconds=900)
 
@@ -1212,19 +1218,24 @@ def run_macro_loop():
         print(f"[System] Error setting EST timezone ({e}). Using local timezone.")
         est_tz = None
 
+    try:
+        cdt_tz = pytz.timezone("America/Chicago")
+    except Exception:
+        cdt_tz = est_tz
+
     morning_macro_context = ""
     last_briefing_date = None
+    last_midday_macro_date = None  # once/day 11:00 CDT isolation
     scan_interval = 1800  # 30-minute active loop
-    # After an unhandled cycle exception: wait before re-entering the loop.
-    # 60s is intentional — prevents Discord spam if a failure is sticky.
     CRITICAL_ERROR_BACKOFF_S = 60
 
     while True:
         try:
             now = datetime.now(est_tz)
             current_time = now.time()
+            now_cdt = datetime.now(cdt_tz) if cdt_tz else now
 
-            # Developer test sequence: night harvest -> briefing -> one delta scan -> exit
+            # Developer test sequence
             if BYPASS_MARKET_HOURS:
                 print("\n🔬 DEVELOPER BYPASS RUN: Simulating 24-Hour Cycle")
                 print("\n[System State] 🌙 [Bypass Sim] NIGHT MODE...")
@@ -1236,7 +1247,7 @@ def run_macro_loop():
                 except Exception as err:
                     print(f"❌ [Bypass Sim] Briefing error: {err}")
                 time.sleep(2)
-                print("\n[System State] 📈 [Bypass Sim] MIDDAY DELTA (Gemini meeting + DeepSeek trades)...")
+                print("\n[System State] 📈 [Bypass Sim] 30-MIN SCAN (table schema)...")
                 if full_llm_intraday:
                     run_portfolio_scan(
                         morning_macro_context,
@@ -1245,11 +1256,23 @@ def run_macro_loop():
                         include_session_open_context=True,
                     )
                 else:
-                    run_midday_delta_scan(
+                    run_thirty_min_scan(
                         breaker,
                         inter_ticker_sleep=5,
                         morning_macro_context=morning_macro_context,
                     )
+                print("\n[System State] 📊 [Bypass Sim] MIDDAY MACRO (isolated)...")
+                try:
+                    bl = load_baseline()
+                    macro_msg = run_midday_macro_meeting(
+                        morning_excerpt=morning_macro_context
+                        or bl.get("morning_briefing")
+                        or "",
+                        rows=bl.get("last_scan_rows") or [],
+                    )
+                    broadcaster.send_discord_alert(macro_msg)
+                except Exception as me:
+                    print(f"[Bypass] Midday macro failed: {me}")
                 print("\n🔬 DEVELOPER BYPASS RUN: Completed. Exiting loop.")
                 break
 
@@ -1263,7 +1286,6 @@ def run_macro_loop():
             trading_end = datetime.strptime("15:59:59", "%H:%M:%S").time()
             is_weekend = now.weekday() > 4
             is_holiday = now.strftime("%Y-%m-%d") in NYSE_HOLIDAYS
-            # Holidays are treated exactly like weekends: no prep, no trading.
             is_market_closed = is_weekend or is_holiday
             if is_holiday:
                 print("[System] Market closed today for NYSE holiday.")
@@ -1281,7 +1303,6 @@ def run_macro_loop():
                 for _ in range(45):
                     time.sleep(60)
                     nxt = datetime.now(est_tz)
-                    # Only break toward prep on a true trading day (weekday + not holiday)
                     if (nxt.time() >= meeting_start
                             and nxt.weekday() <= 4
                             and nxt.strftime("%Y-%m-%d") not in NYSE_HOLIDAYS):
@@ -1304,21 +1325,22 @@ def run_macro_loop():
                 continue
 
             elif is_trading_mode:
-                print(f"\n[System State] 📈 ACTIVE TRADING MODE (EST {now.strftime('%H:%M:%S')})")
+                print(
+                    f"\n[System State] 📈 ACTIVE TRADING MODE "
+                    f"(EST {now.strftime('%H:%M:%S')} | CDT {cdt_clock_str(now_cdt)})"
+                )
                 if not morning_macro_context:
-                    # Prefer baseline on disk over re-calling Gemini mid-session
                     try:
-                        from midday_delta import load_baseline
                         bl = load_baseline()
                         if bl.get("date") == now.strftime("%Y-%m-%d") and bl.get("morning_briefing"):
                             morning_macro_context = bl["morning_briefing"]
                             last_briefing_date = now.date()
-                            print("[System State] Loaded morning brief from session baseline (no Gemini).")
+                            print("[System State] Loaded morning brief from session baseline.")
                     except Exception:
                         pass
                 if not morning_macro_context and not full_llm_intraday:
-                    morning_macro_context = "No morning briefing on file (delta path continues without Gemini)."
-                    print("[System State] No morning brief — continuing delta path without Gemini re-run.")
+                    morning_macro_context = "No morning briefing on file."
+                    print("[System State] No morning brief on file — 30-min scan continues.")
                 elif not morning_macro_context and full_llm_intraday:
                     print("[System State] FULL_LLM_INTRADAY: generating morning brief via Gemini...")
                     try:
@@ -1328,8 +1350,38 @@ def run_macro_loop():
                         print(f"❌ Fallback briefing error: {brief_err}")
                         morning_macro_context = "No morning briefing context available."
 
+                # ---- 1) Isolated Midday Macro @ 11:00 AM CDT (once/day) ----
+                # 12:00 PM EDT during CDT. Never prepended onto 30-min scan messages.
+                if (
+                    last_midday_macro_date != now_cdt.date()
+                    and is_midday_macro_window(now_cdt)
+                ):
+                    print(
+                        f"[System State] 📊 MIDDAY MACRO WINDOW "
+                        f"(CDT {cdt_clock_str(now_cdt)}) — Gemini once, isolated payload"
+                    )
+                    try:
+                        bl = load_baseline()
+                        macro_msg = run_midday_macro_meeting(
+                            morning_excerpt=morning_macro_context
+                            or bl.get("morning_briefing")
+                            or "",
+                            rows=bl.get("last_scan_rows") or [],
+                        )
+                        # Guarantee branding isolation
+                        if "30-MIN SCAN" in (macro_msg or "").upper():
+                            macro_msg = macro_msg.replace("30-MIN SCAN", "BOOK SNAPSHOT")
+                        ok_m = broadcaster.send_discord_alert(macro_msg)
+                        last_midday_macro_date = now_cdt.date()
+                        print(f"[System State] Midday macro delivered={ok_m}")
+                    except Exception as macro_err:
+                        print(f"❌ Midday macro failed: {macro_err}")
+                        # Still mark date to avoid retry spam every loop minute
+                        last_midday_macro_date = now_cdt.date()
+
+                # ---- 2) Standard 30-minute scan (table schema only) ----
                 if full_llm_intraday:
-                    print("[System State] FULL_LLM_INTRADAY=true — heavy portfolio scan (not default).")
+                    print("[System State] FULL_LLM_INTRADAY=true — heavy portfolio scan.")
                     run_portfolio_scan(
                         morning_macro_context,
                         breaker,
@@ -1337,10 +1389,10 @@ def run_macro_loop():
                     )
                 else:
                     print(
-                        "[System State] Midday delta scan — Gemini meeting + "
-                        "DeepSeek trade notes; deltas vs morning baseline."
+                        "[System State] 30-MIN SCAN — single Discord table; "
+                        "no Midday Macro header on this payload."
                     )
-                    run_midday_delta_scan(
+                    run_thirty_min_scan(
                         breaker,
                         morning_macro_context=morning_macro_context,
                     )
@@ -1348,6 +1400,17 @@ def run_macro_loop():
                 print(f"Sleeping up to {scan_interval // 60} minutes before next scan...")
                 for _ in range(scan_interval // 60):
                     time.sleep(60)
+                    # Wake early into the 11:00 CDT window so macro isn't missed
+                    woke = datetime.now(cdt_tz) if cdt_tz else datetime.now(est_tz)
+                    if (
+                        last_midday_macro_date != woke.date()
+                        and is_midday_macro_window(woke)
+                    ):
+                        print(
+                            f"[System State] Waking early for 11:00 CDT macro "
+                            f"(CDT {cdt_clock_str(woke)})"
+                        )
+                        break
                     if datetime.now(est_tz).time() >= trading_end:
                         break
                 continue

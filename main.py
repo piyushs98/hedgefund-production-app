@@ -3,9 +3,9 @@ main.py — Render entrypoint for Master Bot only.
 
 What this process does:
   1. Starts master_bot.run_macro_loop() once (daemon thread):
-       • Pre-market CoS briefing via Gemini → Discord (~09:15–09:29 ET)  [only heavy LLM]
-       • Midday delta scans every ~30 min (09:30–16:00 ET) — no Gemini;
-         deterministic score vs morning baseline, Discord deltas only
+       • Pre-market CoS briefing via Gemini → Discord (~09:15–09:29 ET)
+       • 30-min scans (RTH): single Discord table + KEY TELEMETRY (DeepSeek)
+       • Midday Macro & News once/day @ 11:00 AM CDT only (Gemini; isolated)
   2. Serves a minimal Flask app so Render health checks stay green.
 
 What this process does NOT do:
