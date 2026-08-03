@@ -85,6 +85,19 @@ def log_scan_result(scan_id, scorecard, adversarial_result=None,
             conn.commit()
         print(f"[Telemetry] Logged {card['ticker']} scan {scan_id} "
               f"({card['total_score']}/100 -> {card['action_flag']}).")
+        try:
+            import write_guard
+            write_guard.record_write_ok("telemetry")
+        except Exception:
+            pass
     except Exception as e:
         print(f"[Telemetry] WARNING: failed to log scan for "
               f"{getattr(scorecard, 'ticker', '?')}: {e}")
+        try:
+            import write_guard
+            write_guard.record_write_fail(
+                "telemetry", e,
+                detail=f"{getattr(scorecard, 'ticker', '?')} scan={scan_id}",
+            )
+        except Exception:
+            pass

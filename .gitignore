@@ -21,3 +21,7 @@ __pycache__/
 *.log
 mac_ssl_fix.sh
 patcher.py
+
+# Local SQLite state (ephemeral on free tier; never commit)
+data/*.db
+*.db

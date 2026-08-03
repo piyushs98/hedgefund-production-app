@@ -322,11 +322,23 @@ def record_executed_trade(ticker, contract, scan_id=None, card=None):
     # Dual-write: active_trades.json + news_room.db active_trades_store
     ok = save_active_trade(trade_payload, path=ACTIVE_TRADES_PATH)
     if ok:
+        try:
+            import write_guard
+            write_guard.record_write_ok("active_trades")
+        except Exception:
+            pass
         print(
             "[CEO] Successfully recorded new position to active_trades.json "
             "and SQLite active_trades_store"
         )
     else:
+        try:
+            import write_guard
+            write_guard.record_write_fail(
+                "active_trades", detail=f"{ticker} path={ACTIVE_TRADES_PATH}"
+            )
+        except Exception:
+            pass
         print(f"[CEO] WARNING: failed to record {ticker} to {ACTIVE_TRADES_PATH}")
     return ok
 
@@ -1209,6 +1221,12 @@ def run_macro_loop():
         f"{'FULL LLM escape hatch' if full_llm_intraday else '30-MIN SCAN table + isolated 11:00 CDT macro'}"
     )
     config.assert_secrets(require_discord=False)
+    # Log-only path inventory (Stage 1). No writes, no restore.
+    try:
+        import state_preflight
+        state_preflight.run_preflight()
+    except Exception as pf_err:
+        print(f"[System] WARNING: state preflight failed: {pf_err}")
     telemetry.init_telemetry_table()
     breaker = CircuitBreaker(failure_threshold=5, cooldown_seconds=900)
 

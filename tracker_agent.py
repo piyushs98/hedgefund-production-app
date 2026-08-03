@@ -315,9 +315,19 @@ def _write_trades(trades: list[dict[str, Any]], store: Path) -> bool:
             raise
         # JSON is source of truth for this write; mirror entire open set to SQLite
         _sync_sqlite_to_json(trades)
+        try:
+            import write_guard
+            write_guard.record_write_ok("active_trades")
+        except Exception:
+            pass
         return True
     except OSError as e:
         print(f"[Tracker] Failed to write state to {store}: {e}")
+        try:
+            import write_guard
+            write_guard.record_write_fail("active_trades", e, detail=str(store))
+        except Exception:
+            pass
         return False
 
 

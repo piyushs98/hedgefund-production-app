@@ -125,6 +125,13 @@ def prepare_process() -> None:
 
     print("\n=== MASTER BOT ONLY (main.py) — no dashboard, no tracker ===")
 
+    # Log-only path inventory (Stage 1). Never writes or restores state.
+    try:
+        import state_preflight
+        state_preflight.run_preflight()
+    except Exception as e:
+        print(f"[main] WARNING: state preflight failed: {e}")
+
     # Paper ledger used by master_bot EXECUTE path (not for a web UI).
     try:
         import virtual_broker

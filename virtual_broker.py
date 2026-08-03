@@ -174,37 +174,54 @@ def paper_buy(contract: Any, entry_price: float | int | None) -> dict[str, Any]:
     cost = premium * CONTRACT_MULTIPLIER
     now = datetime.now(timezone.utc).isoformat()
 
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT buying_power, total_realized_pnl FROM portfolio_ledger WHERE id = 1"
-        ).fetchone()
-        if not row:
-            return {"ok": False, "error": "portfolio_ledger missing after ensure"}
+    # Stage 1: write_guard is additive only. Soft failures still return
+    # {"ok": False, ...} as before. Hard DB errors still raise so callers'
+    # existing except blocks keep logging — we record then re-raise.
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT buying_power, total_realized_pnl FROM portfolio_ledger WHERE id = 1"
+            ).fetchone()
+            if not row:
+                return {"ok": False, "error": "portfolio_ledger missing after ensure"}
 
-        buying_power = float(row["buying_power"])
-        if buying_power < cost:
-            print(
-                f"[VirtualBroker] paper_buy blocked: need ${cost:.2f}, "
-                f"have ${buying_power:.2f}"
+            buying_power = float(row["buying_power"])
+            if buying_power < cost:
+                print(
+                    f"[VirtualBroker] paper_buy blocked: need ${cost:.2f}, "
+                    f"have ${buying_power:.2f}"
+                )
+                return {
+                    "ok": False,
+                    "error": "insufficient buying_power",
+                    "buying_power": buying_power,
+                    "cost": cost,
+                }
+
+            new_bp = buying_power - cost
+            conn.execute(
+                """
+                UPDATE portfolio_ledger
+                SET buying_power = ?, updated_at = ?
+                WHERE id = 1
+                """,
+                (new_bp, now),
             )
-            return {
-                "ok": False,
-                "error": "insufficient buying_power",
-                "buying_power": buying_power,
-                "cost": cost,
-            }
+            conn.commit()
+            realized = float(row["total_realized_pnl"])
+    except Exception as e:
+        try:
+            import write_guard
+            write_guard.record_write_fail("paper_broker", e)
+        except Exception:
+            pass
+        raise
 
-        new_bp = buying_power - cost
-        conn.execute(
-            """
-            UPDATE portfolio_ledger
-            SET buying_power = ?, updated_at = ?
-            WHERE id = 1
-            """,
-            (new_bp, now),
-        )
-        conn.commit()
-        realized = float(row["total_realized_pnl"])
+    try:
+        import write_guard
+        write_guard.record_write_ok("paper_broker")
+    except Exception:
+        pass
 
     meta = _contract_meta(contract)
     ticker = meta.get("ticker") or meta.get("symbol")

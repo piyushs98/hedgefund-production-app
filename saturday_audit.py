@@ -7,12 +7,17 @@ import llm_chain
 
 DB_PATH = "data/news_room.db"
 LLM_TIMEOUT_S = int(os.environ.get("LLM_CALL_TIMEOUT_S", "40"))
+# Minimum real closed trades before win-rate / PnL may be reported to Discord.
+MIN_AUDIT_TRADES = int(os.environ.get("MIN_AUDIT_TRADES", "3"))
 
 def run_saturday_audit():
     """
     Saturday Performance Audit Loop
     Reads the trade_logs table and synthesizes the metrics portfolio.
     Outputs a weight adjustment JSON for the upcoming week.
+
+    Never substitutes mock/sample trades. Empty or insufficient trade_logs
+    posts a plain insufficient-data notice with no win rate or PnL.
     """
     print("📊 Initiating Saturday Performance Audit Loop...")
     try:
@@ -20,22 +25,26 @@ def run_saturday_audit():
             cursor = conn.cursor()
             cursor.execute("SELECT ticker, outcome, profit_loss, duration_hours, agent_prediction FROM trade_logs")
             logs = cursor.fetchall()
-            
-        # For testing purposes, mock a log if the database is empty
-        if not logs:
-            print("No trades logged this week to audit. Generating simulated audit data...")
-            logs = [
-                ("AAPL", "WIN", 450.50, 4.2, "BULLISH_BREAKOUT"),
-                ("TSLA", "LOSS", -120.00, 2.1, "SUPPORT_BOUNCE"),
-                ("SPY", "WIN", 210.00, 1.5, "MOMENTUM_CONTINUATION")
-            ]
-            
-        # Synthesize Metrics Portfolio
-        total_trades = len(logs)
-        wins = sum(1 for log in logs if log[2] > 0)
+
+        n = len(logs)
+        if n < MIN_AUDIT_TRADES:
+            report = (
+                f"# 📊 Saturday Performance Audit\n"
+                f"**insufficient data: {n} closed trades**\n\n"
+                f"Need at least {MIN_AUDIT_TRADES} closed rows in `trade_logs` "
+                f"before win rate or PnL will be reported.\n"
+                f"No sample data was substituted."
+            )
+            print(report)
+            broadcaster.send_discord_alert(report)
+            return
+
+        # Synthesize Metrics Portfolio (real rows only)
+        total_trades = n
+        wins = sum(1 for log in logs if (log[2] or 0) > 0)
         win_loss_ratio = wins / total_trades if total_trades > 0 else 0
-        avg_duration = sum(log[3] for log in logs) / total_trades if total_trades > 0 else 0
-        total_pnl = sum(log[2] for log in logs)
+        avg_duration = sum((log[3] or 0) for log in logs) / total_trades if total_trades > 0 else 0
+        total_pnl = sum((log[2] or 0) for log in logs)
         
         metrics_payload = {
             "total_weekly_capital_deployed": total_trades * 1000,
@@ -93,6 +102,7 @@ Do not output anything other than raw JSON.
             print(f"Could not persist recommended weights ({w_err}); engine keeps prior weights.")
         
         report = f"""# 📊 Saturday Performance Audit
+**Closed trades:** {total_trades} (source: trade_logs — real data only)
 **Total PnL:** ${total_pnl:.2f}
 **Win/Loss Ratio:** {win_loss_ratio*100:.1f}%
 **Average Duration:** {avg_duration:.1f} hours
@@ -107,6 +117,14 @@ Do not output anything other than raw JSON.
         
     except sqlite3.Error as e:
         print(f"SQLite Error in Saturday Audit: {e}")
+        try:
+            broadcaster.send_discord_alert(
+                f"# 📊 Saturday Performance Audit\n"
+                f"**insufficient data: audit DB error**\n`{e}`\n"
+                f"No sample data was substituted."
+            )
+        except Exception:
+            pass
     except Exception as e:
         print(f"Saturday Audit Error: {e}")
 

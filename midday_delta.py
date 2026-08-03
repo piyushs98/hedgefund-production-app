@@ -152,8 +152,20 @@ def save_baseline(data: dict) -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         os.replace(tmp, BASELINE_PATH)
+        try:
+            import write_guard
+            write_guard.record_write_ok("session_baseline")
+        except Exception:
+            pass
     except Exception as e:
         print(f"[midday] WARNING: could not save baseline: {e}")
+        try:
+            import write_guard
+            write_guard.record_write_fail(
+                "session_baseline", e, detail=str(BASELINE_PATH)
+            )
+        except Exception:
+            pass
 
 
 def store_morning_briefing(briefing_text: str, session_date: str | None = None) -> dict:
@@ -673,8 +685,10 @@ def run_thirty_min_scan(
                     selected_contract=contract,
                     agent_params={"mode": "thirty_min_scan", "llm_policy": "deepseek_telemetry"},
                 )
-            except Exception:
-                pass
+            except Exception as te:
+                # Keep scan alive; still surface failure (write_guard is also
+                # invoked inside telemetry.log_scan_result on its own except).
+                print(f"[{ticker}] telemetry WARNING: {te}")
 
         except MasterBotScanError as e:
             print(f"[{ticker}] isolated: {e.step}: {e.message}")
