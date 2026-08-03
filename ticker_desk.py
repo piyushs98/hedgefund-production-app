@@ -1,9 +1,17 @@
 import os
 import time
 import sqlite3
+from datetime import datetime
+
 import yfinance as yf
 from news_memory import get_historical_context
 from yf_client import SESSION, TICKER_PACING_SECONDS
+
+try:
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
+except ImportError:  # pragma: no cover — py<3.9
+    _ET = None
 
 # CENTRALIZED GROQ CONFIGURATION
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
@@ -15,56 +23,191 @@ try:
 except ImportError:
     HAS_GROQ = False
 
+# ---------------------------------------------------------------------------
+# Daily pivot cache: first computation per (ticker, session date) wins.
+# Levels are frozen for the rest of the trading day. Live close / pct_change
+# are refreshed each call so scoring still sees current spot vs a static pivot.
+# Key: (TICKER, "YYYY-MM-DD") -> {pivot, r1, s1, r2, s2, basis_date, H, L, C}
+# ---------------------------------------------------------------------------
+_PIVOT_CACHE = {}
+
+
+def _session_date_et(now=None):
+    """US equity session calendar date (America/New_York)."""
+    if now is None:
+        now = datetime.now(_ET) if _ET is not None else datetime.now()
+    elif _ET is not None and getattr(now, "tzinfo", None) is None:
+        now = now.replace(tzinfo=_ET)
+    elif _ET is not None and getattr(now, "tzinfo", None) is not None:
+        now = now.astimezone(_ET)
+    return now.date() if hasattr(now, "date") else now
+
+
+def _bar_date(ts):
+    """Calendar date of a yfinance bar index, in America/New_York when tz-aware."""
+    if hasattr(ts, "to_pydatetime"):
+        ts = ts.to_pydatetime()
+    if getattr(ts, "tzinfo", None) is not None and _ET is not None:
+        return ts.astimezone(_ET).date()
+    if hasattr(ts, "date"):
+        return ts.date()
+    return ts
+
+
+def _levels_from_ohlc(high, low, close):
+    """Standard floor pivots from a single completed session's OHLC."""
+    if (high + low + close) > 0:
+        pivot = (high + low + close) / 3.0
+    else:
+        pivot = 100.0
+    r1 = (2 * pivot) - low if pivot > 0 else 101.0
+    s1 = (2 * pivot) - high if pivot > 0 else 99.0
+    r2 = pivot + (high - low) if pivot > 0 else 102.0
+    s2 = pivot - (high - low) if pivot > 0 else 98.0
+    return {
+        "pivot": round(pivot, 2),
+        "r1": round(r1, 2),
+        "s1": round(s1, 2),
+        "r2": round(r2, 2),
+        "s2": round(s2, 2),
+    }
+
+
+def _select_completed_session(hist, today):
+    """
+    Return (basis_row_as_dict, basis_date, live_close) from daily history.
+
+    Basis = last bar whose date is strictly before `today` (completed session).
+    live_close = today's developing close if present, else basis close.
+    Raises ValueError if no completed session is available.
+    """
+    if hist is None or hist.empty:
+        raise ValueError("empty history")
+
+    completed = []
+    today_close = None
+    for ts, row in hist.iterrows():
+        d = _bar_date(ts)
+        if d < today:
+            completed.append((d, row))
+        elif d == today:
+            today_close = float(row["Close"])
+
+    if not completed:
+        raise ValueError(f"no completed session before {today.isoformat()}")
+
+    basis_date, basis_row = completed[-1]  # most recent strictly-prior bar
+    high = float(basis_row["High"])
+    low = float(basis_row["Low"])
+    close = float(basis_row["Close"])
+    live_close = today_close if today_close is not None else close
+    return {
+        "high": high,
+        "low": low,
+        "close": close,
+        "basis_date": basis_date,
+    }, live_close
+
+
 def fetch_pivot_data(ticker):
     """
     Employee Tier - Specialist Tech Assist:
-    Fetches the last completed trading day's metrics from yfinance
-    and calculates standard pivot points, support (S1, S2), and resistance (R1, R2).
-    Includes robust defaults if yfinance fails.
+    Computes standard floor pivots from the last COMPLETED trading session
+    (bar date strictly before today's ET date). Pivot / R1 / S1 / R2 / S2 are
+    cached per ticker per session day — first computation wins; never mutated.
+
+    The returned ``close`` and ``pct_change`` still reflect the live spot so
+    downstream scoring can compare current price to the frozen pivot.
     """
+    ticker_key = str(ticker).upper().strip()
+    today = _session_date_et()
+    cache_key = (ticker_key, today.isoformat())
+
     try:
         stock = yf.Ticker(ticker, session=SESSION)
-        # Fetch 5 days to ensure we have completed trading sessions
-        hist = stock.history(period="5d")
+        # Extra days so weekends/holidays still leave a completed bar
+        hist = stock.history(period="10d")
+
         if hist.empty:
-            # Fallback to current info if history is not available
-            info = stock.info
-            close = info.get("regularMarketPrice") or info.get("previousClose") or 100.0
-            high = close * 1.01
-            low = close * 0.99
-            prev_close = close
+            info = stock.info or {}
+            live_close = (
+                info.get("regularMarketPrice")
+                or info.get("previousClose")
+                or 100.0
+            )
+            prev = info.get("previousClose") or live_close
+            # No daily bars: weak fallback for levels only (not ideal, rare)
+            high = float(prev) * 1.01
+            low = float(prev) * 0.99
+            basis_close = float(prev)
+            basis_date = None
+            basis = {"high": high, "low": low, "close": basis_close, "basis_date": basis_date}
+            live_close = float(live_close)
         else:
-            last_row = hist.iloc[-1]
-            high = last_row["High"]
-            low = last_row["Low"]
-            close = last_row["Close"]
-            prev_close = hist["Close"].iloc[-2] if len(hist) > 1 else close
-            
-        # Standard Pivot Point Calculations
-        # Safeguard against zero values
-        if prev_close and prev_close > 0:
-            pct_change = ((close - prev_close) / prev_close) * 100.0
+            basis, live_close = _select_completed_session(hist, today)
+            high, low, basis_close = basis["high"], basis["low"], basis["close"]
+            basis_date = basis["basis_date"]
+
+        computed = _levels_from_ohlc(high, low, basis_close)
+
+        if cache_key in _PIVOT_CACHE:
+            cached = _PIVOT_CACHE[cache_key]
+            drift = (
+                cached["pivot"] != computed["pivot"]
+                or cached["r1"] != computed["r1"]
+                or cached["s1"] != computed["s1"]
+                or cached["r2"] != computed["r2"]
+                or cached["s2"] != computed["s2"]
+            )
+            if drift:
+                print(
+                    f"CRITICAL: pivot for {ticker_key} attempted to change on "
+                    f"{today.isoformat()} "
+                    f"(cached P={cached['pivot']} R1={cached['r1']} S1={cached['s1']} "
+                    f"→ recomputed P={computed['pivot']} R1={computed['r1']} "
+                    f"S1={computed['s1']}); keeping original cached values."
+                )
+            levels = {
+                "pivot": cached["pivot"],
+                "r1": cached["r1"],
+                "s1": cached["s1"],
+                "r2": cached["r2"],
+                "s2": cached["s2"],
+            }
+            basis_close = cached.get("basis_close", basis_close)
+        else:
+            levels = computed
+            _PIVOT_CACHE[cache_key] = {
+                **levels,
+                "basis_close": round(basis_close, 2),
+                "basis_high": round(high, 2),
+                "basis_low": round(low, 2),
+                "basis_date": basis_date.isoformat() if basis_date else None,
+            }
+            basis_label = basis_date.isoformat() if basis_date else "unknown"
+            print(
+                f"pivot basis {ticker_key} {basis_label}: "
+                f"H={high:.2f} L={low:.2f} C={basis_close:.2f} -> "
+                f"P={levels['pivot']:.2f} R1={levels['r1']:.2f} S1={levels['s1']:.2f}"
+            )
+
+        if basis_close and basis_close > 0:
+            pct_change = ((live_close - basis_close) / basis_close) * 100.0
         else:
             pct_change = 0.0
-            
-        pivot = (high + low + close) / 3.0 if (high + low + close) > 0 else 100.0
-        r1 = (2 * pivot) - low if pivot > 0 else 101.0
-        s1 = (2 * pivot) - high if pivot > 0 else 99.0
-        r2 = pivot + (high - low) if pivot > 0 else 102.0
-        s2 = pivot - (high - low) if pivot > 0 else 98.0
-        
+
         return {
-            "close": round(close, 2),
-            "pivot": round(pivot, 2),
-            "r1": round(r1, 2),
-            "s1": round(s1, 2),
-            "r2": round(r2, 2),
-            "s2": round(s2, 2),
-            "pct_change": round(pct_change, 2)
+            "close": round(live_close, 2),
+            "pivot": levels["pivot"],
+            "r1": levels["r1"],
+            "s1": levels["s1"],
+            "r2": levels["r2"],
+            "s2": levels["s2"],
+            "pct_change": round(pct_change, 2),
         }
     except Exception as e:
         print(f"❌ [Specialist Desk] Error fetching pivot data for {ticker}: {e}")
-        # Default placeholder safe return
+        # Default placeholder safe return (not cached — avoid freezing garbage)
         return {
             "close": 100.0,
             "pivot": 100.0,
@@ -72,7 +215,7 @@ def fetch_pivot_data(ticker):
             "s1": 99.0,
             "r2": 102.0,
             "s2": 98.0,
-            "pct_change": 0.0
+            "pct_change": 0.0,
         }
 
 def get_specialist_briefing(ticker, pivot_data, news_headlines):
