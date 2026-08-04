@@ -69,14 +69,17 @@ DEEPSEEK_TRADE_SYSTEM = """You write KEY TICKER TELEMETRY bullets for a real-tim
 
 OUTPUT RULES (strict):
 1. One bullet per ticker. Format exactly:
-- **TICKER**: Spot $X vs Pivot $Y. Score: Z/100. <≤25-word technical rationale>
-2. Data-dense only: Spot, Pivot, Score, and one brief technical reason (and Contract/Entry/SL/TP if provided).
-3. MAX 25 words after the Score clause in each bullet (count words strictly).
-4. BANNED phrases (never use any of these or close variants):
+- **TICKER**: Spot $X vs Pivot $Y. Score: Z/100. <brief technical rationale>
+2. Data-dense only: Spot, Pivot, Score, and Contract/Entry/SL/TP if provided.
+3. When the payload includes "ext" (e.g. ext=$0.51 (2.8%)), copy it verbatim after Entry/SL/TP.
+   That is extrinsic premium — do not invent or omit it on EXECUTE rows.
+4. When "delta" is present, append δ=0.XX. Never invent delta.
+5. MAX 32 words after the Score clause on EXECUTE rows; 25 on PASS/change rows.
+6. BANNED phrases (never use any of these or close variants):
    CEO, CEO says, No deltas to manage, No hesitation, We move, Let's work,
    Disciplined execution, No fluff, Load the position.
-5. No morning brief, no ES/NQ futures essays, no MIDDAY MEETING headers, no table.
-6. Output ONLY the bullet list. No preamble or closing.
+7. No morning brief, no ES/NQ futures essays, no MIDDAY MEETING headers, no table.
+8. Output ONLY the bullet list. No preamble or closing.
 """
 
 
@@ -244,6 +247,41 @@ def _fmt_contract_cell(contract: dict | None) -> str:
     return f"{strike_s}{letter} {exp_s}"
 
 
+def _fmt_extrinsic(contract: dict | None) -> str:
+    """
+    Compact moneyness: ext=$0.51 (2.8%). Pure arithmetic from strike/spot/premium.
+    Appends δ=… only when the chain already supplied delta (no local BS).
+    """
+    if not contract or "error" in contract:
+        return ""
+    entry = _num(contract.get("entry_premium"))
+    ext = _num(contract.get("extrinsic"))
+    ext_pct = _num(contract.get("extrinsic_pct"))
+    # Recompute if strike_selector did not attach fields (legacy contracts)
+    if ext is None and entry is not None:
+        spot = _num(contract.get("spot"))
+        strike = _num(contract.get("strike"))
+        direction = str(contract.get("direction") or "").upper()
+        if spot is not None and strike is not None:
+            if "PUT" in direction or direction == "P":
+                intrinsic = max(0.0, strike - spot)
+            else:
+                intrinsic = max(0.0, spot - strike)
+            ext = entry - intrinsic
+            ext_pct = (ext / entry * 100.0) if entry > 0 else None
+    if ext is None or entry is None:
+        return ""
+    if ext_pct is None and entry > 0:
+        ext_pct = ext / entry * 100.0
+    parts = [f"ext=${ext:.2f}"]
+    if ext_pct is not None:
+        parts[0] = f"ext=${ext:.2f} ({ext_pct:.1f}%)"
+    delta = _num(contract.get("delta"))
+    if delta is not None:
+        parts.append(f"δ={delta:.2f}")
+    return " ".join(parts)
+
+
 def compute_deltas(ticker: str, prev: dict | None, cur: dict) -> list[str]:
     if not prev:
         return [f"NEW baseline | score {cur.get('total_score')} → {cur.get('action_flag')}"]
@@ -303,16 +341,24 @@ def deterministic_telemetry_bullet(row: dict) -> str:
     rel = ">" if _num(row.get("spot"), 0) >= _num(row.get("pivot"), 0) else "<"
     rationale = "Holding pivot structure." if rel == ">" else "Trading below pivot; caution."
     if row.get("action_flag") == "EXECUTE" and row.get("contract"):
-        c = row["contract"]
+        c = dict(row["contract"])
+        # Prefer row spot when contract.spot missing
+        if c.get("spot") is None and row.get("spot") is not None:
+            c["spot"] = row.get("spot")
+        ext_s = _fmt_extrinsic(c)
+        ext_bit = f" {ext_s}" if ext_s else ""
         rationale = (
             f"Setup {_fmt_contract_cell(c)} entry {_fmt_money(c.get('entry_premium'))} "
-            f"SL {_fmt_money(c.get('stop_loss'))} TP {_fmt_money(c.get('take_profit'))}."
+            f"SL {_fmt_money(c.get('stop_loss'))} TP {_fmt_money(c.get('take_profit'))}"
+            f"{ext_bit}."
         )
     bullet = (
         f"- **{ticker}**: Spot ${spot} {rel} Pivot ${pivot}. "
         f"Score: {score_s}/100. {rationale}"
     )
-    return _limit_rationale_words(_purge_banned(bullet), 25)
+    # EXECUTE lines carry ext=…; allow a few more words so it is not truncated.
+    max_words = 32 if row.get("action_flag") == "EXECUTE" else 25
+    return _limit_rationale_words(_purge_banned(bullet), max_words)
 
 
 def format_thirty_min_scan_discord(
@@ -382,6 +428,12 @@ def deepseek_key_telemetry(
     payload_lines = []
     for r in candidates:
         c = r.get("contract") if r.get("action_flag") == "EXECUTE" else None
+        ext_label = None
+        if c:
+            c_for_ext = dict(c)
+            if c_for_ext.get("spot") is None and r.get("spot") is not None:
+                c_for_ext["spot"] = r.get("spot")
+            ext_label = _fmt_extrinsic(c_for_ext) or None
         payload_lines.append(
             json.dumps(
                 {
@@ -395,6 +447,10 @@ def deepseek_key_telemetry(
                     "entry": c.get("entry_premium") if c else None,
                     "sl": c.get("stop_loss") if c else None,
                     "tp": c.get("take_profit") if c else None,
+                    "ext": ext_label,
+                    "extrinsic": c.get("extrinsic") if c else None,
+                    "extrinsic_pct": c.get("extrinsic_pct") if c else None,
+                    "delta": c.get("delta") if c else None,
                 },
                 separators=(",", ":"),
             )

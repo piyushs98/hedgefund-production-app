@@ -323,15 +323,51 @@ def _compact_reason(reason: str) -> str:
 _GATE: SignalGate | None = None
 
 
+def gate_config_from_env() -> GateConfig:
+    """
+    Build GateConfig from config.py / environment.
+
+    Daily cap and other limits are env-tunable without a code change:
+      GATE_MAX_ENTRIES_PER_TICKER, GATE_MAX_CONCURRENT, GATE_PERSIST_CYCLES,
+      GATE_FLIP_LOCK_MINUTES, GATE_FLIP_OVERRIDE_SCORE,
+      GATE_REENTRY_COOLDOWN_MINUTES. Restart the process after changing env.
+    """
+    try:
+        import config as _cfg
+    except Exception:
+        return GateConfig()
+    return GateConfig(
+        threshold=float(getattr(_cfg, "EXECUTE_THRESHOLD", 70.0)),
+        persist_cycles=int(getattr(_cfg, "GATE_PERSIST_CYCLES", 2)),
+        flip_lock_minutes=int(getattr(_cfg, "GATE_FLIP_LOCK_MINUTES", 60)),
+        flip_override_score=float(getattr(_cfg, "GATE_FLIP_OVERRIDE_SCORE", 85.0)),
+        reentry_cooldown_minutes=int(
+            getattr(_cfg, "GATE_REENTRY_COOLDOWN_MINUTES", 45)
+        ),
+        max_entries_per_ticker=int(
+            getattr(_cfg, "GATE_MAX_ENTRIES_PER_TICKER", 3)
+        ),
+        max_concurrent=int(getattr(_cfg, "GATE_MAX_CONCURRENT", 5)),
+        allow_pyramiding=False,
+    )
+
+
 def get_gate() -> SignalGate:
     global _GATE
     if _GATE is None:
-        _GATE = SignalGate()
+        cfg = gate_config_from_env()
+        _GATE = SignalGate(cfg)
+        print(
+            f"[Gate] init max_entries/ticker={cfg.max_entries_per_ticker} "
+            f"max_concurrent={cfg.max_concurrent} persist={cfg.persist_cycles} "
+            f"flip_lock={cfg.flip_lock_minutes}m cooldown={cfg.reentry_cooldown_minutes}m "
+            f"threshold={cfg.threshold}"
+        )
     return _GATE
 
 
-def reset_gate_for_tests() -> SignalGate:
+def reset_gate_for_tests(cfg: GateConfig | None = None) -> SignalGate:
     """Replace singleton — tests only."""
     global _GATE
-    _GATE = SignalGate()
+    _GATE = SignalGate(cfg or GateConfig())
     return _GATE

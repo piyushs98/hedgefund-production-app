@@ -79,6 +79,47 @@ def assert_secrets(require_discord=True):
 DEFAULT_WEIGHTS = {"liquidity": 30, "technical": 40, "sentiment": 30}
 EXECUTE_THRESHOLD = 70
 
+# ------------------------------------------------------------------
+# Stage 3 signal gate — all knobs are env-overridable (no code change).
+# Set on Render / local shell and restart the process to apply.
+#   GATE_MAX_ENTRIES_PER_TICKER  default 3   (daily cap per ticker)
+#   GATE_MAX_CONCURRENT          default 5
+#   GATE_PERSIST_CYCLES          default 2
+#   GATE_FLIP_LOCK_MINUTES       default 60
+#   GATE_FLIP_OVERRIDE_SCORE     default 85
+#   GATE_REENTRY_COOLDOWN_MINUTES default 45
+# ------------------------------------------------------------------
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    try:
+        return int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        print(f"[Config] Invalid {name}={raw!r}; using default {default}")
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        print(f"[Config] Invalid {name}={raw!r}; using default {default}")
+        return float(default)
+
+
+GATE_MAX_ENTRIES_PER_TICKER = _env_int("GATE_MAX_ENTRIES_PER_TICKER", 3)
+GATE_MAX_CONCURRENT = _env_int("GATE_MAX_CONCURRENT", 5)
+GATE_PERSIST_CYCLES = _env_int("GATE_PERSIST_CYCLES", 2)
+GATE_FLIP_LOCK_MINUTES = _env_int("GATE_FLIP_LOCK_MINUTES", 60)
+GATE_FLIP_OVERRIDE_SCORE = _env_float("GATE_FLIP_OVERRIDE_SCORE", 85.0)
+GATE_REENTRY_COOLDOWN_MINUTES = _env_int("GATE_REENTRY_COOLDOWN_MINUTES", 45)
+
 
 def _init_weights_table():
     os.makedirs(os.path.dirname(HEDGE_DB_PATH), exist_ok=True)

@@ -119,9 +119,34 @@ def select_optimal_contract(options_dict, pivot_data, atr_abs=None):
         return {"error": f"No liquid {direction} contract within 4% of the ATR-derived target strike."}
 
     entry = best_meta["mid"]
-    return {
+    strike = best["strike"]
+    # Pure arithmetic moneyness — no model. CALL: max(0, spot-K); PUT: max(0, K-spot).
+    try:
+        spot_f = float(spot)
+        strike_f = float(strike)
+        if direction == "CALL":
+            intrinsic = max(0.0, spot_f - strike_f)
+        else:
+            intrinsic = max(0.0, strike_f - spot_f)
+        extrinsic = float(entry) - intrinsic
+        extrinsic_pct = (extrinsic / float(entry) * 100.0) if float(entry) > 0 else None
+    except (TypeError, ValueError):
+        intrinsic = None
+        extrinsic = None
+        extrinsic_pct = None
+
+    # Pass through chain delta only if the feed already provided it (no BS).
+    raw_delta = best.get("delta")
+    try:
+        delta = float(raw_delta) if raw_delta is not None and raw_delta != "" else None
+        if delta is not None and (delta != delta):  # NaN
+            delta = None
+    except (TypeError, ValueError):
+        delta = None
+
+    out = {
         "direction": direction,
-        "strike": best["strike"],
+        "strike": strike,
         "expiration": best_meta["expiration"],
         "days_to_expiration": best_meta["dte"],
         "entry_premium": entry,
@@ -134,6 +159,10 @@ def select_optimal_contract(options_dict, pivot_data, atr_abs=None):
         "volume": int(best.get("volume") or 0),
         "atr_expected_move": best_meta["expected_move"],
         "selection_rank": round(best_rank, 3),
+        "spot": round(float(spot), 2) if isinstance(spot, (int, float)) else spot,
+        "intrinsic": round(intrinsic, 2) if intrinsic is not None else None,
+        "extrinsic": round(extrinsic, 2) if extrinsic is not None else None,
+        "extrinsic_pct": round(extrinsic_pct, 1) if extrinsic_pct is not None else None,
         "rationale": (
             f"{direction} selected from {'above' if direction == 'CALL' else 'below'}-pivot posture. "
             f"ATR expected move ${best_meta['expected_move']} over {best_meta['dte']}d places the target near "
@@ -142,3 +171,6 @@ def select_optimal_contract(options_dict, pivot_data, atr_abs=None):
             f"IV {round(best.get('impliedVolatility') or 0, 3)} vs chain median {best_meta['median_iv']}."
         ),
     }
+    if delta is not None:
+        out["delta"] = round(delta, 3)
+    return out

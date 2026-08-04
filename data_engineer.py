@@ -34,7 +34,11 @@ def fetch_options_data(ticker_symbol):
             # Keep only what the AI needs: Strike, Bid, Ask, Volume, Open Interest, Implied Volatility.
             # yfinance column sets vary by version — select only columns that exist
             # instead of raising KeyError and killing the whole ticker.
-            columns_to_keep = ['strike', 'lastPrice', 'bid', 'ask', 'volume', 'openInterest', 'impliedVolatility']
+            # Include delta only when the feed already supplies it (no local BS).
+            columns_to_keep = [
+                'strike', 'lastPrice', 'bid', 'ask', 'volume', 'openInterest',
+                'impliedVolatility', 'delta',
+            ]
             present = [c for c in columns_to_keep if c in df.columns]
             if not present:
                 return []
