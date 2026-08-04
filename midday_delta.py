@@ -8,7 +8,8 @@ Architecture:
   * Midday macro meeting: Gemini once/day STRICTLY 11:00 AM CDT window
     (DeepSeek backup) — never mixed into 30-min scan messages
 
-Scoring / strike selection remain deterministic and unchanged.
+Scoring / strike selection remain deterministic. Stage 3 adds SignalGate
+between score/adversarial and strike/execution (rank-before-admit).
 """
 
 from __future__ import annotations
@@ -17,13 +18,14 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from typing import Any
 
 import config
 import broadcaster
 import llm_chain
 import scoring_engine
+import signal_gate
 import strike_selector
 import telemetry
 import virtual_broker
@@ -319,11 +321,13 @@ def format_thirty_min_scan_discord(
     universe: list[str],
     clock_cdt: str | None = None,
     telemetry_bullets: list[str] | None = None,
+    gate_summary: str | None = None,
 ) -> str:
     """
     SINGLE Discord payload for a 30-minute scan cycle.
 
     Table lists every production ticker; telemetry only EXECUTE / changed.
+    gate_summary is a compact one-line Stage 3 rejection/admit tally.
     """
     clock = clock_cdt or cdt_clock_str()
     lines = [
@@ -344,6 +348,10 @@ def format_thirty_min_scan_discord(
         else:
             c_cell, entry, sl, tp = "-", "-", "-", "-"
         lines.append(f"| {ticker} | {status} | {c_cell} | {entry} | {sl} | {tp} |")
+
+    if gate_summary:
+        lines.append("")
+        lines.append(f"`{gate_summary}`")
 
     lines.append("")
     lines.append("---")
@@ -563,6 +571,8 @@ def run_thirty_min_scan(
     new_ticker_state = dict(baseline.get("tickers") or {})
     rows_by_ticker: dict[str, dict] = {}
     telemetry_candidates: list[dict] = []
+    # Phase-1 workspace: score all tickers before any admit (rank-before-admit).
+    scored: dict[str, dict[str, Any]] = {}
 
     for idx, ticker in enumerate(universe):
         row: dict[str, Any] = {"ticker": ticker, "error": None}
@@ -615,14 +625,104 @@ def run_thirty_min_scan(
                     )
                     print(f"[{ticker}] 🛑 Local adversarial veto → {card.action_flag}")
 
-            contract = None
+            direction = None
             if card.action_flag == "EXECUTE":
+                direction = strike_selector.infer_direction(pivot_data)
+
+            scored[ticker] = {
+                "card": card,
+                "adv": adv,
+                "options_dict": options_dict,
+                "pivot_data": pivot_data,
+                "atr_abs": atr_abs,
+                "direction": direction,
+            }
+
+        except MasterBotScanError as e:
+            print(f"[{ticker}] isolated: {e.step}: {e.message}")
+            row["error"] = f"{e.step}: {e.message}"
+            row["action_flag"] = "PASS"
+            rows_by_ticker[ticker] = row
+            result["results"].append(row)
+        except Exception as e:
+            print(f"[{ticker}] error: {e}")
+            row["error"] = str(e)
+            row["action_flag"] = "PASS"
+            rows_by_ticker[ticker] = row
+            result["results"].append(row)
+
+        if idx < len(universe) - 1 and inter_ticker_sleep:
+            import time as _time
+            _time.sleep(inter_ticker_sleep)
+
+    # ---- Stage 3 gate: sync durable book, rank-before-admit ----
+    gate = signal_gate.get_gate()
+    try:
+        from tracker_agent import load_active_trades
+        open_tickers = [
+            t.get("ticker") for t in load_active_trades() if t.get("ticker")
+        ]
+        gate.sync_open_from_book(open_tickers)
+    except Exception as sync_err:
+        print(f"[scan] gate sync_open_from_book warn: {sync_err}")
+
+    observations = []
+    for ticker in universe:
+        ctx = scored.get(ticker)
+        if not ctx:
+            observations.append(
+                signal_gate.Observation(ticker=ticker, score=0.0, direction=None, action_flag="PASS")
+            )
+            continue
+        card = ctx["card"]
+        observations.append(
+            signal_gate.Observation(
+                ticker=ticker,
+                score=float(card.total_score),
+                direction=ctx.get("direction"),
+                action_flag=card.action_flag,
+            )
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    gate_decisions = gate.process_scan(observations, now_utc)
+    gate_by_ticker = {d.ticker: d for d in gate_decisions}
+    gate_summary = gate.format_scan_summary(gate_decisions)
+    print(f"[scan] {gate_summary}")
+    result["gate_summary"] = gate_summary
+
+    # ---- Phase 2: strike + paper buy only for admitted tickers ----
+    for ticker in universe:
+        ctx = scored.get(ticker)
+        if not ctx:
+            continue
+        card = ctx["card"]
+        adv = ctx.get("adv")
+        options_dict = ctx["options_dict"]
+        pivot_data = ctx["pivot_data"]
+        atr_abs = ctx.get("atr_abs")
+        gdec = gate_by_ticker.get(ticker.upper()) or gate_by_ticker.get(ticker)
+
+        contract = None
+        gate_blocked = False
+        if card.action_flag == "EXECUTE":
+            if gdec is not None and not gdec.admit:
+                gate_blocked = True
+                card.action_flag = "PASS"
+                card.reasons.append(f"Gate: {gdec.reason}")
+                print(f"[{ticker}] 🚧 Gate blocked → PASS ({gdec.reason})")
+            elif gdec is not None and gdec.admit:
                 contract = strike_selector.select_optimal_contract(
                     options_dict, pivot_data, atr_abs=atr_abs
                 )
                 if "error" in contract:
                     card.action_flag = "PASS"
                     card.reasons.append(contract["error"])
+                    # Free the slot we just reserved — strike failed
+                    try:
+                        gate.on_close(ticker)
+                    except Exception:
+                        pass
                     contract = None
                 else:
                     try:
@@ -643,76 +743,72 @@ def run_thirty_min_scan(
                         "entry_premium": contract.get("entry_premium"),
                         "stop_loss": contract.get("stop_loss"),
                         "take_profit": contract.get("take_profit"),
+                        "gate_rank": getattr(gdec, "conviction_rank", None),
+                        "total_score": card.total_score,
                     })
 
-            snap = _card_snapshot(card, atr_abs=atr_abs)
-            prev = (baseline.get("tickers") or {}).get(ticker)
-            changes = compute_deltas(ticker, prev, snap)
-            new_ticker_state[ticker] = snap
+        snap = _card_snapshot(card, atr_abs=atr_abs)
+        prev = (baseline.get("tickers") or {}).get(ticker)
+        changes = compute_deltas(ticker, prev, snap)
+        if gate_blocked and gdec is not None:
+            changes = list(changes or [])
+            changes.append(f"GATE {gdec.reason}")
+        new_ticker_state[ticker] = snap
 
-            row.update({
-                "action_flag": card.action_flag,
-                "total_score": card.total_score,
-                "spot": snap.get("spot"),
-                "pivot": snap.get("pivot"),
-                "pct_change": snap.get("pct_change"),
-                "changes": changes,
-                "contract": contract,
-                "card": card,
-            })
-            rows_by_ticker[ticker] = row
-            result["results"].append({
-                "ticker": ticker,
-                "action_flag": card.action_flag,
-                "total_score": card.total_score,
-                "changes": changes,
-            })
+        row = {
+            "ticker": ticker,
+            "error": None,
+            "action_flag": card.action_flag,
+            "total_score": card.total_score,
+            "spot": snap.get("spot"),
+            "pivot": snap.get("pivot"),
+            "pct_change": snap.get("pct_change"),
+            "changes": changes,
+            "contract": contract,
+            "card": card,
+            "gate_reason": None if gdec is None else gdec.reason,
+            "gate_admit": None if gdec is None else gdec.admit,
+        }
+        rows_by_ticker[ticker] = row
+        result["results"].append({
+            "ticker": ticker,
+            "action_flag": card.action_flag,
+            "total_score": card.total_score,
+            "changes": changes,
+            "gate_reason": row["gate_reason"],
+            "gate_admit": row["gate_admit"],
+        })
 
-            is_execute = card.action_flag == "EXECUTE"
-            is_material = bool(changes) and not (
-                open_baseline
-                and all(str(c).startswith("NEW baseline") for c in changes)
-                and not is_execute
+        is_execute = card.action_flag == "EXECUTE"
+        is_material = bool(changes) and not (
+            open_baseline
+            and all(str(c).startswith("NEW baseline") for c in changes)
+            and not is_execute
+        )
+        if is_execute or is_material or gate_blocked:
+            telemetry_candidates.append(row)
+
+        try:
+            telemetry.log_scan_result(
+                scan_id,
+                card,
+                adversarial_result=adv,
+                selected_contract=contract,
+                agent_params={
+                    "mode": "thirty_min_scan",
+                    "llm_policy": "deepseek_telemetry",
+                    "gate_reason": row["gate_reason"],
+                    "gate_admit": row["gate_admit"],
+                },
             )
-            if is_execute or is_material:
-                telemetry_candidates.append(row)
-
-            try:
-                telemetry.log_scan_result(
-                    scan_id,
-                    card,
-                    adversarial_result=adv,
-                    selected_contract=contract,
-                    agent_params={"mode": "thirty_min_scan", "llm_policy": "deepseek_telemetry"},
-                )
-            except Exception as te:
-                # Keep scan alive; still surface failure (write_guard is also
-                # invoked inside telemetry.log_scan_result on its own except).
-                print(f"[{ticker}] telemetry WARNING: {te}")
-
-        except MasterBotScanError as e:
-            print(f"[{ticker}] isolated: {e.step}: {e.message}")
-            row["error"] = f"{e.step}: {e.message}"
-            row["action_flag"] = "PASS"
-            rows_by_ticker[ticker] = row
-            result["results"].append(row)
-        except Exception as e:
-            print(f"[{ticker}] error: {e}")
-            row["error"] = str(e)
-            row["action_flag"] = "PASS"
-            rows_by_ticker[ticker] = row
-            result["results"].append(row)
-
-        if idx < len(universe) - 1 and inter_ticker_sleep:
-            import time as _time
-            _time.sleep(inter_ticker_sleep)
+        except Exception as te:
+            print(f"[{ticker}] telemetry WARNING: {te}")
 
     baseline["tickers"] = new_ticker_state
     if open_baseline:
         baseline["established_at"] = datetime.utcnow().isoformat() + "Z"
     baseline["last_scan_id"] = scan_id
     baseline["last_scan_at"] = datetime.utcnow().isoformat() + "Z"
-    # Keep last full row list for midday macro context (serializable subset)
     baseline["last_scan_rows"] = [
         {
             "ticker": t,
@@ -731,6 +827,7 @@ def run_thirty_min_scan(
         universe=universe,
         clock_cdt=clock,
         telemetry_bullets=bullets,
+        gate_summary=gate_summary,
     )
     # Hard guarantee: never ship MIDDAY headers on 30-min cycles
     if re.search(r"MIDDAY\s+(MEETING|MACRO)", payload, re.I):

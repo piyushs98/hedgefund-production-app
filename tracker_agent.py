@@ -256,6 +256,9 @@ def remove_active_trade(
 
     SQLite `active_trades_store` is full-synced to the remaining list via
     `_write_trades` (absolute parity — no selective DELETE).
+
+    Stage 3: always free the SignalGate concurrent slot for this ticker so
+    max_concurrent is not permanent after exits.
     """
     store = Path(path) if path else ACTIVE_TRADES_PATH
     trades = load_active_trades(store)
@@ -264,7 +267,18 @@ def remove_active_trade(
         print(f"[Tracker] remove_active_trade: no match for {trade.get('ticker')}")
         return False
     trades.pop(idx)
-    return _write_trades(trades, store)
+    ok = _write_trades(trades, store)
+    # Free gate slot even if Master Bot runs in another process — same-process
+    # Tracker path updates memory immediately; scan path also syncs from book.
+    try:
+        import signal_gate
+        ticker = trade.get("ticker")
+        if ticker:
+            signal_gate.get_gate().on_close(ticker)
+            print(f"[Tracker] gate on_close({ticker})")
+    except Exception as gate_err:
+        print(f"[Tracker] WARNING: gate on_close failed: {gate_err}")
+    return ok
 
 
 def _find_trade_index(

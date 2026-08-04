@@ -23,7 +23,7 @@ import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytz
 import requests
@@ -35,6 +35,7 @@ import broadcaster
 import telemetry
 import scoring_engine
 import strike_selector
+import signal_gate
 import virtual_broker
 import llm_chain
 from circuit_breaker import CircuitBreaker
@@ -99,7 +100,7 @@ from adversarial_agent import DevilsAdvocate
 
 # Shared durable state with the micro Tracker (atomic load/append/write).
 # save_active_trade dual-writes JSON + SQLite active_trades_store (news_room.db).
-from tracker_agent import save_active_trade
+from tracker_agent import save_active_trade, load_active_trades
 
 TICKERS = config.TICKERS
 GEMINI_API_KEY = config.GEMINI_API_KEY
@@ -773,6 +774,17 @@ def run_portfolio_scan(
     print(f"\n🚀 PORTFOLIO SCAN {scan_id} | tickers={universe} | "
           f"weights={weights} | ES=F overnight {futures_pct}%")
 
+    # Stage 3: reconcile gate book with durable open positions (Tracker may be
+    # another process — on_close alone is not enough across process boundaries).
+    gate = signal_gate.get_gate()
+    try:
+        open_tickers = [
+            t.get("ticker") for t in load_active_trades() if t.get("ticker")
+        ]
+        gate.sync_open_from_book(open_tickers)
+    except Exception as sync_err:
+        print(f"[System] gate sync_open_from_book warn: {sync_err}")
+
     # Portfolio-level technical color (LLM, for the CoS brief only).
     # Wall-clock bound: a hung yfinance desk + Gemini manager must not pin
     # the trading thread past API_CALL_TIMEOUT_S * stages.
@@ -934,6 +946,20 @@ def run_portfolio_scan(
                   f"{card.total_score}/100 -> {card.action_flag}")
 
             is_execute = card.action_flag == "EXECUTE"
+            # Reset gate streaks on PASS (same process_scan path as EXECUTE blocks).
+            if not is_execute:
+                try:
+                    gate.process_scan(
+                        [signal_gate.Observation(
+                            ticker=ticker,
+                            score=float(card.total_score),
+                            direction=None,
+                            action_flag="PASS",
+                        )],
+                        datetime.now(timezone.utc),
+                    )
+                except Exception as ge:
+                    print(f"[{ticker}] gate PASS observe warn: {ge}")
             from llm_payloads import (
                 quant_local_note,
                 risk_local_note,
@@ -1036,6 +1062,29 @@ def run_portfolio_scan(
                 else:
                     print(f"[{ticker}] ✅ Devil's Advocate cleared the trade.")
 
+            # ---- Stage 3 gate (FULL_LLM path). Production RTH uses
+            # run_thirty_min_scan which rank-before-admits the full book.
+            # Here we still apply persist/dirlock/concurrent/cooldown per ticker.
+            if is_execute:
+                direction = strike_selector.infer_direction(pivot_data)
+                gdecs = gate.process_scan(
+                    [signal_gate.Observation(
+                        ticker=ticker,
+                        score=float(card.total_score),
+                        direction=direction,
+                        action_flag="EXECUTE",
+                    )],
+                    datetime.now(timezone.utc),
+                )
+                gdec = gdecs[0] if gdecs else None
+                if gdec is not None and not gdec.admit:
+                    print(f"[{ticker}] 🚧 Gate blocked → PASS ({gdec.reason})")
+                    card.action_flag = "PASS"
+                    card.reasons.append(f"Gate: {gdec.reason}")
+                    is_execute = False
+                elif gdec is not None:
+                    print(f"[{ticker}] ✅ Gate admitted ({gdec.reason})")
+
             # ---- Strike selection on EXECUTE (Task 3a) ----
             contract = None
             if is_execute:
@@ -1047,6 +1096,10 @@ def run_portfolio_scan(
                     card.action_flag = "PASS"
                     card.reasons.append(f"Downgraded: {contract['error']}")
                     is_execute = False
+                    try:
+                        gate.on_close(ticker)
+                    except Exception:
+                        pass
                 else:
                     print(f"[{ticker}] 🎯 Contract: {contract['direction']} "
                           f"{contract['strike']} {contract['expiration']} @ "
