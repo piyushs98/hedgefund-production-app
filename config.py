@@ -139,11 +139,37 @@ GATE_REENTRY_COOLDOWN_MINUTES = _env_int("GATE_REENTRY_COOLDOWN_MINUTES", 45)
 # ------------------------------------------------------------------
 # Stage 4 deterministic exits (30-min scan path — no tracker / no Gemini).
 # All knobs env-overridable; restart process to apply.
-#   EXIT_EOD_FLATTEN_CDT   default 14:45  (America/Chicago — flatten all open)
+#   EXIT_EOD_FLATTEN_CDT          default 14:45  (America/Chicago)
+#   EXIT_ZERO_DTE_FLATTEN_CDT     default 13:00  (0DTE hard flatten)
+#   EXIT_BREAKEVEN_PEAK_PCT       default 25     (B5)
+#   EXIT_TRAIL_PEAK_PCT           default 40
+#   EXIT_TRAIL_GIVEBACK_FRAC      default 0.30   (close when pnl <= peak*(1-frac))
+#   EXIT_TIME_STOP_MINUTES        default 90
+#   EXIT_TIME_STOP_PNL_ABS_PCT    default 10
 # ------------------------------------------------------------------
 EXIT_EOD_FLATTEN_HOUR, EXIT_EOD_FLATTEN_MINUTE = _env_hhmm(
     "EXIT_EOD_FLATTEN_CDT", "14:45"
 )
+EXIT_ZERO_DTE_FLATTEN_HOUR, EXIT_ZERO_DTE_FLATTEN_MINUTE = _env_hhmm(
+    "EXIT_ZERO_DTE_FLATTEN_CDT", "13:00"
+)
+EXIT_BREAKEVEN_PEAK_PCT = _env_float("EXIT_BREAKEVEN_PEAK_PCT", 25.0)
+EXIT_TRAIL_PEAK_PCT = _env_float("EXIT_TRAIL_PEAK_PCT", 40.0)
+EXIT_TRAIL_GIVEBACK_FRAC = _env_float("EXIT_TRAIL_GIVEBACK_FRAC", 0.30)
+EXIT_TIME_STOP_MINUTES = _env_int("EXIT_TIME_STOP_MINUTES", 90)
+EXIT_TIME_STOP_PNL_ABS_PCT = _env_float("EXIT_TIME_STOP_PNL_ABS_PCT", 10.0)
+
+# ------------------------------------------------------------------
+# Stage 4 Part C — entry filters (strike_selector). Env-overridable.
+#   MIN_DTE                     default 1   (calendar days; primary 0DTE kill)
+#   MAX_EXPIRY_CALENDAR_DTE     default 10  (how far Yahoo chains we load)
+#   REQUIRED_MOVE_ATR_K         default 0.5 (reject if need/(ATR*√dte) > k)
+#   EXIT_MAX_DECAY_DENSITY      default 8.0 (% extrinsic per RTH hour to expiry)
+# ------------------------------------------------------------------
+MIN_DTE = _env_int("MIN_DTE", 1)
+MAX_EXPIRY_CALENDAR_DTE = _env_int("MAX_EXPIRY_CALENDAR_DTE", 10)
+REQUIRED_MOVE_ATR_K = _env_float("REQUIRED_MOVE_ATR_K", 0.5)
+EXIT_MAX_DECAY_DENSITY = _env_float("EXIT_MAX_DECAY_DENSITY", 8.0)
 
 
 def _init_weights_table():

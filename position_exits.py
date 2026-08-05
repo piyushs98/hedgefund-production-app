@@ -1,5 +1,5 @@
 """
-position_exits.py — Deterministic scan-path exits (Stage 4 B1–B4).
+position_exits.py — Deterministic scan-path exits (Stage 4 B1–B5 + C-D).
 
 Runs inside the 30-minute scan. No tracker daemon, no Gemini, no new process.
 
@@ -7,6 +7,8 @@ Runs inside the 30-minute scan. No tracker daemon, no Gemini, no new process.
   B2  Expiry flatten when contract expiration date is at or past session date
   B3  Stop-loss / take-profit vs live option mark each scan
   B4  Persist a mark row every scan for every still-open (and pre-close) position
+  B5  Breakeven lock / trailing giveback / time stop (uses peak_pnl_pct from B4)
+  C-D 0DTE hard flatten at/after EXIT_ZERO_DTE_FLATTEN_CDT (default 13:00 CDT)
 
 Every close: virtual_broker.paper_sell → tracker_agent.remove_active_trade
 (which calls signal_gate.on_close so the concurrent slot frees).
@@ -29,6 +31,20 @@ except ImportError:  # pragma: no cover
 
 # Once-per-process-day EOD flag (also checked against empty book).
 _eod_flatten_dates: set[str] = set()
+
+
+def _parse_entry_time(trade: dict[str, Any]) -> datetime | None:
+    raw = trade.get("entry_timestamp") or trade.get("entry_time")
+    if not raw:
+        return None
+    text = str(raw).strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
 
 
 def _chicago_now(dt: datetime | None = None) -> datetime:
@@ -64,6 +80,19 @@ def is_eod_flatten_window(dt: datetime | None = None) -> bool:
     boundary = time(
         int(config.EXIT_EOD_FLATTEN_HOUR),
         int(config.EXIT_EOD_FLATTEN_MINUTE),
+    )
+    return tt >= boundary
+
+
+def is_zero_dte_flatten_window(dt: datetime | None = None) -> bool:
+    """C-D: True at/after EXIT_ZERO_DTE_FLATTEN_CDT (default 13:00 America/Chicago)."""
+    now = _chicago_now(dt)
+    tt = now.time()
+    if getattr(tt, "tzinfo", None) is not None:
+        tt = tt.replace(tzinfo=None)
+    boundary = time(
+        int(getattr(config, "EXIT_ZERO_DTE_FLATTEN_HOUR", 13)),
+        int(getattr(config, "EXIT_ZERO_DTE_FLATTEN_MINUTE", 0)),
     )
     return tt >= boundary
 
@@ -379,6 +408,52 @@ def _tp_breached(mark: float, take_profit: float | None) -> bool:
     return mark >= take_profit
 
 
+def _b5_exit_reason(
+    trade: dict[str, Any],
+    mark: float,
+    entry: float | None,
+    pnl: float | None,
+    now_utc: datetime,
+) -> str | None:
+    """
+    B5 rules (checked after hard SL/TP):
+      * breakeven lock: peak >= +25% and mark back to entry
+      * trailing giveback: peak >= +40% and pnl <= peak * (1 - giveback_frac)
+      * time stop: open > 90m and |pnl| < 10%
+    """
+    if entry is None or pnl is None:
+        return None
+
+    peak = _f(trade.get("peak_pnl_pct"))
+    if peak is None:
+        peak = pnl
+
+    be_peak = float(getattr(config, "EXIT_BREAKEVEN_PEAK_PCT", 25.0))
+    trail_peak = float(getattr(config, "EXIT_TRAIL_PEAK_PCT", 40.0))
+    giveback = float(getattr(config, "EXIT_TRAIL_GIVEBACK_FRAC", 0.30))
+    t_min = int(getattr(config, "EXIT_TIME_STOP_MINUTES", 90))
+    t_band = float(getattr(config, "EXIT_TIME_STOP_PNL_ABS_PCT", 10.0))
+
+    # Breakeven lock: was up enough, mark back to entry (or worse)
+    if peak >= be_peak and mark <= entry:
+        return "BREAKEVEN_LOCK"
+
+    # Trailing giveback of peak gain
+    if peak >= trail_peak and peak > 0:
+        floor_pnl = peak * (1.0 - giveback)
+        if pnl <= floor_pnl:
+            return "TRAILING_GIVEBACK"
+
+    # Time stop: dead money
+    ent = _parse_entry_time(trade)
+    if ent is not None:
+        age_min = (now_utc - ent.astimezone(timezone.utc)).total_seconds() / 60.0
+        if age_min >= t_min and abs(pnl) < t_band:
+            return "TIME_STOP"
+
+    return None
+
+
 def run_scan_exits(
     open_trades: list[dict[str, Any]],
     scored_by_ticker: dict[str, dict[str, Any]],
@@ -451,16 +526,23 @@ def run_scan_exits(
 
         reason: str | None = None
         exit_px: float | None = mark
+        exp_d = _parse_exp_date(_trade_expiration(trade))
+        is_0dte = exp_d is not None and exp_d == sess
 
         # B1 — EOD flatten (highest priority when window active)
         if do_eod:
             reason = "EOD_FLATTEN"
             if exit_px is None and entry is not None:
                 exit_px = entry  # flat if no mark
+        # C-D — 0DTE hard flatten (before soft B5; after EOD)
+        elif is_0dte and is_zero_dte_flatten_window(now):
+            reason = "ZERO_DTE_FLATTEN"
+            if exit_px is None and entry is not None:
+                exit_px = entry
         else:
-            # B2 — expiry
-            exp_d = _parse_exp_date(_trade_expiration(trade))
-            if exp_d is not None and exp_d <= sess:
+            # B2 — past calendar expiry only (0DTE same-day is still live until
+            # C-D 13:00 CDT / B1 EOD; do not kill 0DTE at the open).
+            if exp_d is not None and exp_d < sess:
                 reason = "EXPIRY_FLATTEN"
                 if exit_px is None and entry is not None:
                     exit_px = entry
@@ -474,6 +556,19 @@ def run_scan_exits(
                 elif _tp_breached(mark, tp):
                     reason = "TAKE_PROFIT"
                     exit_px = mark
+                else:
+                    # B5 — path-dependent / time exits
+                    pnl = _pnl_pct(entry, mark)
+                    b5 = _b5_exit_reason(
+                        trade,
+                        mark,
+                        entry,
+                        pnl,
+                        datetime.now(timezone.utc),
+                    )
+                    if b5:
+                        reason = b5
+                        exit_px = mark
 
         if reason is None:
             if mark is None:

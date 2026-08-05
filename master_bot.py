@@ -1482,7 +1482,7 @@ def run_macro_loop():
                             f"(CDT {cdt_clock_str(woke)})"
                         )
                         break
-                    # Wake early for Stage 4 EOD flatten window (default 14:45 CDT)
+                    # Wake early for Stage 4 EOD / 0DTE flatten windows
                     try:
                         import position_exits as _pex
                         if (
@@ -1496,6 +1496,26 @@ def run_macro_loop():
                                 f"(CDT {cdt_clock_str(woke)})"
                             )
                             break
+                        if _pex.is_zero_dte_flatten_window(woke):
+                            # Cheap check: only break if any open 0DTE might need it
+                            try:
+                                from tracker_agent import load_active_trades
+                                from datetime import date as _date
+
+                                sess = woke.date() if hasattr(woke, "date") else _date.today()
+                                opens = load_active_trades()
+                                for tr in opens:
+                                    exp = tr.get("expiration") or (
+                                        (tr.get("option_contract") or {}).get("expiration")
+                                    )
+                                    if exp and str(exp)[:10] == str(sess):
+                                        print(
+                                            f"[System State] Waking early for 0DTE flatten "
+                                            f"(CDT {cdt_clock_str(woke)})"
+                                        )
+                                        raise StopIteration
+                            except StopIteration:
+                                break
                     except Exception:
                         pass
                     if datetime.now(est_tz).time() >= trading_end:

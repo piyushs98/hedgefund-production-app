@@ -249,7 +249,8 @@ def _fmt_contract_cell(contract: dict | None) -> str:
 
 def _fmt_extrinsic(contract: dict | None) -> str:
     """
-    Compact moneyness: ext=$0.51 (2.8%). Pure arithmetic from strike/spot/premium.
+    Compact moneyness + Stage 4 C-E fields:
+      ext=$0.51 (2.8%) dte=1.2 rm_atr=0.31 decay=2.5%/hr
     Appends δ=… only when the chain already supplied delta (no local BS).
     """
     if not contract or "error" in contract:
@@ -269,13 +270,26 @@ def _fmt_extrinsic(contract: dict | None) -> str:
                 intrinsic = max(0.0, spot - strike)
             ext = entry - intrinsic
             ext_pct = (ext / entry * 100.0) if entry > 0 else None
-    if ext is None or entry is None:
-        return ""
-    if ext_pct is None and entry > 0:
-        ext_pct = ext / entry * 100.0
-    parts = [f"ext=${ext:.2f}"]
-    if ext_pct is not None:
-        parts[0] = f"ext=${ext:.2f} ({ext_pct:.1f}%)"
+    parts: list[str] = []
+    if ext is not None and entry is not None:
+        if ext_pct is None and entry > 0:
+            ext_pct = ext / entry * 100.0
+        if ext_pct is not None:
+            parts.append(f"ext=${ext:.2f} ({ext_pct:.1f}%)")
+        else:
+            parts.append(f"ext=${ext:.2f}")
+    # C-E: dte / required_move_atr / decay_density on every EXECUTE line
+    dte = _num(contract.get("days_to_expiration"))
+    if dte is not None:
+        parts.append(f"dte={dte:g}")
+    elif contract.get("calendar_dte") is not None:
+        parts.append(f"dte={contract.get('calendar_dte')}")
+    rm = _num(contract.get("required_move_atr"))
+    if rm is not None:
+        parts.append(f"rm_atr={rm:.2f}")
+    dens = _num(contract.get("decay_density"))
+    if dens is not None:
+        parts.append(f"decay={dens:.1f}%/hr")
     delta = _num(contract.get("delta"))
     if delta is not None:
         parts.append(f"δ={delta:.2f}")
@@ -356,8 +370,8 @@ def deterministic_telemetry_bullet(row: dict) -> str:
         f"- **{ticker}**: Spot ${spot} {rel} Pivot ${pivot}. "
         f"Score: {score_s}/100. {rationale}"
     )
-    # EXECUTE lines carry ext=…; allow a few more words so it is not truncated.
-    max_words = 32 if row.get("action_flag") == "EXECUTE" else 25
+    # EXECUTE lines carry ext/dte/rm_atr/decay; allow room so C-E is not clipped.
+    max_words = 48 if row.get("action_flag") == "EXECUTE" else 25
     return _limit_rationale_words(_purge_banned(bullet), max_words)
 
 
@@ -450,6 +464,9 @@ def deepseek_key_telemetry(
                     "ext": ext_label,
                     "extrinsic": c.get("extrinsic") if c else None,
                     "extrinsic_pct": c.get("extrinsic_pct") if c else None,
+                    "days_to_expiration": c.get("days_to_expiration") if c else None,
+                    "required_move_atr": c.get("required_move_atr") if c else None,
+                    "decay_density": c.get("decay_density") if c else None,
                     "delta": c.get("delta") if c else None,
                 },
                 separators=(",", ":"),

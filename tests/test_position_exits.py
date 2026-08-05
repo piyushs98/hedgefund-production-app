@@ -10,6 +10,8 @@ from datetime import date, datetime
 from pathlib import Path
 from unittest import mock
 
+# datetime used in B5 / C-D exit tests
+
 import config
 import position_exits
 
@@ -142,8 +144,9 @@ class TestExitRules(unittest.TestCase):
                         )
         self.assertEqual(summary["closed"][0]["reason"], "TAKE_PROFIT")
 
-    def test_expiry_flatten(self):
-        trade = self._trade(expiration="2026-08-05")
+    def test_expiry_flatten_past_date_only(self):
+        """Same-day (0DTE) is NOT expiry-flattened at the open — only past dates."""
+        trade = self._trade(expiration="2026-08-04")
         scored = {"IWM": {"options_dict": self._options(0.50, 0.60), "card": None}}
 
         with mock.patch("position_exits.close_open_position") as close:
@@ -158,8 +161,49 @@ class TestExitRules(unittest.TestCase):
                             scored,
                             session_date=date(2026, 8, 5),
                             force_eod=False,
+                            now_cdt=datetime(2026, 8, 5, 10, 0, 0),
                         )
         self.assertEqual(close.call_args[0][2], "EXPIRY_FLATTEN")
+
+    def test_zero_dte_flatten_at_1300_cdt(self):
+        trade = self._trade(expiration="2026-08-05")
+        scored = {"IWM": {"options_dict": self._options(0.50, 0.60), "card": None}}
+        with mock.patch("position_exits.close_open_position") as close:
+            close.return_value = {"ticker": "IWM", "reason": "ZERO_DTE_FLATTEN", "ok": True}
+            with mock.patch("position_exits.record_position_mark", return_value=True):
+                with mock.patch("tracker_agent.save_active_trade", return_value=True):
+                    with mock.patch(
+                        "tracker_agent.load_active_trades", return_value=[]
+                    ):
+                        position_exits.run_scan_exits(
+                            [trade],
+                            scored,
+                            session_date=date(2026, 8, 5),
+                            force_eod=False,
+                            now_cdt=datetime(2026, 8, 5, 13, 5, 0),
+                        )
+        self.assertEqual(close.call_args[0][2], "ZERO_DTE_FLATTEN")
+
+    def test_breakeven_lock_b5(self):
+        trade = self._trade()
+        trade["peak_pnl_pct"] = 30.0  # was +30%
+        # mark back at entry 1.42
+        scored = {"IWM": {"options_dict": self._options(1.40, 1.44), "card": None}}
+        with mock.patch("position_exits.close_open_position") as close:
+            close.return_value = {"ticker": "IWM", "reason": "BREAKEVEN_LOCK", "ok": True}
+            with mock.patch("position_exits.record_position_mark", return_value=True):
+                with mock.patch("tracker_agent.save_active_trade", return_value=True):
+                    with mock.patch(
+                        "tracker_agent.load_active_trades", return_value=[]
+                    ):
+                        position_exits.run_scan_exits(
+                            [trade],
+                            scored,
+                            session_date=date(2026, 8, 4),
+                            force_eod=False,
+                            now_cdt=datetime(2026, 8, 5, 11, 0, 0),
+                        )
+        self.assertEqual(close.call_args[0][2], "BREAKEVEN_LOCK")
 
     def test_eod_flatten_all(self):
         trade = self._trade(expiration="2026-08-12")  # not expired
