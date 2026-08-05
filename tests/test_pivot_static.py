@@ -157,6 +157,44 @@ class TestSignalGateRanking(unittest.TestCase):
         )
         self.assertTrue(d3[0].admit)
 
+    def test_rollback_admit_clears_cooldown_and_daily_cap(self):
+        """Strike failure after admit must not burn daily attempts or cooldown."""
+        from datetime import timedelta, timezone
+        from signal_gate import SignalGate, GateConfig, Observation
+
+        gate = SignalGate(
+            GateConfig(
+                max_concurrent=2,
+                persist_cycles=1,
+                max_entries_per_ticker=1,
+                reentry_cooldown_minutes=45,
+            )
+        )
+        t0 = datetime(2026, 8, 5, 15, 0, 0, tzinfo=timezone.utc)
+        d1 = gate.process_scan(
+            [Observation("IWM", 80, "C", "EXECUTE")], t0
+        )
+        self.assertTrue(d1[0].admit)
+        self.assertEqual(gate._st("IWM").entries_today, 1)
+        self.assertIsNotNone(gate._st("IWM").last_entry_at)
+
+        ok = gate.rollback_admit("IWM")
+        self.assertTrue(ok)
+        self.assertEqual(gate._st("IWM").entries_today, 0)
+        self.assertIsNone(gate._st("IWM").last_entry_at)
+        self.assertFalse(gate._st("IWM").position_open)
+        self.assertNotIn("IWM", gate._open)
+
+        # Next scan moments later: re-admit must succeed (no cooldown / day cap burn)
+        t1 = t0 + timedelta(minutes=1)
+        d2 = gate.process_scan(
+            [Observation("IWM", 81, "C", "EXECUTE")], t1
+        )
+        self.assertTrue(
+            d2[0].admit,
+            f"expected re-admit after rollback, got {d2[0].reason}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

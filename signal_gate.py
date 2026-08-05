@@ -8,10 +8,12 @@ Stage 3 fixes vs the original reference design:
   1. Rank-before-admit: within one scan, candidates that clear persistence
      and direction lock are sorted by score DESC, then admitted against
      max_concurrent. Conviction wins the slot, not config list order.
-  2. on_close() frees concurrent slots; callers must wire every tracker
-     exit path. Cross-process safety: sync_open_from_book() reconciles
-     the in-memory book with durable active_trades at each scan start
-     (Master Bot and Tracker may be separate processes).
+  2. on_close() frees concurrent slots on REAL position exits only.
+  3. rollback_admit() undoes a gate admit when strike/contract selection
+     fails after admit (MIN_DTE / required_move / decay / no liquid) so
+     entries_today, last_entry_at, and the concurrent slot are restored.
+     Cross-process safety: sync_open_from_book() reconciles the in-memory
+     book with durable active_trades at each scan start.
 """
 from __future__ import annotations
 
@@ -78,17 +80,57 @@ class SignalGate:
         self.cfg = cfg or GateConfig()
         self.state: dict[str, TickerState] = {}
         self._open: set[str] = set()
+        # Pre-admit snapshots for rollback_admit (ticker -> prior last_entry_at, entries_today)
+        self._admit_snapshots: dict[str, tuple[datetime | None, int]] = {}
 
     def _st(self, ticker: str) -> TickerState:
         key = str(ticker).upper().strip()
         return self.state.setdefault(key, TickerState())
 
     def on_close(self, ticker: str) -> None:
-        """Free a concurrent slot when a position is closed (any exit path)."""
+        """
+        Free a concurrent slot when a REAL position is closed.
+
+        Does not touch entries_today or last_entry_at (those track real entries
+        and cooldown). For failed contract selection after admit, use
+        rollback_admit() instead.
+        """
         key = str(ticker).upper().strip()
         st = self._st(key)
         st.position_open = False
         self._open.discard(key)
+        # Real exit: drop any unused admit snapshot
+        self._admit_snapshots.pop(key, None)
+
+    def rollback_admit(self, ticker: str) -> bool:
+        """
+        Reverse a gate admit when no position was actually opened
+        (strike selection / Part C filter failure).
+
+        Restores entries_today, last_entry_at (pre-admit values), and
+        clears position_open / concurrent slot. Returns True if a snapshot
+        was restored.
+        """
+        key = str(ticker).upper().strip()
+        st = self._st(key)
+        snap = self._admit_snapshots.pop(key, None)
+        st.position_open = False
+        self._open.discard(key)
+        if snap is not None:
+            prev_last, prev_entries = snap
+            st.last_entry_at = prev_last
+            st.entries_today = max(0, int(prev_entries))
+            print(
+                f"[Gate] rollback_admit({key}): entries_today→{st.entries_today} "
+                f"last_entry_at→{st.last_entry_at}"
+            )
+            return True
+        # Fallback if snapshot missing (should not happen on normal paths)
+        if st.entries_today > 0:
+            st.entries_today -= 1
+        st.last_entry_at = None
+        print(f"[Gate] rollback_admit({key}): no snapshot — decremented entries only")
+        return False
 
     def sync_open_from_book(self, open_tickers: Iterable[str]) -> None:
         """
@@ -187,11 +229,14 @@ class SignalGate:
                 score=score, direction=direction,
             )
 
+        key = str(ticker).upper().strip()
+        # Snapshot pre-admit state so strike failures can fully roll back
+        self._admit_snapshots[key] = (st.last_entry_at, int(st.entries_today))
         st.direction = direction
         st.last_entry_at = now
         st.position_open = True
         st.entries_today += 1
-        self._open.add(str(ticker).upper().strip())
+        self._open.add(key)
         return GateDecision(
             ticker=ticker, admit=True,
             reason=f"admitted (score {score:.1f}, streak {st.streak})",
@@ -363,7 +408,23 @@ def get_gate() -> SignalGate:
             f"flip_lock={cfg.flip_lock_minutes}m cooldown={cfg.reentry_cooldown_minutes}m "
             f"threshold={cfg.threshold}"
         )
+        log_entry_filter_config()
     return _GATE
+
+
+def log_entry_filter_config() -> None:
+    """Boot / init: print resolved Part C knobs (env-overridable at process start)."""
+    try:
+        import config as _cfg
+        print(
+            f"[EntryFilters] MIN_DTE={getattr(_cfg, 'MIN_DTE', 1)} "
+            f"REQUIRED_MOVE_ATR_K={getattr(_cfg, 'REQUIRED_MOVE_ATR_K', 0.5)} "
+            f"EXIT_MAX_DECAY_DENSITY={getattr(_cfg, 'EXIT_MAX_DECAY_DENSITY', 8.0)}%/hr "
+            f"MAX_EXPIRY_CALENDAR_DTE={getattr(_cfg, 'MAX_EXPIRY_CALENDAR_DTE', 10)} "
+            f"(env-tunable; restart process to apply)"
+        )
+    except Exception as e:
+        print(f"[EntryFilters] config unavailable: {e}")
 
 
 def reset_gate_for_tests(cfg: GateConfig | None = None) -> SignalGate:

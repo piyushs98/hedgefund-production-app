@@ -10,10 +10,11 @@ contract algorithmically instead of leaving it to LLM prose:
   3. Candidate contracts near the target strike are ranked on:
        tight spread (45%), open interest (25%), volume (15%),
        and IV vs. the chain median (15%).
-  4. Entry filters (reject → try next rank; else error so gate.on_close):
+  4. Entry filters (reject → try next rank; else error so gate.rollback_admit):
        C-A  calendar DTE >= MIN_DTE (default 1)
        C-C  required_move_atr <= REQUIRED_MOVE_ATR_K (default 0.5)
        C-F  decay_density <= EXIT_MAX_DECAY_DENSITY (default 8 %/hr)
+     Error payloads include reject_tag for GATE line logging, e.g. decay(9.3>8.0).
 """
 
 from __future__ import annotations
@@ -211,24 +212,28 @@ def _passes_entry_filters(
     rm_atr: float | None,
     dens: float | None,
 ) -> tuple[bool, str | None]:
+    """
+    Return (ok, reject_tag). reject_tag is compact for GATE lines:
+      min_dte(0) | rm_atr(0.61>0.50) | decay(9.3>8.0)
+    """
     min_dte = int(getattr(config, "MIN_DTE", 1))
     k = float(getattr(config, "REQUIRED_MOVE_ATR_K", 0.5))
     max_dens = float(getattr(config, "EXIT_MAX_DECAY_DENSITY", 8.0))
 
     if cal_dte < min_dte:
-        return False, f"MIN_DTE {cal_dte}<{min_dte}"
+        return False, f"min_dte({cal_dte})"
     if rm_atr is not None and rm_atr > k:
-        return False, f"required_move_atr {rm_atr:.2f}>{k}"
+        return False, f"rm_atr({rm_atr:.2f}>{k:.2f})"
     if dens is not None and dens > max_dens:
-        return False, f"decay_density {dens:.1f}%/hr>{max_dens}"
+        return False, f"decay({dens:.1f}>{max_dens:.1f})"
     return True, None
 
 
 def select_optimal_contract(options_dict, pivot_data, atr_abs=None, now=None):
     """
     Returns a dict describing the chosen contract + rationale, or
-    {"error": ...} when nothing tradeable exists (the caller should then
-    downgrade to PASS and gate.on_close the reserved slot).
+    {"error": ..., "reject_tag": "min_dte(0)"} when nothing tradeable
+    exists (caller must gate.rollback_admit, not on_close).
     """
     spot = options_dict.get("current_price")
     chains = options_dict.get("chains", {})
@@ -324,12 +329,14 @@ def select_optimal_contract(options_dict, pivot_data, atr_abs=None, now=None):
             "error": (
                 f"No liquid {direction} contract within 4% of the ATR-derived "
                 f"target strike (MIN_DTE={min_dte})."
-            )
+            ),
+            "reject_tag": "no_liquid",
         }
 
     ranked.sort(key=lambda r: r["rank"], reverse=True)
 
     rejects: list[str] = []
+    reject_tags: list[str] = []
     chosen = None
     for cand in ranked:
         ok, why = _passes_entry_filters(
@@ -338,21 +345,27 @@ def select_optimal_contract(options_dict, pivot_data, atr_abs=None, now=None):
             dens=cand["decay_density"],
         )
         if not ok:
+            tag = why or "filter"
+            reject_tags.append(tag)
             rejects.append(
-                f"{cand['expiration']} {cand['contract'].get('strike')}: {why}"
+                f"{cand['expiration']} {cand['contract'].get('strike')}: {tag}"
             )
             continue
         chosen = cand
         break
 
     if chosen is None:
+        # Primary tag = top-ranked candidate's failure (most liquid / would-have-picked)
+        primary = reject_tags[0] if reject_tags else "filter"
         sample = "; ".join(rejects[:5])
         return {
             "error": (
                 f"All {direction} candidates failed entry filters "
                 f"(MIN_DTE/required_move/decay_density). "
                 f"Tried {len(ranked)}; e.g. {sample}"
-            )
+            ),
+            "reject_tag": primary,
+            "filter_rejects": rejects,
         }
 
     best = chosen["contract"]

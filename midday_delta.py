@@ -815,6 +815,7 @@ def run_thirty_min_scan(
     result["gate_summary"] = gate_summary
 
     # ---- Phase 2: strike + paper buy only for admitted tickers ----
+    strike_rejects: list[str] = []
     for ticker in universe:
         ctx = scored.get(ticker)
         if not ctx:
@@ -841,11 +842,17 @@ def run_thirty_min_scan(
                 if "error" in contract:
                     card.action_flag = "PASS"
                     card.reasons.append(contract["error"])
-                    # Free the slot we just reserved — strike failed
+                    tag = contract.get("reject_tag") or "strike_fail"
+                    strike_rejects.append(f"{ticker}:{tag}")
+                    # Full admit rollback — not on_close (never opened a position)
                     try:
-                        gate.on_close(ticker)
+                        gate.rollback_admit(ticker)
                     except Exception:
                         pass
+                    print(
+                        f"[{ticker}] 🚧 Contract filter REJECT {tag} → PASS "
+                        f"(admit rolled back)"
+                    )
                     contract = None
                 else:
                     try:
@@ -926,6 +933,13 @@ def run_thirty_min_scan(
             )
         except Exception as te:
             print(f"[{ticker}] telemetry WARNING: {te}")
+
+    # Append Part C contract-filter rejects to the GATE summary line
+    if strike_rejects:
+        reject_line = "REJECT " + " ".join(strike_rejects)
+        gate_summary = f"{gate_summary} | {reject_line}"
+        result["gate_summary"] = gate_summary
+        print(f"[scan] {reject_line}")
 
     baseline["tickers"] = new_ticker_state
     if open_baseline:

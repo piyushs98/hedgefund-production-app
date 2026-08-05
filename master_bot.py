@@ -1091,13 +1091,16 @@ def run_portfolio_scan(
                 contract = strike_selector.select_optimal_contract(
                     options_dict, pivot_data, atr_abs=atr_abs)
                 if "error" in contract:
-                    print(f"[{ticker}] ⚠️ Strike selector found no tradeable contract: "
-                          f"{contract['error']} — downgrading to PASS.")
+                    tag = contract.get("reject_tag") or "strike_fail"
+                    print(
+                        f"[{ticker}] ⚠️ Contract filter REJECT {tag}: "
+                        f"{contract['error']} — downgrading to PASS (admit rolled back)."
+                    )
                     card.action_flag = "PASS"
                     card.reasons.append(f"Downgraded: {contract['error']}")
                     is_execute = False
                     try:
-                        gate.on_close(ticker)
+                        gate.rollback_admit(ticker)
                     except Exception:
                         pass
                 else:
@@ -1274,6 +1277,13 @@ def run_macro_loop():
         f"{'FULL LLM escape hatch' if full_llm_intraday else '30-MIN SCAN table + isolated 11:00 CDT macro'}"
     )
     config.assert_secrets(require_discord=False)
+    # Resolved Part C knobs (env at process start — restart to retune without code change)
+    print(
+        f"[EntryFilters] MIN_DTE={config.MIN_DTE} "
+        f"REQUIRED_MOVE_ATR_K={config.REQUIRED_MOVE_ATR_K} "
+        f"EXIT_MAX_DECAY_DENSITY={config.EXIT_MAX_DECAY_DENSITY}%/hr "
+        f"MAX_EXPIRY_CALENDAR_DTE={config.MAX_EXPIRY_CALENDAR_DTE}"
+    )
     # Log-only path inventory (Stage 1). No writes, no restore.
     try:
         import state_preflight
@@ -1282,6 +1292,12 @@ def run_macro_loop():
         print(f"[System] WARNING: state preflight failed: {pf_err}")
     telemetry.init_telemetry_table()
     breaker = CircuitBreaker(failure_threshold=5, cooldown_seconds=900)
+    # Eager gate init so [Gate] + [EntryFilters] lines appear at boot
+    try:
+        import signal_gate
+        signal_gate.get_gate()
+    except Exception as g_err:
+        print(f"[System] WARNING: gate init failed: {g_err}")
 
     try:
         est_tz = pytz.timezone("America/New_York")
