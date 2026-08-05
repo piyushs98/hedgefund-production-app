@@ -82,8 +82,8 @@ EXECUTE_THRESHOLD = 70
 # ------------------------------------------------------------------
 # Stage 3 signal gate — all knobs are env-overridable (no code change).
 # Set on Render / local shell and restart the process to apply.
-#   GATE_MAX_ENTRIES_PER_TICKER  default 3   (daily cap per ticker)
-#   GATE_MAX_CONCURRENT          default 5
+#   GATE_MAX_ENTRIES_PER_TICKER  default 6   (daily cap per ticker)
+#   GATE_MAX_CONCURRENT          default 10  (paper: exits protect the book)
 #   GATE_PERSIST_CYCLES          default 2
 #   GATE_FLIP_LOCK_MINUTES       default 60
 #   GATE_FLIP_OVERRIDE_SCORE     default 85
@@ -113,12 +113,37 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
-GATE_MAX_ENTRIES_PER_TICKER = _env_int("GATE_MAX_ENTRIES_PER_TICKER", 3)
-GATE_MAX_CONCURRENT = _env_int("GATE_MAX_CONCURRENT", 5)
+def _env_hhmm(name: str, default: str) -> tuple:
+    """Parse HH:MM env into (hour, minute). Falls back to default on bad input."""
+    raw = os.environ.get(name)
+    text = (raw if raw is not None and str(raw).strip() != "" else default).strip()
+    try:
+        parts = text.split(":")
+        hour, minute = int(parts[0]), int(parts[1])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError("out of range")
+        return hour, minute
+    except (TypeError, ValueError, IndexError):
+        print(f"[Config] Invalid {name}={raw!r}; using default {default}")
+        parts = default.split(":")
+        return int(parts[0]), int(parts[1])
+
+
+GATE_MAX_ENTRIES_PER_TICKER = _env_int("GATE_MAX_ENTRIES_PER_TICKER", 6)
+GATE_MAX_CONCURRENT = _env_int("GATE_MAX_CONCURRENT", 10)
 GATE_PERSIST_CYCLES = _env_int("GATE_PERSIST_CYCLES", 2)
 GATE_FLIP_LOCK_MINUTES = _env_int("GATE_FLIP_LOCK_MINUTES", 60)
 GATE_FLIP_OVERRIDE_SCORE = _env_float("GATE_FLIP_OVERRIDE_SCORE", 85.0)
 GATE_REENTRY_COOLDOWN_MINUTES = _env_int("GATE_REENTRY_COOLDOWN_MINUTES", 45)
+
+# ------------------------------------------------------------------
+# Stage 4 deterministic exits (30-min scan path — no tracker / no Gemini).
+# All knobs env-overridable; restart process to apply.
+#   EXIT_EOD_FLATTEN_CDT   default 14:45  (America/Chicago — flatten all open)
+# ------------------------------------------------------------------
+EXIT_EOD_FLATTEN_HOUR, EXIT_EOD_FLATTEN_MINUTE = _env_hhmm(
+    "EXIT_EOD_FLATTEN_CDT", "14:45"
+)
 
 
 def _init_weights_table():

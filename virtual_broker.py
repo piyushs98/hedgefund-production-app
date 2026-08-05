@@ -298,12 +298,15 @@ def paper_sell(
     exit_price: float | int | None,
     direction: str | None,
     entry_price: float | int | None,
+    notes: str | None = None,
 ) -> dict[str, Any]:
     """
     Close a virtual long option:
       * credit exit_price * 100 back to buying_power
       * realized PnL = (exit_price - entry_price) * 100
       * append a row to trade_history
+
+    notes: optional exit reason (e.g. EXIT:STOP_LOSS) for audit/analytics.
     """
     ensure_ledger()
     try:
@@ -380,7 +383,7 @@ def paper_sell(
                 exit_,
                 pnl,
                 json.dumps(meta, default=str) if meta else None,
-                None,
+                notes,
                 slippage,
             ),
         )

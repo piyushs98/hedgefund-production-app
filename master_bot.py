@@ -1482,6 +1482,22 @@ def run_macro_loop():
                             f"(CDT {cdt_clock_str(woke)})"
                         )
                         break
+                    # Wake early for Stage 4 EOD flatten window (default 14:45 CDT)
+                    try:
+                        import position_exits as _pex
+                        if (
+                            _pex.is_eod_flatten_window(woke)
+                            and not _pex.eod_already_done(
+                                woke.date() if hasattr(woke, "date") else None
+                            )
+                        ):
+                            print(
+                                f"[System State] Waking early for EOD flatten "
+                                f"(CDT {cdt_clock_str(woke)})"
+                            )
+                            break
+                    except Exception:
+                        pass
                     if datetime.now(est_tz).time() >= trading_end:
                         break
                 continue

@@ -711,7 +711,57 @@ def run_thirty_min_scan(
             import time as _time
             _time.sleep(inter_ticker_sleep)
 
-    # ---- Stage 3 gate: sync durable book, rank-before-admit ----
+    # ---- Stage 4 exits (B1–B4): before gate so freed slots are available ----
+    # Reuses phase-1 options_dict marks — no extra yfinance when open ⊆ universe.
+    exit_summary: dict[str, Any] = {}
+    try:
+        import position_exits
+        from tracker_agent import load_active_trades as _load_open
+
+        open_before_exits = _load_open()
+        if open_before_exits:
+            print(
+                f"[scan] Stage 4 exits: evaluating {len(open_before_exits)} open "
+                f"position(s) (EOD/expiry/SL/TP + marks)"
+            )
+            exit_summary = position_exits.run_scan_exits(
+                open_before_exits,
+                scored,
+                scan_id=scan_id,
+                now_cdt=_chicago_now(),
+            )
+            result["exits"] = {
+                "closed": [
+                    {
+                        "ticker": c.get("ticker"),
+                        "reason": c.get("reason"),
+                        "exit_price": c.get("exit_price"),
+                        "pnl": c.get("pnl"),
+                    }
+                    for c in (exit_summary.get("closed") or [])
+                ],
+                "marks_recorded": exit_summary.get("marks_recorded"),
+                "eod_triggered": exit_summary.get("eod_triggered"),
+                "open_after": exit_summary.get("open_after"),
+            }
+            if exit_summary.get("closed"):
+                try:
+                    lines = [
+                        f"**{c.get('ticker')}** {c.get('reason')} "
+                        f"@ ${c.get('exit_price')}"
+                        + (f" PnL ${c.get('pnl'):.0f}" if c.get("pnl") is not None else "")
+                        for c in exit_summary["closed"]
+                    ]
+                    broadcaster.send_discord_alert(
+                        "📉 **SCAN EXITS**\n" + "\n".join(lines)
+                    )
+                except Exception as disc_err:
+                    print(f"[scan] exit Discord warn: {disc_err}")
+    except Exception as exit_err:
+        print(f"[scan] Stage 4 exits error (continuing to gate): {exit_err}")
+        result["exits_error"] = str(exit_err)
+
+    # ---- Stage 3 gate: sync durable book (post-exit), rank-before-admit ----
     gate = signal_gate.get_gate()
     try:
         from tracker_agent import load_active_trades
