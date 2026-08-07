@@ -1284,6 +1284,13 @@ def run_macro_loop():
         f"EXIT_MAX_DECAY_DENSITY={config.EXIT_MAX_DECAY_DENSITY}%/hr "
         f"MAX_EXPIRY_CALENDAR_DTE={config.MAX_EXPIRY_CALENDAR_DTE}"
     )
+    print(
+        f"[SessionCutoffs] NO_NEW_ENTRIES_AFTER_CDT="
+        f"{config.NO_NEW_ENTRIES_AFTER_HOUR:02d}:{config.NO_NEW_ENTRIES_AFTER_MINUTE:02d} "
+        f"EXIT_EOD_FLATTEN_CDT="
+        f"{config.EXIT_EOD_FLATTEN_HOUR:02d}:{config.EXIT_EOD_FLATTEN_MINUTE:02d} "
+        f"(Chicago; admits blocked after either fires)"
+    )
     # Log-only path inventory (Stage 1). No writes, no restore.
     try:
         import state_preflight

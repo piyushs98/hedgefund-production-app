@@ -195,6 +195,45 @@ class TestSignalGateRanking(unittest.TestCase):
             f"expected re-admit after rollback, got {d2[0].reason}",
         )
 
+    def test_late_session_blocks_admits_after_cutoff(self):
+        """NO_NEW_ENTRIES_AFTER_CDT: no admits after 14:00 Chicago."""
+        from datetime import timezone
+        from zoneinfo import ZoneInfo
+        from signal_gate import SignalGate, GateConfig, Observation
+        import position_exits
+
+        position_exits.reset_eod_flags_for_tests()
+        gate = SignalGate(GateConfig(max_concurrent=5, persist_cycles=1))
+        # 14:05 America/Chicago
+        now = datetime(2026, 8, 6, 14, 5, 0, tzinfo=ZoneInfo("America/Chicago"))
+        d = gate.process_scan(
+            [Observation("SPY", 90, "C", "EXECUTE")], now
+        )
+        self.assertFalse(d[0].admit)
+        self.assertIn("late_session", d[0].reason)
+        summary = gate.format_scan_summary(d)
+        self.assertIn("late_session", summary)
+
+    def test_eod_flatten_done_blocks_all_later_admits(self):
+        """Once EOD flatten has fired, no admits even before clock cutoff mock."""
+        from datetime import timezone
+        from zoneinfo import ZoneInfo
+        from signal_gate import SignalGate, GateConfig, Observation
+        import position_exits
+
+        position_exits.reset_eod_flags_for_tests()
+        # Mark EOD done for 2026-08-06 Chicago
+        position_exits.mark_eod_done(datetime(2026, 8, 6).date())
+        gate = SignalGate(GateConfig(max_concurrent=5, persist_cycles=1))
+        # 11:00 CDT — before 14:00 cutoff, but EOD already done
+        now = datetime(2026, 8, 6, 11, 0, 0, tzinfo=ZoneInfo("America/Chicago"))
+        d = gate.process_scan(
+            [Observation("NVDA", 95, "C", "EXECUTE")], now
+        )
+        self.assertFalse(d[0].admit)
+        self.assertIn("EOD flatten already done", d[0].reason)
+        position_exits.reset_eod_flags_for_tests()
+
 
 if __name__ == "__main__":
     unittest.main()
