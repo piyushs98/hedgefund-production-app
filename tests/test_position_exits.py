@@ -205,9 +205,41 @@ class TestExitRules(unittest.TestCase):
                         )
         self.assertEqual(close.call_args[0][2], "BREAKEVEN_LOCK")
 
-    def test_eod_flatten_all(self):
-        trade = self._trade(expiration="2026-08-12")  # not expired
-        scored = {"IWM": {"options_dict": self._options(1.00, 1.20), "card": None}}
+    def test_eod_flattens_short_dated_only(self):
+        """CARRY_MIN_DTE=2: cal_dte 1 flattens; cal_dte>=2 may carry."""
+        short = self._trade(expiration="2026-08-06", trade_id="short")  # cal_dte=1 on Aug 5
+        long = self._trade(
+            expiration="2026-08-12",
+            trade_id="long",
+            ticker="SPY",
+            strike=500.0,
+        )
+        # Fresh entry so TIME_STOP does not fire on the carry-eligible name
+        from datetime import timezone as _tz
+        long["entry_timestamp"] = datetime.now(_tz.utc).isoformat()
+        scored = {
+            "IWM": {"options_dict": self._options(1.00, 1.20), "card": None},
+            "SPY": {
+                "options_dict": {
+                    "current_price": 500.0,
+                    "chains": {
+                        "2026-08-12": {
+                            "calls": [
+                                {
+                                    "strike": 500.0,
+                                    # Above SL (1.14) so only short-dated EOD closes
+                                    "bid": 1.40,
+                                    "ask": 1.50,
+                                    "lastPrice": 1.45,
+                                }
+                            ],
+                            "puts": [],
+                        }
+                    },
+                },
+                "card": None,
+            },
+        }
 
         with mock.patch("position_exits.close_open_position") as close:
             close.return_value = {"ticker": "IWM", "reason": "EOD_FLATTEN", "ok": True}
@@ -216,14 +248,50 @@ class TestExitRules(unittest.TestCase):
                     with mock.patch(
                         "tracker_agent.load_active_trades", return_value=[]
                     ):
-                        summary = position_exits.run_scan_exits(
+                        with mock.patch.object(config, "CARRY_MIN_DTE", 2):
+                            summary = position_exits.run_scan_exits(
+                                [short, long],
+                                scored,
+                                session_date=date(2026, 8, 5),
+                                force_eod=True,
+                                now_cdt=datetime(2026, 8, 5, 14, 50, 0),
+                            )
+        self.assertTrue(summary["eod_triggered"])
+        # Only short-dated closed
+        self.assertEqual(close.call_count, 1)
+        self.assertEqual(close.call_args[0][2], "EOD_FLATTEN")
+        self.assertEqual(close.call_args[0][0].get("trade_id"), "short")
+
+    def test_morning_carry_review_hold_line(self):
+        trade = self._trade(expiration="2026-08-12")
+        trade["entry_score"] = 78.0
+        trade["entry_pivot"] = 300.0
+        trade["entry_dte"] = 7
+        scored = {
+            "IWM": {
+                "options_dict": self._options(1.50, 1.70),
+                "card": mock.Mock(total_score=72.0),
+                "pivot_data": {"pivot": 301.5, "close": 302.0},
+            }
+        }
+        position_exits.reset_eod_flags_for_tests()
+        with mock.patch("position_exits.close_open_position") as close:
+            with mock.patch("position_exits.record_position_mark", return_value=True):
+                with mock.patch("tracker_agent.save_active_trade", return_value=True):
+                    with mock.patch("broadcaster.send_discord_alert", return_value=True):
+                        summary = position_exits.run_morning_carry_review(
                             [trade],
                             scored,
                             session_date=date(2026, 8, 5),
-                            force_eod=True,
+                            now_cdt=datetime(2026, 8, 5, 8, 35, 0),
+                            force=True,
                         )
-        self.assertTrue(summary["eod_triggered"])
-        self.assertEqual(close.call_args[0][2], "EOD_FLATTEN")
+        self.assertTrue(summary["ran"])
+        self.assertEqual(len(summary["lines"]), 1)
+        self.assertIn("HOLD", summary["lines"][0])
+        self.assertIn("score 78->72", summary["lines"][0])
+        self.assertIn("pivot 300.00->301.50", summary["lines"][0])
+        close.assert_not_called()
 
     def test_record_mark_persists(self):
         trade = self._trade()

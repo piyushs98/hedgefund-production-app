@@ -140,7 +140,7 @@ GATE_REENTRY_COOLDOWN_MINUTES = _env_int("GATE_REENTRY_COOLDOWN_MINUTES", 45)
 # Stage 4 deterministic exits (30-min scan path — no tracker / no Gemini).
 # All knobs env-overridable; restart process to apply.
 #   EXIT_EOD_FLATTEN_CDT          default 14:45  (America/Chicago)
-#   NO_NEW_ENTRIES_AFTER_CDT      default 14:00  (gate admits nothing after)
+#   CARRY_MIN_DTE                 default 2     (EOD flattens only if cal_dte < this)
 #   EXIT_ZERO_DTE_FLATTEN_CDT     default 13:00  (0DTE hard flatten)
 #   EXIT_BREAKEVEN_PEAK_PCT       default 25     (B5)
 #   EXIT_TRAIL_PEAK_PCT           default 40
@@ -151,9 +151,7 @@ GATE_REENTRY_COOLDOWN_MINUTES = _env_int("GATE_REENTRY_COOLDOWN_MINUTES", 45)
 EXIT_EOD_FLATTEN_HOUR, EXIT_EOD_FLATTEN_MINUTE = _env_hhmm(
     "EXIT_EOD_FLATTEN_CDT", "14:45"
 )
-NO_NEW_ENTRIES_AFTER_HOUR, NO_NEW_ENTRIES_AFTER_MINUTE = _env_hhmm(
-    "NO_NEW_ENTRIES_AFTER_CDT", "14:00"
-)
+CARRY_MIN_DTE = _env_int("CARRY_MIN_DTE", 2)
 EXIT_ZERO_DTE_FLATTEN_HOUR, EXIT_ZERO_DTE_FLATTEN_MINUTE = _env_hhmm(
     "EXIT_ZERO_DTE_FLATTEN_CDT", "13:00"
 )

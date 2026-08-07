@@ -200,22 +200,6 @@ class SignalGate:
         c, st = self.cfg, self._st(ticker)
         direction = _norm_direction(direction) or direction
 
-        # Hard session close: after EOD flatten has fired, no new admits all day.
-        if _eod_flatten_already_done(now):
-            return GateDecision(
-                ticker=ticker, admit=False,
-                reason="late_session: EOD flatten already done — no new entries",
-                score=score, direction=direction,
-            )
-
-        # Cutoff clock (default 14:00 CDT): no new entries into the close.
-        if _is_no_new_entries_window(now):
-            return GateDecision(
-                ticker=ticker, admit=False,
-                reason="late_session: no new entries after cutoff CDT",
-                score=score, direction=direction,
-            )
-
         if st.position_open and not c.allow_pyramiding:
             return GateDecision(
                 ticker=ticker, admit=False, reason="position already open on this ticker",
@@ -362,8 +346,6 @@ class SignalGate:
 
 def _compact_reason(reason: str) -> str:
     r = reason.lower()
-    if "late_session" in r or "eod flatten already" in r:
-        return "late_session"
     if "persistence" in r:
         return "persist"
     if "direction lock" in r:
@@ -379,46 +361,6 @@ def _compact_reason(reason: str) -> str:
     if "below" in r:
         return "below_thr"
     return "other"
-
-
-def _chicago_wall(now: datetime | None = None) -> datetime:
-    """Normalize to America/Chicago wall clock for session cutoffs."""
-    try:
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo("America/Chicago")
-        if now is None:
-            return datetime.now(tz)
-        if now.tzinfo is None:
-            return now.replace(tzinfo=tz)
-        return now.astimezone(tz)
-    except Exception:
-        return now or datetime.now()
-
-
-def _is_no_new_entries_window(now: datetime | None = None) -> bool:
-    """True at/after NO_NEW_ENTRIES_AFTER_CDT (default 14:00 America/Chicago)."""
-    try:
-        import config as _cfg
-        hour = int(getattr(_cfg, "NO_NEW_ENTRIES_AFTER_HOUR", 14))
-        minute = int(getattr(_cfg, "NO_NEW_ENTRIES_AFTER_MINUTE", 0))
-    except Exception:
-        hour, minute = 14, 0
-    wall = _chicago_wall(now)
-    tt = wall.time()
-    if getattr(tt, "tzinfo", None) is not None:
-        tt = tt.replace(tzinfo=None)
-    from datetime import time as _time
-    return tt >= _time(hour, minute)
-
-
-def _eod_flatten_already_done(now: datetime | None = None) -> bool:
-    """True once Stage 4 EOD flatten has fired for the Chicago session date."""
-    try:
-        import position_exits as _pex
-        wall = _chicago_wall(now)
-        return bool(_pex.eod_already_done(wall.date()))
-    except Exception:
-        return False
 
 
 # Process-wide singleton (Master Bot scan path). Tracker calls on_close via

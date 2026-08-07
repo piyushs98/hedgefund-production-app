@@ -1,14 +1,16 @@
 """
-position_exits.py — Deterministic scan-path exits (Stage 4 B1–B5 + C-D).
+position_exits.py — Deterministic scan-path exits (Stage 4 B1–B5 + C-D + carry).
 
 Runs inside the 30-minute scan. No tracker daemon, no Gemini, no new process.
 
-  B1  EOD flatten at/after EXIT_EOD_FLATTEN_CDT (default 14:45 America/Chicago)
-  B2  Expiry flatten when contract expiration date is at or past session date
+  B1  Selective EOD flatten at EXIT_EOD_FLATTEN_CDT (default 14:45 CDT):
+      only calendar_dte < CARRY_MIN_DTE (default 2) — multi-day may overnight
+  B2  Expiry flatten when expiration date is strictly before session date
   B3  Stop-loss / take-profit vs live option mark each scan
   B4  Persist a mark row every scan for every still-open (and pre-close) position
   B5  Breakeven lock / trailing giveback / time stop (uses peak_pnl_pct from B4)
   C-D 0DTE hard flatten at/after EXIT_ZERO_DTE_FLATTEN_CDT (default 13:00 CDT)
+  Carry morning re-eval once/day before admits (score/pivot/mark + Discord)
 
 Every close: virtual_broker.paper_sell → tracker_agent.remove_active_trade
 (which calls signal_gate.on_close so the concurrent slot frees).
@@ -29,8 +31,9 @@ try:
 except ImportError:  # pragma: no cover
     pytz = None
 
-# Once-per-process-day EOD flag (also checked against empty book).
+# Once-per-process-day flags (Chicago session date).
 _eod_flatten_dates: set[str] = set()
+_carry_review_dates: set[str] = set()
 
 
 def _parse_entry_time(trade: dict[str, Any]) -> datetime | None:
@@ -108,8 +111,261 @@ def mark_eod_done(session_day: date | None = None) -> None:
 
 
 def reset_eod_flags_for_tests() -> None:
-    """Test helper — clear in-process EOD-done set."""
+    """Test helper — clear in-process EOD / carry-review day sets."""
     _eod_flatten_dates.clear()
+    _carry_review_dates.clear()
+
+
+def carry_review_already_done(session_day: date | None = None) -> bool:
+    day = session_day or _chicago_now().date()
+    return day.isoformat() in _carry_review_dates
+
+
+def mark_carry_review_done(session_day: date | None = None) -> None:
+    day = session_day or _chicago_now().date()
+    _carry_review_dates.add(day.isoformat())
+
+
+def _calendar_dte_for_trade(trade: dict[str, Any], sess: date) -> int | None:
+    exp_d = _parse_exp_date(_trade_expiration(trade))
+    if exp_d is None:
+        return None
+    return (exp_d - sess).days
+
+
+def _carry_min_dte() -> int:
+    return int(getattr(config, "CARRY_MIN_DTE", 2))
+
+
+def _fmt_contract_label(trade: dict[str, Any]) -> str:
+    ticker = trade.get("ticker") or "?"
+    direction = _trade_direction(trade)
+    strike = _trade_strike(trade)
+    exp = _trade_expiration(trade) or "?"
+    letter = "P" if "PUT" in direction else "C"
+    try:
+        strike_s = f"{float(strike):g}" if strike is not None else "?"
+    except (TypeError, ValueError):
+        strike_s = str(strike or "?")
+    exp_s = str(exp)[5:] if exp and len(str(exp)) >= 10 else str(exp)
+    return f"{ticker} {strike_s}{letter} {exp_s}"
+
+
+def evaluate_exit_reason_for_mark(
+    trade: dict[str, Any],
+    mark: float | None,
+    *,
+    sess: date,
+    now: datetime,
+    include_time_stop: bool = True,
+    do_eod: bool = False,
+) -> tuple[str | None, float | None]:
+    """
+    Shared exit decision for scan exits and morning carry review.
+
+    EOD is selective: only cal_dte < CARRY_MIN_DTE is forced flat.
+    Morning carry review typically sets include_time_stop=False.
+    """
+    entry = _entry_premium(trade)
+    exit_px = mark
+    exp_d = _parse_exp_date(_trade_expiration(trade))
+    cal_dte = (exp_d - sess).days if exp_d is not None else None
+    is_0dte = exp_d is not None and exp_d == sess
+    carry_min = _carry_min_dte()
+
+    # Selective EOD — short-dated only (1DTE and under)
+    if do_eod and cal_dte is not None and cal_dte < carry_min:
+        if exit_px is None and entry is not None:
+            exit_px = entry
+        return "EOD_FLATTEN", exit_px
+
+    # 0DTE hard flatten
+    if is_0dte and is_zero_dte_flatten_window(now):
+        if exit_px is None and entry is not None:
+            exit_px = entry
+        return "ZERO_DTE_FLATTEN", exit_px
+
+    # Past expiry
+    if exp_d is not None and exp_d < sess:
+        if exit_px is None and entry is not None:
+            exit_px = entry
+        return "EXPIRY_FLATTEN", exit_px
+
+    if mark is None:
+        return None, None
+
+    sl = _f(trade.get("stop_loss"))
+    tp = _f(trade.get("take_profit") or trade.get("target_price"))
+    if _sl_breached(mark, sl):
+        return "STOP_LOSS", mark
+    if _tp_breached(mark, tp):
+        return "TAKE_PROFIT", mark
+
+    pnl = _pnl_pct(entry, mark)
+    # Path rules (optional time stop)
+    if include_time_stop:
+        b5 = _b5_exit_reason(trade, mark, entry, pnl, datetime.now(timezone.utc))
+        if b5:
+            return b5, mark
+    else:
+        # Morning review: BE lock + trailing only (no thesis-blind time stop)
+        peak = _f(trade.get("peak_pnl_pct"))
+        if peak is None:
+            peak = pnl
+        if entry is not None and pnl is not None and peak is not None:
+            be_peak = float(getattr(config, "EXIT_BREAKEVEN_PEAK_PCT", 25.0))
+            trail_peak = float(getattr(config, "EXIT_TRAIL_PEAK_PCT", 40.0))
+            giveback = float(getattr(config, "EXIT_TRAIL_GIVEBACK_FRAC", 0.30))
+            if peak >= be_peak and mark <= entry:
+                return "BREAKEVEN_LOCK", mark
+            if peak >= trail_peak and peak > 0 and pnl <= peak * (1.0 - giveback):
+                return "TRAILING_GIVEBACK", mark
+
+    return None, None
+
+
+def run_morning_carry_review(
+    open_trades: list[dict[str, Any]],
+    scored_by_ticker: dict[str, dict[str, Any]],
+    *,
+    scan_id: str | None = None,
+    now_cdt: datetime | None = None,
+    session_date: date | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """
+    First scan of the day: re-mark carried positions against TODAY's pivot/score.
+
+    Runs before gate admits. Posts Discord CARRY REVIEW. Applies SL/TP /
+    BE / trail / expiry (not time stop). Once per Chicago session date.
+    """
+    summary: dict[str, Any] = {
+        "ran": False,
+        "lines": [],
+        "closed": [],
+        "held": [],
+    }
+    now = _chicago_now(now_cdt)
+    if not force and carry_review_already_done(now.date()):
+        return summary
+    if not open_trades:
+        mark_carry_review_done(now.date())
+        summary["ran"] = True
+        return summary
+
+    sess = session_date or _et_session_date()
+    summary["ran"] = True
+    lines: list[str] = []
+
+    for trade in list(open_trades):
+        if not isinstance(trade, dict) or not trade.get("ticker"):
+            continue
+        ticker = str(trade["ticker"])
+        ctx = scored_by_ticker.get(ticker) or scored_by_ticker.get(ticker.upper()) or {}
+        options_dict = ctx.get("options_dict")
+        card = ctx.get("card")
+        pivot_data = ctx.get("pivot_data") or {}
+
+        mark_info = lookup_option_mark(trade, options_dict)
+        entry = _entry_premium(trade)
+        mark = _f(mark_info.get("mark"))
+        pnl = _pnl_pct(entry, mark)
+
+        live_score = _f(getattr(card, "total_score", None)) if card is not None else None
+        today_pivot = _f(pivot_data.get("pivot")) if isinstance(pivot_data, dict) else None
+        entry_score = _f(trade.get("entry_score"))
+        entry_pivot = _f(trade.get("entry_pivot"))
+        entry_dte = _f(trade.get("entry_dte") if trade.get("entry_dte") is not None
+                       else trade.get("entry_calendar_dte"))
+        today_cal = _calendar_dte_for_trade(trade, sess)
+
+        # Persist mark / peak for B4/B5 continuity
+        if mark is not None:
+            record_position_mark(
+                trade, mark_info, live_score=live_score, scan_id=scan_id
+            )
+            if pnl is not None:
+                prev_peak = _f(trade.get("peak_pnl_pct"))
+                if prev_peak is None or pnl > prev_peak:
+                    trade["peak_pnl_pct"] = pnl
+                trade["last_mark"] = mark
+                trade["last_mark_at"] = datetime.now(timezone.utc).isoformat()
+                try:
+                    from tracker_agent import save_active_trade
+                    save_active_trade(trade)
+                except Exception:
+                    pass
+
+        reason, exit_px = evaluate_exit_reason_for_mark(
+            trade,
+            mark,
+            sess=sess,
+            now=now,
+            include_time_stop=False,
+            do_eod=False,
+        )
+
+        # Format line
+        label = _fmt_contract_label(trade)
+        e_s = f"{entry:.2f}" if entry is not None else "?"
+        m_s = f"{mark:.2f}" if mark is not None else "n/a"
+        pnl_s = f"{pnl:+.1f}%" if pnl is not None else "n/a"
+        sc_s = (
+            f"{entry_score:.0f}->{live_score:.0f}"
+            if entry_score is not None and live_score is not None
+            else (
+                f"?->{live_score:.0f}" if live_score is not None
+                else f"{entry_score:.0f}->?" if entry_score is not None else "?->?"
+            )
+        )
+        pv_s = (
+            f"{entry_pivot:.2f}->{today_pivot:.2f}"
+            if entry_pivot is not None and today_pivot is not None
+            else (
+                f"?->{today_pivot:.2f}" if today_pivot is not None
+                else f"{entry_pivot:.2f}->?" if entry_pivot is not None else "?->?"
+            )
+        )
+        dte_s = (
+            f"{entry_dte:g}->{today_cal}"
+            if entry_dte is not None and today_cal is not None
+            else (
+                f"?->{today_cal}" if today_cal is not None
+                else f"{entry_dte:g}->?" if entry_dte is not None else "?->?"
+            )
+        )
+
+        if reason and exit_px is not None:
+            closed = close_open_position(trade, float(exit_px), f"CARRY_{reason}")
+            summary["closed"].append(closed)
+            action = f"CLOSE {reason}"
+        else:
+            summary["held"].append(ticker)
+            action = "HOLD"
+            if mark is None:
+                action = "HOLD (no mark)"
+
+        line = (
+            f"CARRY {label} | entry {e_s} -> {m_s} ({pnl_s}) | "
+            f"score {sc_s} | pivot {pv_s} | dte {dte_s} | {action}"
+        )
+        lines.append(line)
+        print(f"[CarryReview] {line}")
+
+    summary["lines"] = lines
+    mark_carry_review_done(now.date())
+
+    if lines:
+        try:
+            import broadcaster
+            msg = "📋 **CARRY REVIEW**\n" + "\n".join(lines)
+            if len(msg) > 1900:
+                msg = msg[:1850] + "\n…(truncated)"
+            broadcaster.send_discord_alert(msg)
+        except Exception as e:
+            print(f"[CarryReview] Discord warn: {e}")
+
+    return summary
 
 
 def _f(val: Any) -> float | None:
@@ -524,51 +780,15 @@ def run_scan_exits(
                 except Exception as pe:
                     print(f"[Exits] peak/mark persist warn {ticker}: {pe}")
 
-        reason: str | None = None
-        exit_px: float | None = mark
-        exp_d = _parse_exp_date(_trade_expiration(trade))
-        is_0dte = exp_d is not None and exp_d == sess
-
-        # B1 — EOD flatten (highest priority when window active)
-        if do_eod:
-            reason = "EOD_FLATTEN"
-            if exit_px is None and entry is not None:
-                exit_px = entry  # flat if no mark
-        # C-D — 0DTE hard flatten (before soft B5; after EOD)
-        elif is_0dte and is_zero_dte_flatten_window(now):
-            reason = "ZERO_DTE_FLATTEN"
-            if exit_px is None and entry is not None:
-                exit_px = entry
-        else:
-            # B2 — past calendar expiry only (0DTE same-day is still live until
-            # C-D 13:00 CDT / B1 EOD; do not kill 0DTE at the open).
-            if exp_d is not None and exp_d < sess:
-                reason = "EXPIRY_FLATTEN"
-                if exit_px is None and entry is not None:
-                    exit_px = entry
-            # B3 — SL / TP (need a live mark)
-            elif mark is not None:
-                sl = _f(trade.get("stop_loss"))
-                tp = _f(trade.get("take_profit") or trade.get("target_price"))
-                if _sl_breached(mark, sl):
-                    reason = "STOP_LOSS"
-                    exit_px = mark
-                elif _tp_breached(mark, tp):
-                    reason = "TAKE_PROFIT"
-                    exit_px = mark
-                else:
-                    # B5 — path-dependent / time exits
-                    pnl = _pnl_pct(entry, mark)
-                    b5 = _b5_exit_reason(
-                        trade,
-                        mark,
-                        entry,
-                        pnl,
-                        datetime.now(timezone.utc),
-                    )
-                    if b5:
-                        reason = b5
-                        exit_px = mark
+        # B1 selective EOD (cal_dte < CARRY_MIN_DTE only), C-D 0DTE, B2–B5
+        reason, exit_px = evaluate_exit_reason_for_mark(
+            trade,
+            mark,
+            sess=sess,
+            now=now,
+            include_time_stop=True,
+            do_eod=do_eod,
+        )
 
         if reason is None:
             if mark is None:
@@ -596,7 +816,7 @@ def run_scan_exits(
     n_closed = len(summary["closed"])
     print(
         f"[Exits] scan done: closed={n_closed} marks={summary['marks_recorded']} "
-        f"eod={summary['eod_triggered']} "
+        f"eod={summary['eod_triggered']} carry_min_dte={_carry_min_dte()} "
         f"open {summary['open_before']}→{summary['open_after']}"
     )
     return summary

@@ -265,7 +265,7 @@ broadcaster.WEBHOOK_URL = config.DISCORD_WEBHOOK or broadcaster.WEBHOOK_URL
 # 📁 ACTIVE TRADE PERSISTENCE (Tracker handoff)
 # ==========================================
 
-def record_executed_trade(ticker, contract, scan_id=None, card=None):
+def record_executed_trade(ticker, contract, scan_id=None, card=None, pivot_data=None):
     """
     Append a confirmed EXECUTE position to active_trades.json via the
     Tracker agent's atomic save helper (temp file + os.replace).
@@ -274,7 +274,8 @@ def record_executed_trade(ticker, contract, scan_id=None, card=None):
     news_room.db (via save_active_trade) so open trades survive restarts
     when the JSON file is empty.
 
-    Does not alter scoring or execution criteria — persistence only.
+    Stores entry_score / entry_pivot for morning carry review vs next-day
+    static pivot. Does not alter scoring or execution criteria.
     Returns True on successful write.
     """
     if not contract or "error" in contract:
@@ -301,6 +302,31 @@ def record_executed_trade(ticker, contract, scan_id=None, card=None):
     if contract.get("rationale"):
         notes_parts.append(str(contract["rationale"])[:240])
 
+    entry_score = None
+    if card is not None:
+        try:
+            entry_score = float(getattr(card, "total_score", None))
+        except (TypeError, ValueError):
+            entry_score = None
+    entry_pivot = None
+    entry_spot = None
+    if isinstance(pivot_data, dict):
+        try:
+            if pivot_data.get("pivot") is not None:
+                entry_pivot = float(pivot_data["pivot"])
+        except (TypeError, ValueError):
+            entry_pivot = None
+        try:
+            if pivot_data.get("close") is not None:
+                entry_spot = float(pivot_data["close"])
+        except (TypeError, ValueError):
+            entry_spot = None
+    if entry_spot is None and contract.get("spot") is not None:
+        try:
+            entry_spot = float(contract["spot"])
+        except (TypeError, ValueError):
+            pass
+
     trade_payload = {
         # Tracker-compatible core fields
         "trade_id": str(uuid.uuid4()),
@@ -318,6 +344,12 @@ def record_executed_trade(ticker, contract, scan_id=None, card=None):
         "trailing_stop": None,
         "option_contract": option_contract,
         "notes": "; ".join(notes_parts),
+        # Carry-review baseline (judged next day against new static pivot)
+        "entry_score": entry_score,
+        "entry_pivot": entry_pivot,
+        "entry_spot": entry_spot,
+        "entry_calendar_dte": contract.get("calendar_dte"),
+        "entry_dte": contract.get("days_to_expiration"),
     }
 
     # Dual-write: active_trades.json + news_room.db active_trades_store
@@ -1182,7 +1214,12 @@ def run_portfolio_scan(
                         print(f"[CEO] WARNING: virtual paper_buy failed "
                               f"for {ticker}: {broker_err}")
                     record_executed_trade(
-                        ticker, contract, scan_id=scan_id, card=card)
+                        ticker,
+                        contract,
+                        scan_id=scan_id,
+                        card=card,
+                        pivot_data=pivot_data,
+                    )
                     ticker_summary["trade_executed"] = True
                     result["trades"].append({
                         "ticker": ticker,
@@ -1285,11 +1322,10 @@ def run_macro_loop():
         f"MAX_EXPIRY_CALENDAR_DTE={config.MAX_EXPIRY_CALENDAR_DTE}"
     )
     print(
-        f"[SessionCutoffs] NO_NEW_ENTRIES_AFTER_CDT="
-        f"{config.NO_NEW_ENTRIES_AFTER_HOUR:02d}:{config.NO_NEW_ENTRIES_AFTER_MINUTE:02d} "
-        f"EXIT_EOD_FLATTEN_CDT="
+        f"[SessionCutoffs] EXIT_EOD_FLATTEN_CDT="
         f"{config.EXIT_EOD_FLATTEN_HOUR:02d}:{config.EXIT_EOD_FLATTEN_MINUTE:02d} "
-        f"(Chicago; admits blocked after either fires)"
+        f"CARRY_MIN_DTE={config.CARRY_MIN_DTE} "
+        f"(EOD flattens only cal_dte < CARRY_MIN_DTE; multi-day may overnight)"
     )
     # Log-only path inventory (Stage 1). No writes, no restore.
     try:

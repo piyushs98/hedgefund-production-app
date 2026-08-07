@@ -728,24 +728,65 @@ def run_thirty_min_scan(
             import time as _time
             _time.sleep(inter_ticker_sleep)
 
-    # ---- Stage 4 exits (B1–B4): before gate so freed slots are available ----
-    # Reuses phase-1 options_dict marks — no extra yfinance when open ⊆ universe.
+    # ---- Stage 4: carry review (first scan of day) + exits, then gate sync ----
+    # Order is intentional: mark/close carried book BEFORE admits so
+    # sync_open_from_book sees the true open set (no double-admit on carry).
+    # Reuses phase-1 options_dict / scores — no extra yfinance when open ⊆ universe.
     exit_summary: dict[str, Any] = {}
+    carry_summary: dict[str, Any] = {}
     try:
         import position_exits
         from tracker_agent import load_active_trades as _load_open
 
         open_before_exits = _load_open()
+        now_cdt = _chicago_now()
+
+        # Morning carry review once/day before any new entries this session
+        if open_before_exits and not position_exits.carry_review_already_done(
+            now_cdt.date()
+        ):
+            print(
+                f"[scan] CARRY REVIEW: {len(open_before_exits)} open position(s) "
+                f"vs today's pivot/score"
+            )
+            carry_summary = position_exits.run_morning_carry_review(
+                open_before_exits,
+                scored,
+                scan_id=scan_id,
+                now_cdt=now_cdt,
+            )
+            result["carry_review"] = {
+                "ran": carry_summary.get("ran"),
+                "held": carry_summary.get("held"),
+                "closed": [
+                    {
+                        "ticker": c.get("ticker"),
+                        "reason": c.get("reason"),
+                        "exit_price": c.get("exit_price"),
+                        "pnl": c.get("pnl"),
+                    }
+                    for c in (carry_summary.get("closed") or [])
+                ],
+                "lines": carry_summary.get("lines"),
+            }
+            # Reload book after carry closes
+            open_before_exits = _load_open()
+        elif not open_before_exits and not position_exits.carry_review_already_done(
+            now_cdt.date()
+        ):
+            # No open book — still mark review done so we don't re-check all day
+            position_exits.mark_carry_review_done(now_cdt.date())
+
         if open_before_exits:
             print(
                 f"[scan] Stage 4 exits: evaluating {len(open_before_exits)} open "
-                f"position(s) (EOD/expiry/SL/TP + marks)"
+                f"position(s) (selective EOD/expiry/SL/TP + marks)"
             )
             exit_summary = position_exits.run_scan_exits(
                 open_before_exits,
                 scored,
                 scan_id=scan_id,
-                now_cdt=_chicago_now(),
+                now_cdt=now_cdt,
             )
             result["exits"] = {
                 "closed": [
@@ -778,7 +819,7 @@ def run_thirty_min_scan(
         print(f"[scan] Stage 4 exits error (continuing to gate): {exit_err}")
         result["exits_error"] = str(exit_err)
 
-    # ---- Stage 3 gate: sync durable book (post-exit), rank-before-admit ----
+    # ---- Stage 3 gate: sync durable book (post-exit/carry), rank-before-admit ----
     gate = signal_gate.get_gate()
     try:
         from tracker_agent import load_active_trades
@@ -786,6 +827,10 @@ def run_thirty_min_scan(
             t.get("ticker") for t in load_active_trades() if t.get("ticker")
         ]
         gate.sync_open_from_book(open_tickers)
+        print(
+            f"[scan] gate sync_open_from_book: {len(open_tickers)} open "
+            f"{open_tickers} (before admit)"
+        )
     except Exception as sync_err:
         print(f"[scan] gate sync_open_from_book warn: {sync_err}")
 
@@ -862,7 +907,13 @@ def run_thirty_min_scan(
                     except Exception as be:
                         print(f"[{ticker}] paper_buy warn: {be}")
                     try:
-                        record_executed_trade(ticker, contract, scan_id=scan_id, card=card)
+                        record_executed_trade(
+                            ticker,
+                            contract,
+                            scan_id=scan_id,
+                            card=card,
+                            pivot_data=pivot_data,
+                        )
                     except Exception as pe:
                         print(f"[{ticker}] persist warn: {pe}")
                     result["trades"].append({
