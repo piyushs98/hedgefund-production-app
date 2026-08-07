@@ -1129,8 +1129,18 @@ def run_exit_only_pass(
             for c in (exit_summary.get("closed") or [])
         ]
         result["marks_recorded"] = exit_summary.get("marks_recorded")
+        result["positions_checked"] = exit_summary.get("positions_checked")
+        result["marks_ok"] = exit_summary.get("marks_ok")
+        result["marks_failed"] = exit_summary.get("marks_failed")
         result["eod_triggered"] = exit_summary.get("eod_triggered")
         result["open_after"] = exit_summary.get("open_after")
+        # Always log one-line mark health (also printed inside run_scan_exits)
+        print(
+            f"[exit-pass] {clock} CDT marks checked="
+            f"{exit_summary.get('positions_checked')} "
+            f"ok={exit_summary.get('marks_ok')} "
+            f"failed={exit_summary.get('marks_failed')}"
+        )
         if exit_summary.get("closed"):
             try:
                 lines = [

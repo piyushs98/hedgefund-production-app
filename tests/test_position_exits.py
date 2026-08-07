@@ -265,6 +265,39 @@ class TestExitRules(unittest.TestCase):
         self.assertEqual(close.call_args[0][2], "EOD_FLATTEN")
         self.assertEqual(close.call_args[0][0].get("trade_id"), "short")
 
+    def test_mark_fail_streak_alerts_at_two(self):
+        trade = self._trade()
+        trade["mark_fail_streak"] = 1  # already failed once
+        # No options → mark fails
+        scored = {"IWM": {"options_dict": {"current_price": 302.0, "chains": {}}, "card": None}}
+        alerts = []
+
+        def _capture(msg):
+            alerts.append(msg)
+            return True
+
+        with mock.patch("position_exits.close_open_position") as close:
+            with mock.patch("tracker_agent.save_active_trade", return_value=True):
+                with mock.patch("broadcaster.send_discord_alert", side_effect=_capture):
+                    with mock.patch(
+                        "tracker_agent.load_active_trades", return_value=[trade]
+                    ):
+                        with mock.patch.object(config, "MARK_FAIL_ALERT_STREAK", 2):
+                            summary = position_exits.run_scan_exits(
+                                [trade],
+                                scored,
+                                session_date=date(2026, 8, 5),
+                                force_eod=False,
+                                now_cdt=datetime(2026, 8, 5, 11, 0, 0),
+                            )
+        close.assert_not_called()
+        self.assertEqual(summary["marks_failed"], 1)
+        self.assertEqual(summary["marks_ok"], 0)
+        self.assertEqual(summary["positions_checked"], 1)
+        self.assertTrue(summary.get("all_marks_failed"))
+        self.assertTrue(any("MARK FAILED" in a for a in alerts))
+        self.assertIn("marks: checked=1", summary.get("mark_summary_line", ""))
+
     def test_morning_carry_review_hold_line(self):
         trade = self._trade(expiration="2026-08-12")
         trade["entry_score"] = 78.0

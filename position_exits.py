@@ -710,6 +710,33 @@ def _b5_exit_reason(
     return None
 
 
+def _mark_fail_threshold() -> int:
+    return max(1, int(getattr(config, "MARK_FAIL_ALERT_STREAK", 2)))
+
+
+def _alert_mark_failure(trade: dict[str, Any], streak: int, *, all_failed: bool = False) -> None:
+    """Discord CRITICAL when marks fail and stops cannot be checked."""
+    label = _fmt_contract_label(trade)
+    if all_failed:
+        msg = (
+            f"🚨 **CRITICAL: MARK FAILED (all open)**\n"
+            f"`{label}` and other open positions: **0 marks obtained** this pass.\n"
+            f"Stops / TP / trail are **not being checked**. Investigate Yahoo/options."
+        )
+    else:
+        msg = (
+            f"🚨 **CRITICAL: MARK FAILED {label} x{streak}**\n"
+            f"Stop not being checked for this position "
+            f"({streak} consecutive mark failures)."
+        )
+    print(f"[Exits] {msg.replace(chr(10), ' | ')}")
+    try:
+        import broadcaster
+        broadcaster.send_discord_alert(msg)
+    except Exception as e:
+        print(f"[Exits] mark-fail Discord warn: {e}")
+
+
 def run_scan_exits(
     open_trades: list[dict[str, Any]],
     scored_by_ticker: dict[str, dict[str, Any]],
@@ -722,13 +749,22 @@ def run_scan_exits(
     """
     Evaluate every open trade once per scan. Closes mutate the durable book.
 
-    scored_by_ticker: map ticker -> {options_dict, card, ...} from phase-1.
-    Returns summary with closed list and marks_recorded count.
+    scored_by_ticker: map ticker -> {options_dict, card, ...} from phase-1
+    or exit-only chain pulls.
+
+    Mark health: counts positions checked / marks ok / marks failed; persists
+    mark_fail_streak on each trade; Discord CRITICAL after
+    MARK_FAIL_ALERT_STREAK consecutive failures (default 2), and if zero
+    marks while any positions are open.
     """
     summary: dict[str, Any] = {
         "closed": [],
         "marks_recorded": 0,
+        "positions_checked": 0,
+        "marks_ok": 0,
+        "marks_failed": 0,
         "skipped_no_mark": [],
+        "mark_fail_alerts": [],
         "eod_triggered": False,
         "open_before": len(open_trades),
         "open_after": None,
@@ -742,12 +778,14 @@ def run_scan_exits(
     do_eod = force_eod if force_eod is not None else (
         is_eod_flatten_window(now) and not eod_already_done(now.date())
     )
+    fail_threshold = _mark_fail_threshold()
 
     # Work on a shallow copy of the list; closes remove from durable store.
     for trade in list(open_trades):
         if not isinstance(trade, dict) or not trade.get("ticker"):
             continue
         ticker = str(trade["ticker"])
+        summary["positions_checked"] += 1
         ctx = scored_by_ticker.get(ticker) or scored_by_ticker.get(ticker.upper()) or {}
         options_dict = ctx.get("options_dict")
         card = ctx.get("card")
@@ -762,11 +800,13 @@ def run_scan_exits(
         # Always try to record a mark when we have one (B4), including
         # the pre-close observation so the path is complete.
         if mark is not None:
+            summary["marks_ok"] += 1
+            trade["mark_fail_streak"] = 0
             if record_position_mark(
                 trade, mark_info, live_score=live_score, scan_id=scan_id
             ):
                 summary["marks_recorded"] += 1
-            # Track peak for future B5 (no exit rules here)
+            # Track peak for B5
             pnl = _pnl_pct(entry, mark)
             if pnl is not None:
                 prev_peak = _f(trade.get("peak_pnl_pct"))
@@ -774,13 +814,32 @@ def run_scan_exits(
                     trade["peak_pnl_pct"] = pnl
                 trade["last_mark"] = mark
                 trade["last_mark_at"] = datetime.now(timezone.utc).isoformat()
-                try:
-                    from tracker_agent import save_active_trade
-                    save_active_trade(trade)
-                except Exception as pe:
-                    print(f"[Exits] peak/mark persist warn {ticker}: {pe}")
+            try:
+                from tracker_agent import save_active_trade
+                save_active_trade(trade)
+            except Exception as pe:
+                print(f"[Exits] peak/mark persist warn {ticker}: {pe}")
+        else:
+            summary["marks_failed"] += 1
+            summary["skipped_no_mark"].append(ticker)
+            try:
+                streak = int(trade.get("mark_fail_streak") or 0) + 1
+            except (TypeError, ValueError):
+                streak = 1
+            trade["mark_fail_streak"] = streak
+            trade["last_mark_fail_at"] = datetime.now(timezone.utc).isoformat()
+            try:
+                from tracker_agent import save_active_trade
+                save_active_trade(trade)
+            except Exception as pe:
+                print(f"[Exits] mark_fail_streak persist warn {ticker}: {pe}")
+            if streak >= fail_threshold:
+                label = _fmt_contract_label(trade)
+                summary["mark_fail_alerts"].append(f"{label} x{streak}")
+                _alert_mark_failure(trade, streak, all_failed=False)
 
         # B1 selective EOD (cal_dte < CARRY_MIN_DTE only), C-D 0DTE, B2–B5
+        # (include_time_stop=True — carried positions get TIME_STOP on normal passes)
         reason, exit_px = evaluate_exit_reason_for_mark(
             trade,
             mark,
@@ -791,12 +850,9 @@ def run_scan_exits(
         )
 
         if reason is None:
-            if mark is None:
-                summary["skipped_no_mark"].append(ticker)
             continue
 
         if exit_px is None:
-            summary["skipped_no_mark"].append(ticker)
             print(f"[Exits] {ticker} would close ({reason}) but no mark/entry — skip")
             continue
 
@@ -807,6 +863,20 @@ def run_scan_exits(
         mark_eod_done(now.date())
         summary["eod_triggered"] = True
 
+    # Zero marks while book is open → fleet-wide CRITICAL
+    if (
+        summary["positions_checked"] > 0
+        and summary["marks_ok"] == 0
+        and summary["marks_failed"] > 0
+    ):
+        summary["all_marks_failed"] = True
+        # Alert once with first open trade as example
+        sample = next(
+            (t for t in open_trades if isinstance(t, dict) and t.get("ticker")),
+            {"ticker": "?"},
+        )
+        _alert_mark_failure(sample, summary["marks_failed"], all_failed=True)
+
     try:
         from tracker_agent import load_active_trades
         summary["open_after"] = len(load_active_trades())
@@ -814,9 +884,14 @@ def run_scan_exits(
         summary["open_after"] = None
 
     n_closed = len(summary["closed"])
-    print(
-        f"[Exits] scan done: closed={n_closed} marks={summary['marks_recorded']} "
-        f"eod={summary['eod_triggered']} carry_min_dte={_carry_min_dte()} "
+    # One-line health summary every exit pass (log always)
+    mark_line = (
+        f"[Exits] marks: checked={summary['positions_checked']} "
+        f"ok={summary['marks_ok']} failed={summary['marks_failed']} "
+        f"closed={n_closed} eod={summary['eod_triggered']} "
+        f"carry_min_dte={_carry_min_dte()} "
         f"open {summary['open_before']}→{summary['open_after']}"
     )
+    print(mark_line)
+    summary["mark_summary_line"] = mark_line
     return summary
