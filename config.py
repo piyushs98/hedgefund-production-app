@@ -155,6 +155,11 @@ CARRY_MIN_DTE = _env_int("CARRY_MIN_DTE", 2)
 EXIT_ZERO_DTE_FLATTEN_HOUR, EXIT_ZERO_DTE_FLATTEN_MINUTE = _env_hhmm(
     "EXIT_ZERO_DTE_FLATTEN_CDT", "13:00"
 )
+# Split cadence: full score/admit scan vs exit-only mark pass.
+#   FULL_SCAN_INTERVAL_SECONDS  default 1800 (30 min)
+#   EXIT_INTERVAL_SECONDS       default 900  (15 min) — loop tick; full scan every other tick
+FULL_SCAN_INTERVAL_SECONDS = _env_int("FULL_SCAN_INTERVAL_SECONDS", 1800)
+EXIT_INTERVAL_SECONDS = _env_int("EXIT_INTERVAL_SECONDS", 900)
 EXIT_BREAKEVEN_PEAK_PCT = _env_float("EXIT_BREAKEVEN_PEAK_PCT", 25.0)
 EXIT_TRAIL_PEAK_PCT = _env_float("EXIT_TRAIL_PEAK_PCT", 40.0)
 EXIT_TRAIL_GIVEBACK_FRAC = _env_float("EXIT_TRAIL_GIVEBACK_FRAC", 0.30)

@@ -1028,6 +1028,144 @@ def run_thirty_min_scan(
     return result
 
 
+def run_exit_only_pass(
+    breaker: CircuitBreaker,
+    *,
+    inter_ticker_sleep: float = 1.0,
+) -> dict[str, Any]:
+    """
+    Lightweight 15-minute exit pass (Part 3 split cadence).
+
+    - Marks open positions only (options fetch per open ticker)
+    - Selective EOD / 0DTE / SL-TP / B5 path exits
+    - Does NOT score, admit, or open new trades
+    - Syncs gate open book so concurrent slots stay accurate
+    - Discord only when something closes
+    """
+    from master_bot import (
+        MasterBotScanError,
+        _call_with_timeout,
+        API_CALL_TIMEOUT_S,
+    )
+    from data_engineer import fetch_options_data
+    from tracker_agent import load_active_trades
+    import position_exits
+
+    scan_id = f"exit-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    clock = cdt_clock_str()
+    result: dict[str, Any] = {
+        "scan_id": scan_id,
+        "mode": "exit_only",
+        "closed": [],
+        "open_before": 0,
+        "open_after": 0,
+    }
+
+    if breaker.is_open():
+        print("🛑 [exit-pass] Circuit breaker OPEN — exit pass suspended.")
+        result["aborted"] = True
+        return result
+
+    try:
+        open_trades = load_active_trades()
+    except Exception as e:
+        print(f"[exit-pass] load_active_trades failed: {e}")
+        result["error"] = str(e)
+        return result
+
+    result["open_before"] = len(open_trades)
+    if not open_trades:
+        print(f"[exit-pass] {clock} CDT — no open positions; skip mark fetches.")
+        return result
+
+    print(
+        f"\n⏱️ EXIT-ONLY PASS {scan_id} | {clock} CDT | "
+        f"{len(open_trades)} open position(s)"
+    )
+
+    scored: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
+    for i, trade in enumerate(open_trades):
+        ticker = str(trade.get("ticker") or "").upper().strip()
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        try:
+            options_json = _call_with_timeout(
+                lambda t=ticker: fetch_options_data(t),
+                timeout_s=API_CALL_TIMEOUT_S,
+                step=f"exit_yf_options:{ticker}",
+            )
+            options_dict = json.loads(options_json)
+            if "error" in options_dict:
+                print(f"[exit-pass] [{ticker}] options error: {options_dict['error']}")
+                breaker.record_failure(f"exit_options:{ticker}")
+                continue
+            breaker.record_success(f"exit_options:{ticker}")
+            scored[ticker] = {"options_dict": options_dict, "card": None, "pivot_data": {}}
+        except MasterBotScanError as e:
+            print(f"[exit-pass] [{ticker}] isolated: {e.step}: {e.message}")
+            breaker.record_failure(f"exit_options:{ticker}")
+        except Exception as e:
+            print(f"[exit-pass] [{ticker}] error: {e}")
+        if i < len(open_trades) - 1 and inter_ticker_sleep:
+            import time as _time
+            _time.sleep(inter_ticker_sleep)
+
+    try:
+        exit_summary = position_exits.run_scan_exits(
+            open_trades,
+            scored,
+            scan_id=scan_id,
+            now_cdt=_chicago_now(),
+        )
+        result["closed"] = [
+            {
+                "ticker": c.get("ticker"),
+                "reason": c.get("reason"),
+                "exit_price": c.get("exit_price"),
+                "pnl": c.get("pnl"),
+            }
+            for c in (exit_summary.get("closed") or [])
+        ]
+        result["marks_recorded"] = exit_summary.get("marks_recorded")
+        result["eod_triggered"] = exit_summary.get("eod_triggered")
+        result["open_after"] = exit_summary.get("open_after")
+        if exit_summary.get("closed"):
+            try:
+                lines = [
+                    f"**{c.get('ticker')}** {c.get('reason')} "
+                    f"@ ${c.get('exit_price')}"
+                    + (f" PnL ${c.get('pnl'):.0f}" if c.get("pnl") is not None else "")
+                    for c in exit_summary["closed"]
+                ]
+                broadcaster.send_discord_alert(
+                    f"📉 **EXIT PASS [{clock} CDT]**\n" + "\n".join(lines)
+                )
+            except Exception as disc_err:
+                print(f"[exit-pass] Discord warn: {disc_err}")
+    except Exception as e:
+        print(f"[exit-pass] exits error: {e}")
+        result["error"] = str(e)
+
+    # Keep gate concurrent book aligned (no admits on this path)
+    try:
+        gate = signal_gate.get_gate()
+        remaining = [
+            t.get("ticker") for t in load_active_trades() if t.get("ticker")
+        ]
+        gate.sync_open_from_book(remaining)
+        print(f"[exit-pass] gate synced open={remaining}")
+    except Exception as se:
+        print(f"[exit-pass] gate sync warn: {se}")
+
+    print(
+        f"✅ EXIT-ONLY {scan_id} complete | closed={len(result.get('closed') or [])} "
+        f"open {result.get('open_before')}→{result.get('open_after')}"
+    )
+    return result
+
+
 # Backward-compatible alias used by older call sites / docs
 def run_midday_delta_scan(*args, **kwargs):
     """Alias → run_thirty_min_scan (30-min radar; no midday macro header)."""

@@ -1298,6 +1298,7 @@ def run_macro_loop():
     """
     from midday_delta import (
         run_thirty_min_scan,
+        run_exit_only_pass,
         run_midday_macro_meeting,
         is_midday_macro_window,
         load_baseline,
@@ -1307,11 +1308,14 @@ def run_macro_loop():
     # Optional escape hatch: FULL_LLM_INTRADAY=true restores the old heavy scan.
     full_llm_intraday = os.environ.get("FULL_LLM_INTRADAY", "false").lower() == "true"
 
-    print("\n--- INITIATING MASTER BOT (30-min radar + 11:00 CDT midday macro) ---")
+    print(
+        "\n--- INITIATING MASTER BOT "
+        "(15-min exits / 30-min full scan + 11:00 CDT midday macro) ---"
+    )
     print(f"Loaded Tickers: {TICKERS}")
     print(
         f"[System] Intraday mode: "
-        f"{'FULL LLM escape hatch' if full_llm_intraday else '30-MIN SCAN table + isolated 11:00 CDT macro'}"
+        f"{'FULL LLM escape hatch' if full_llm_intraday else 'split cadence: EXIT every 15m, FULL score/admit every 30m'}"
     )
     config.assert_secrets(require_discord=False)
     # Resolved Part C knobs (env at process start — restart to retune without code change)
@@ -1356,7 +1360,21 @@ def run_macro_loop():
     morning_macro_context = ""
     last_briefing_date = None
     last_midday_macro_date = None  # once/day 11:00 CDT isolation
-    scan_interval = 1800  # 30-minute active loop
+    # Split cadence (Part 3): loop ticks every EXIT_INTERVAL; full score/admit
+    # on alternate ticks (or when FULL_SCAN_INTERVAL elapsed).
+    exit_interval = int(getattr(config, "EXIT_INTERVAL_SECONDS", 900) or 900)
+    full_scan_interval = int(
+        getattr(config, "FULL_SCAN_INTERVAL_SECONDS", 1800) or 1800
+    )
+    if exit_interval < 60:
+        exit_interval = 60
+    if full_scan_interval < exit_interval:
+        full_scan_interval = exit_interval
+    last_full_scan_mono = 0.0  # force full scan on first trading tick
+    print(
+        f"[Cadence] EXIT_INTERVAL={exit_interval}s "
+        f"FULL_SCAN_INTERVAL={full_scan_interval}s"
+    )
     CRITICAL_ERROR_BACKOFF_S = 60
 
     while True:
@@ -1509,7 +1527,12 @@ def run_macro_loop():
                         # Still mark date to avoid retry spam every loop minute
                         last_midday_macro_date = now_cdt.date()
 
-                # ---- 2) Standard 30-minute scan (table schema only) ----
+                # ---- 2) Split cadence: full score/admit OR exit-only ----
+                now_mono = time.monotonic()
+                need_full = (
+                    last_full_scan_mono <= 0
+                    or (now_mono - last_full_scan_mono) >= full_scan_interval
+                )
                 if full_llm_intraday:
                     print("[System State] FULL_LLM_INTRADAY=true — heavy portfolio scan.")
                     run_portfolio_scan(
@@ -1517,18 +1540,33 @@ def run_macro_loop():
                         breaker,
                         include_session_open_context=True,
                     )
-                else:
+                    last_full_scan_mono = time.monotonic()
+                elif need_full:
                     print(
-                        "[System State] 30-MIN SCAN — single Discord table; "
+                        "[System State] FULL SCAN (score/admit) — single Discord table; "
                         "no Midday Macro header on this payload."
                     )
                     run_thirty_min_scan(
                         breaker,
                         morning_macro_context=morning_macro_context,
                     )
+                    last_full_scan_mono = time.monotonic()
+                else:
+                    print(
+                        "[System State] EXIT-ONLY PASS (15-min) — mark open book, "
+                        "no new admits."
+                    )
+                    try:
+                        run_exit_only_pass(breaker)
+                    except Exception as exit_pass_err:
+                        print(f"[System] exit-only pass failed: {exit_pass_err}")
 
-                print(f"Sleeping up to {scan_interval // 60} minutes before next scan...")
-                for _ in range(scan_interval // 60):
+                sleep_secs = exit_interval
+                print(
+                    f"Sleeping up to {sleep_secs // 60} minutes "
+                    f"(exit tick; full scan every {full_scan_interval // 60}m)..."
+                )
+                for _ in range(max(1, sleep_secs // 60)):
                     time.sleep(60)
                     # Wake early into the 11:00 CDT window so macro isn't missed
                     woke = datetime.now(cdt_tz) if cdt_tz else datetime.now(est_tz)

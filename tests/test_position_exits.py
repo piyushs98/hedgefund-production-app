@@ -25,6 +25,9 @@ class TestGateDefaults(unittest.TestCase):
         self.assertEqual(config.GATE_FLIP_LOCK_MINUTES, 60)
         self.assertEqual(config.GATE_FLIP_OVERRIDE_SCORE, 85.0)
         self.assertEqual(config.GATE_REENTRY_COOLDOWN_MINUTES, 45)
+        self.assertEqual(config.CARRY_MIN_DTE, 2)
+        self.assertEqual(config.EXIT_INTERVAL_SECONDS, 900)
+        self.assertEqual(config.FULL_SCAN_INTERVAL_SECONDS, 1800)
 
 
 class TestMarkLookup(unittest.TestCase):
