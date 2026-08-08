@@ -211,17 +211,28 @@ def _passes_entry_filters(
     cal_dte: int,
     rm_atr: float | None,
     dens: float | None,
+    extrinsic: float | None = None,
+    extrinsic_pct: float | None = None,
 ) -> tuple[bool, str | None]:
     """
     Return (ok, reject_tag). reject_tag is compact for GATE lines:
-      min_dte(0) | rm_atr(0.61>0.50) | decay(9.3>8.0)
+      min_dte(0) | rm_atr(0.61>0.50) | decay(9.3>8.0) | bad_quote(ext=…) | min_ext(1.5<10)
     """
     min_dte = int(getattr(config, "MIN_DTE", 1))
     k = float(getattr(config, "REQUIRED_MOVE_ATR_K", 0.5))
     max_dens = float(getattr(config, "EXIT_MAX_DECAY_DENSITY", 8.0))
+    min_ext_pct = float(getattr(config, "MIN_EXTRINSIC_PCT", 10.0))
 
     if cal_dte < min_dte:
         return False, f"min_dte({cal_dte})"
+    # Stale/crossed mid: extrinsic cannot be non-positive in a real market
+    if extrinsic is not None and extrinsic <= 0:
+        return False, f"bad_quote(ext={extrinsic:.2f})"
+    if extrinsic_pct is not None and extrinsic_pct <= 0:
+        return False, f"bad_quote(ext%={extrinsic_pct:.1f})"
+    # Deep ITM / synthetic stock — low theta density but pure delta risk
+    if extrinsic_pct is not None and extrinsic_pct < min_ext_pct:
+        return False, f"min_ext({extrinsic_pct:.1f}<{min_ext_pct:.0f})"
     if rm_atr is not None and rm_atr > k:
         return False, f"rm_atr({rm_atr:.2f}>{k:.2f})"
     if dens is not None and dens > max_dens:
@@ -343,6 +354,8 @@ def select_optimal_contract(options_dict, pivot_data, atr_abs=None, now=None):
             cal_dte=cand["cal_dte"],
             rm_atr=cand["required_move_atr"],
             dens=cand["decay_density"],
+            extrinsic=cand.get("extrinsic"),
+            extrinsic_pct=cand.get("extrinsic_pct"),
         )
         if not ok:
             tag = why or "filter"

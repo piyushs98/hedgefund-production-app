@@ -129,6 +129,20 @@ class TestEntryFilters(unittest.TestCase):
         self.assertAlmostEqual(dens, 93.0 / 5.5, places=2)
         self.assertGreater(dens, 8.0)
 
+    def test_bad_quote_negative_extrinsic(self):
+        ok, tag = ss._passes_entry_filters(
+            cal_dte=2, rm_atr=0.1, dens=1.0, extrinsic=-0.59, extrinsic_pct=-4.8
+        )
+        self.assertFalse(ok)
+        self.assertIn("bad_quote", tag or "")
+
+    def test_min_extrinsic_pct(self):
+        ok, tag = ss._passes_entry_filters(
+            cal_dte=2, rm_atr=0.1, dens=1.0, extrinsic=0.20, extrinsic_pct=1.5
+        )
+        self.assertFalse(ok)
+        self.assertIn("min_ext", tag or "")
+
 
 class TestRequiredMove(unittest.TestCase):
     def test_call_breakeven(self):

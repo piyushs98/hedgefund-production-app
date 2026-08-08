@@ -38,6 +38,7 @@ class TickerState:
     direction: str | None = None
     streak: int = 0
     last_entry_at: datetime | None = None
+    last_exit_at: datetime | None = None  # real close only (not rollback)
     last_flip_at: datetime | None = None
     position_open: bool = False
     entries_today: int = 0
@@ -50,6 +51,7 @@ class GateConfig:
     flip_lock_minutes: int = 60
     flip_override_score: float = 85.0
     reentry_cooldown_minutes: int = 45
+    post_exit_cooldown_minutes: int = 45
     max_entries_per_ticker: int = 3
     max_concurrent: int = 5
     allow_pyramiding: bool = False
@@ -87,17 +89,23 @@ class SignalGate:
         key = str(ticker).upper().strip()
         return self.state.setdefault(key, TickerState())
 
-    def on_close(self, ticker: str) -> None:
+    def on_close(self, ticker: str, closed_at: datetime | None = None) -> None:
         """
         Free a concurrent slot when a REAL position is closed.
 
-        Does not touch entries_today or last_entry_at (those track real entries
-        and cooldown). For failed contract selection after admit, use
-        rollback_admit() instead.
+        Sets last_exit_at for GATE_POST_EXIT_COOLDOWN (anti-churn).
+        Does not touch entries_today. For failed contract selection after
+        admit, use rollback_admit() instead.
         """
+        from datetime import timezone as _tz
+
         key = str(ticker).upper().strip()
         st = self._st(key)
         st.position_open = False
+        when = closed_at or datetime.now(_tz.utc)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=_tz.utc)
+        st.last_exit_at = when
         self._open.discard(key)
         # Real exit: drop any unused admit snapshot
         self._admit_snapshots.pop(key, None)
@@ -194,17 +202,58 @@ class SignalGate:
 
         return True, f"eligible (score {score:.1f}, streak {st.streak})", st
 
-    def _try_admit(self, ticker: str, direction: str, score: float,
-                   now: datetime) -> GateDecision:
+    def _try_admit(
+        self,
+        ticker: str,
+        direction: str,
+        score: float,
+        now: datetime,
+        *,
+        closed_this_scan: set[str] | None = None,
+    ) -> GateDecision:
         """Apply book/cooldown/cap checks and admit if possible. Call after ranking."""
         c, st = self.cfg, self._st(ticker)
         direction = _norm_direction(direction) or direction
+        key = str(ticker).upper().strip()
+
+        # Same-scan close → never re-open (churn / free round-trip)
+        blocked = {str(t).upper().strip() for t in (closed_this_scan or ()) if t}
+        if key in blocked:
+            return GateDecision(
+                ticker=ticker, admit=False,
+                reason="same_scan_exit: closed this scan — no re-admit",
+                score=score, direction=direction,
+            )
 
         if st.position_open and not c.allow_pyramiding:
             return GateDecision(
                 ticker=ticker, admit=False, reason="position already open on this ticker",
                 score=score, direction=direction,
             )
+
+        # Primary anti-churn: cooldown from last EXIT (not entry)
+        if st.last_exit_at is not None and c.post_exit_cooldown_minutes > 0:
+            exit_at = st.last_exit_at
+            now_cmp = now
+            if exit_at.tzinfo is None and now_cmp.tzinfo is not None:
+                exit_at = exit_at.replace(tzinfo=now_cmp.tzinfo)
+            elif exit_at.tzinfo is not None and now_cmp.tzinfo is None:
+                now_cmp = now_cmp.replace(tzinfo=exit_at.tzinfo)
+            try:
+                cool_x = (now_cmp - exit_at).total_seconds() / 60.0
+            except TypeError:
+                cool_x = (
+                    now.replace(tzinfo=None) - exit_at.replace(tzinfo=None)
+                ).total_seconds() / 60.0
+            if cool_x < c.post_exit_cooldown_minutes:
+                return GateDecision(
+                    ticker=ticker, admit=False,
+                    reason=(
+                        f"post_exit_cooldown {cool_x:.0f}/"
+                        f"{c.post_exit_cooldown_minutes}m"
+                    ),
+                    score=score, direction=direction,
+                )
 
         if st.last_entry_at:
             cool = (now - st.last_entry_at).total_seconds() / 60.0
@@ -229,7 +278,6 @@ class SignalGate:
                 score=score, direction=direction,
             )
 
-        key = str(ticker).upper().strip()
         # Snapshot pre-admit state so strike failures can fully roll back
         self._admit_snapshots[key] = (st.last_entry_at, int(st.entries_today))
         st.direction = direction
@@ -247,6 +295,7 @@ class SignalGate:
         self,
         observations: list[Observation],
         now: datetime,
+        closed_this_scan: Iterable[str] | None = None,
     ) -> list[GateDecision]:
         """
         Process one full scan cycle.
@@ -254,9 +303,11 @@ class SignalGate:
         1. Prefilter every observation (updates streaks; PASS resets).
         2. Sort eligible candidates by score descending.
         3. Admit in conviction order against concurrent / cooldown / caps.
+        closed_this_scan: tickers closed earlier in this scan — never re-admit.
         """
         decisions: dict[str, GateDecision] = {}
         eligible: list[tuple[str, str, float, str]] = []  # ticker, dir, score, pre_reason
+        closed_set = {str(t).upper().strip() for t in (closed_this_scan or ()) if t}
 
         for obs in observations:
             ticker = str(obs.ticker).upper().strip()
@@ -289,7 +340,9 @@ class SignalGate:
         eligible.sort(key=lambda x: (-x[2], x[0]))
 
         for rank, (ticker, direction, score, _pre) in enumerate(eligible, start=1):
-            dec = self._try_admit(ticker, direction, score, now)
+            dec = self._try_admit(
+                ticker, direction, score, now, closed_this_scan=closed_set
+            )
             dec.conviction_rank = rank
             decisions[ticker] = dec
 
@@ -346,6 +399,10 @@ class SignalGate:
 
 def _compact_reason(reason: str) -> str:
     r = reason.lower()
+    if "same_scan" in r:
+        return "same_scan_exit"
+    if "post_exit" in r:
+        return "post_exit_cd"
     if "persistence" in r:
         return "persist"
     if "direction lock" in r:
@@ -389,6 +446,9 @@ def gate_config_from_env() -> GateConfig:
         reentry_cooldown_minutes=int(
             getattr(_cfg, "GATE_REENTRY_COOLDOWN_MINUTES", 45)
         ),
+        post_exit_cooldown_minutes=int(
+            getattr(_cfg, "GATE_POST_EXIT_COOLDOWN_MINUTES", 45)
+        ),
         max_entries_per_ticker=int(
             getattr(_cfg, "GATE_MAX_ENTRIES_PER_TICKER", 3)
         ),
@@ -405,7 +465,9 @@ def get_gate() -> SignalGate:
         print(
             f"[Gate] init max_entries/ticker={cfg.max_entries_per_ticker} "
             f"max_concurrent={cfg.max_concurrent} persist={cfg.persist_cycles} "
-            f"flip_lock={cfg.flip_lock_minutes}m cooldown={cfg.reentry_cooldown_minutes}m "
+            f"flip_lock={cfg.flip_lock_minutes}m "
+            f"entry_cd={cfg.reentry_cooldown_minutes}m "
+            f"post_exit_cd={cfg.post_exit_cooldown_minutes}m "
             f"threshold={cfg.threshold}"
         )
         log_entry_filter_config()

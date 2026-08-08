@@ -159,6 +159,7 @@ def evaluate_exit_reason_for_mark(
     now: datetime,
     include_time_stop: bool = True,
     do_eod: bool = False,
+    live_score: float | None = None,
 ) -> tuple[str | None, float | None]:
     """
     Shared exit decision for scan exits and morning carry review.
@@ -202,9 +203,11 @@ def evaluate_exit_reason_for_mark(
         return "TAKE_PROFIT", mark
 
     pnl = _pnl_pct(entry, mark)
-    # Path rules (optional time stop)
+    # Path rules (optional time stop with score exempt)
     if include_time_stop:
-        b5 = _b5_exit_reason(trade, mark, entry, pnl, datetime.now(timezone.utc))
+        b5 = _b5_exit_reason(
+            trade, mark, entry, pnl, datetime.now(timezone.utc), live_score=live_score
+        )
         if b5:
             return b5, mark
     else:
@@ -670,12 +673,14 @@ def _b5_exit_reason(
     entry: float | None,
     pnl: float | None,
     now_utc: datetime,
+    live_score: float | None = None,
 ) -> str | None:
     """
     B5 rules (checked after hard SL/TP):
       * breakeven lock: peak >= +25% and mark back to entry
       * trailing giveback: peak >= +40% and pnl <= peak * (1 - giveback_frac)
-      * time stop: open > 90m and |pnl| < 10%
+      * time stop: open > 90m and |pnl| < 10% — skipped when live_score
+        (or trade last_live_score) >= TIME_STOP_SCORE_EXEMPT
     """
     if entry is None or pnl is None:
         return None
@@ -689,6 +694,7 @@ def _b5_exit_reason(
     giveback = float(getattr(config, "EXIT_TRAIL_GIVEBACK_FRAC", 0.30))
     t_min = int(getattr(config, "EXIT_TIME_STOP_MINUTES", 90))
     t_band = float(getattr(config, "EXIT_TIME_STOP_PNL_ABS_PCT", 10.0))
+    score_exempt = float(getattr(config, "TIME_STOP_SCORE_EXEMPT", 80.0))
 
     # Breakeven lock: was up enough, mark back to entry (or worse)
     if peak >= be_peak and mark <= entry:
@@ -700,7 +706,13 @@ def _b5_exit_reason(
         if pnl <= floor_pnl:
             return "TRAILING_GIVEBACK"
 
-    # Time stop: dead money
+    # Time stop: dead money — not when thesis still strong
+    score = live_score
+    if score is None:
+        score = _f(trade.get("last_live_score"))
+    if score is not None and score >= score_exempt:
+        return None
+
     ent = _parse_entry_time(trade)
     if ent is not None:
         age_min = (now_utc - ent.astimezone(timezone.utc)).total_seconds() / 60.0
@@ -802,6 +814,8 @@ def run_scan_exits(
         if mark is not None:
             summary["marks_ok"] += 1
             trade["mark_fail_streak"] = 0
+            if live_score is not None:
+                trade["last_live_score"] = live_score
             if record_position_mark(
                 trade, mark_info, live_score=live_score, scan_id=scan_id
             ):
@@ -839,7 +853,7 @@ def run_scan_exits(
                 _alert_mark_failure(trade, streak, all_failed=False)
 
         # B1 selective EOD (cal_dte < CARRY_MIN_DTE only), C-D 0DTE, B2–B5
-        # (include_time_stop=True — carried positions get TIME_STOP on normal passes)
+        # TIME_STOP uses live_score or last_live_score; exempt if >= TIME_STOP_SCORE_EXEMPT
         reason, exit_px = evaluate_exit_reason_for_mark(
             trade,
             mark,
@@ -847,6 +861,7 @@ def run_scan_exits(
             now=now,
             include_time_stop=True,
             do_eod=do_eod,
+            live_score=live_score,
         )
 
         if reason is None:

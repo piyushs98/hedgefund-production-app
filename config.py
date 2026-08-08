@@ -134,7 +134,10 @@ GATE_MAX_CONCURRENT = _env_int("GATE_MAX_CONCURRENT", 10)
 GATE_PERSIST_CYCLES = _env_int("GATE_PERSIST_CYCLES", 2)
 GATE_FLIP_LOCK_MINUTES = _env_int("GATE_FLIP_LOCK_MINUTES", 60)
 GATE_FLIP_OVERRIDE_SCORE = _env_float("GATE_FLIP_OVERRIDE_SCORE", 85.0)
+# Legacy: cooldown from last entry (still applied). Prefer post-exit for churn.
 GATE_REENTRY_COOLDOWN_MINUTES = _env_int("GATE_REENTRY_COOLDOWN_MINUTES", 45)
+# Primary anti-churn: no re-admit until N minutes after last real EXIT.
+GATE_POST_EXIT_COOLDOWN_MINUTES = _env_int("GATE_POST_EXIT_COOLDOWN_MINUTES", 45)
 
 # ------------------------------------------------------------------
 # Stage 4 deterministic exits (30-min scan path — no tracker / no Gemini).
@@ -157,9 +160,9 @@ EXIT_ZERO_DTE_FLATTEN_HOUR, EXIT_ZERO_DTE_FLATTEN_MINUTE = _env_hhmm(
 )
 # Split cadence: full score/admit scan vs exit-only mark pass.
 #   FULL_SCAN_INTERVAL_SECONDS  default 1800 (30 min)
-#   EXIT_INTERVAL_SECONDS       default 900  (15 min) — loop tick; full scan every other tick
+#   EXIT_INTERVAL_SECONDS       default 300  (5 min) — loop tick
 FULL_SCAN_INTERVAL_SECONDS = _env_int("FULL_SCAN_INTERVAL_SECONDS", 1800)
-EXIT_INTERVAL_SECONDS = _env_int("EXIT_INTERVAL_SECONDS", 900)
+EXIT_INTERVAL_SECONDS = _env_int("EXIT_INTERVAL_SECONDS", 300)
 # Consecutive failed option marks before Discord CRITICAL (stop not checked).
 MARK_FAIL_ALERT_STREAK = _env_int("MARK_FAIL_ALERT_STREAK", 2)
 EXIT_BREAKEVEN_PEAK_PCT = _env_float("EXIT_BREAKEVEN_PEAK_PCT", 25.0)
@@ -167,6 +170,8 @@ EXIT_TRAIL_PEAK_PCT = _env_float("EXIT_TRAIL_PEAK_PCT", 40.0)
 EXIT_TRAIL_GIVEBACK_FRAC = _env_float("EXIT_TRAIL_GIVEBACK_FRAC", 0.30)
 EXIT_TIME_STOP_MINUTES = _env_int("EXIT_TIME_STOP_MINUTES", 90)
 EXIT_TIME_STOP_PNL_ABS_PCT = _env_float("EXIT_TIME_STOP_PNL_ABS_PCT", 10.0)
+# Skip TIME_STOP when live (or last) underlying score is still this strong.
+TIME_STOP_SCORE_EXEMPT = _env_float("TIME_STOP_SCORE_EXEMPT", 80.0)
 
 # ------------------------------------------------------------------
 # Stage 4 Part C — entry filters (strike_selector). Env-overridable.
@@ -174,11 +179,13 @@ EXIT_TIME_STOP_PNL_ABS_PCT = _env_float("EXIT_TIME_STOP_PNL_ABS_PCT", 10.0)
 #   MAX_EXPIRY_CALENDAR_DTE     default 10  (how far Yahoo chains we load)
 #   REQUIRED_MOVE_ATR_K         default 0.5 (reject if need/(ATR*√dte) > k)
 #   EXIT_MAX_DECAY_DENSITY      default 8.0 (% extrinsic per RTH hour to expiry)
+#   MIN_EXTRINSIC_PCT           default 10  (reject deep-ITM / synthetic stock)
 # ------------------------------------------------------------------
 MIN_DTE = _env_int("MIN_DTE", 1)
 MAX_EXPIRY_CALENDAR_DTE = _env_int("MAX_EXPIRY_CALENDAR_DTE", 10)
 REQUIRED_MOVE_ATR_K = _env_float("REQUIRED_MOVE_ATR_K", 0.5)
 EXIT_MAX_DECAY_DENSITY = _env_float("EXIT_MAX_DECAY_DENSITY", 8.0)
+MIN_EXTRINSIC_PCT = _env_float("MIN_EXTRINSIC_PCT", 10.0)
 
 
 def _init_weights_table():

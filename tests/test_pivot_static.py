@@ -168,6 +168,7 @@ class TestSignalGateRanking(unittest.TestCase):
                 persist_cycles=1,
                 max_entries_per_ticker=1,
                 reentry_cooldown_minutes=45,
+                post_exit_cooldown_minutes=45,
             )
         )
         t0 = datetime(2026, 8, 5, 15, 0, 0, tzinfo=timezone.utc)
@@ -194,6 +195,53 @@ class TestSignalGateRanking(unittest.TestCase):
             d2[0].admit,
             f"expected re-admit after rollback, got {d2[0].reason}",
         )
+
+    def test_post_exit_cooldown_blocks_readmit(self):
+        from datetime import timedelta, timezone
+        from signal_gate import SignalGate, GateConfig, Observation
+
+        gate = SignalGate(
+            GateConfig(
+                max_concurrent=5,
+                persist_cycles=1,
+                reentry_cooldown_minutes=0,  # isolate post-exit
+                post_exit_cooldown_minutes=45,
+            )
+        )
+        t0 = datetime(2026, 8, 7, 15, 0, 0, tzinfo=timezone.utc)
+        self.assertTrue(
+            gate.process_scan([Observation("SPY", 90, "C", "EXECUTE")], t0)[0].admit
+        )
+        gate.on_close("SPY", closed_at=t0)
+        t1 = t0 + timedelta(minutes=10)
+        d = gate.process_scan([Observation("SPY", 91, "C", "EXECUTE")], t1)
+        self.assertFalse(d[0].admit)
+        self.assertIn("post_exit_cooldown", d[0].reason)
+        t2 = t0 + timedelta(minutes=50)
+        d2 = gate.process_scan([Observation("SPY", 91, "C", "EXECUTE")], t2)
+        self.assertTrue(d2[0].admit, d2[0].reason)
+
+    def test_same_scan_exit_blocks_readmit(self):
+        from datetime import timezone
+        from signal_gate import SignalGate, GateConfig, Observation
+
+        gate = SignalGate(
+            GateConfig(
+                max_concurrent=5,
+                persist_cycles=1,
+                reentry_cooldown_minutes=0,
+                post_exit_cooldown_minutes=0,
+            )
+        )
+        now = datetime(2026, 8, 7, 16, 0, 0, tzinfo=timezone.utc)
+        d = gate.process_scan(
+            [Observation("QQQ", 88, "C", "EXECUTE")],
+            now,
+            closed_this_scan={"QQQ"},
+        )
+        self.assertFalse(d[0].admit)
+        self.assertIn("same_scan", d[0].reason)
+
 
 if __name__ == "__main__":
     unittest.main()

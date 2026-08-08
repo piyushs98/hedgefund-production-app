@@ -852,8 +852,22 @@ def run_thirty_min_scan(
             )
         )
 
+    # Tickers closed earlier this scan must not be re-admitted (anti-churn)
+    closed_this_scan = {
+        str(c.get("ticker") or "").upper().strip()
+        for c in (exit_summary.get("closed") or [])
+        if c.get("ticker")
+    }
+    # Carry-review closes also count
+    for c in (carry_summary.get("closed") or []):
+        if c.get("ticker"):
+            closed_this_scan.add(str(c["ticker"]).upper().strip())
+    closed_this_scan.discard("")
+
     now_utc = datetime.now(timezone.utc)
-    gate_decisions = gate.process_scan(observations, now_utc)
+    gate_decisions = gate.process_scan(
+        observations, now_utc, closed_this_scan=closed_this_scan
+    )
     gate_by_ticker = {d.ticker: d for d in gate_decisions}
     gate_summary = gate.format_scan_summary(gate_decisions)
     print(f"[scan] {gate_summary}")
