@@ -1045,23 +1045,22 @@ def run_thirty_min_scan(
 def run_exit_only_pass(
     breaker: CircuitBreaker,
     *,
-    inter_ticker_sleep: float = 1.0,
+    inter_ticker_sleep: float = 0.5,
 ) -> dict[str, Any]:
     """
-    Lightweight 15-minute exit pass (Part 3 split cadence).
+    Lightweight off-cycle exit pass (default every 5 min).
 
-    - Marks open positions only (options fetch per open ticker)
-    - Selective EOD / 0DTE / SL-TP / B5 path exits
-    - Does NOT score, admit, or open new trades
-    - Syncs gate open book so concurrent slots stay accurate
-    - Discord only when something closes
+    - Quotes each open contract via fetch_contract_quote (one expiry, one strike)
+    - Falls back to full fetch_options_data only if the light path fails
+    - Selective EOD / 0DTE / SL-TP / B5 — no score, admit, or LLM
+    - Syncs gate open book; Discord only when something closes
     """
     from master_bot import (
         MasterBotScanError,
         _call_with_timeout,
         API_CALL_TIMEOUT_S,
     )
-    from data_engineer import fetch_options_data
+    from data_engineer import fetch_options_data, fetch_contract_quote
     from tracker_agent import load_active_trades
     import position_exits
 
@@ -1073,6 +1072,7 @@ def run_exit_only_pass(
         "closed": [],
         "open_before": 0,
         "open_after": 0,
+        "quote_mode_counts": {"single_contract": 0, "full_chain_fallback": 0, "failed": 0},
     }
 
     if breaker.is_open():
@@ -1094,37 +1094,103 @@ def run_exit_only_pass(
 
     print(
         f"\n⏱️ EXIT-ONLY PASS {scan_id} | {clock} CDT | "
-        f"{len(open_trades)} open position(s)"
+        f"{len(open_trades)} open position(s) | single-contract quotes"
     )
 
+    # Key quotes by trade identity so multi-leg same ticker (if any) stays correct.
+    # lookup in run_scan_exits is by ticker — one options_dict per ticker is enough
+    # under no-pyramiding (one open per ticker).
     scored: dict[str, dict[str, Any]] = {}
-    seen: set[str] = set()
     for i, trade in enumerate(open_trades):
-        ticker = str(trade.get("ticker") or "").upper().strip()
-        if not ticker or ticker in seen:
+        if not isinstance(trade, dict):
             continue
-        seen.add(ticker)
-        try:
-            options_json = _call_with_timeout(
-                lambda t=ticker: fetch_options_data(t),
-                timeout_s=API_CALL_TIMEOUT_S,
-                step=f"exit_yf_options:{ticker}",
-            )
-            options_dict = json.loads(options_json)
-            if "error" in options_dict:
-                print(f"[exit-pass] [{ticker}] options error: {options_dict['error']}")
+        ticker = str(trade.get("ticker") or "").upper().strip()
+        if not ticker:
+            continue
+        exp = trade.get("expiration") or (
+            (trade.get("option_contract") or {}).get("expiration")
+            if isinstance(trade.get("option_contract"), dict)
+            else None
+        )
+        strike = trade.get("strike")
+        if strike is None and isinstance(trade.get("option_contract"), dict):
+            strike = trade["option_contract"].get("strike")
+        direction = trade.get("direction") or (
+            (trade.get("option_contract") or {}).get("direction")
+            if isinstance(trade.get("option_contract"), dict)
+            else "CALL"
+        )
+
+        options_dict = None
+        mode = "failed"
+        # --- light path: one expiry + one strike ---
+        if exp and strike is not None:
+            try:
+                options_json = _call_with_timeout(
+                    lambda t=ticker, e=exp, s=strike, d=direction: fetch_contract_quote(
+                        t, e, s, d
+                    ),
+                    timeout_s=API_CALL_TIMEOUT_S,
+                    step=f"exit_yf_quote:{ticker}",
+                )
+                od = json.loads(options_json)
+                if "error" not in od:
+                    options_dict = od
+                    mode = "single_contract"
+                else:
+                    print(
+                        f"[exit-pass] [{ticker}] light quote failed: {od.get('error')} "
+                        f"— trying full chain"
+                    )
+            except MasterBotScanError as e:
+                print(f"[exit-pass] [{ticker}] light quote timeout: {e.message}")
+            except Exception as e:
+                print(f"[exit-pass] [{ticker}] light quote error: {e}")
+
+        # --- fallback: full multi-expiry chain ---
+        if options_dict is None:
+            try:
+                options_json = _call_with_timeout(
+                    lambda t=ticker: fetch_options_data(t),
+                    timeout_s=API_CALL_TIMEOUT_S,
+                    step=f"exit_yf_options_fallback:{ticker}",
+                )
+                od = json.loads(options_json)
+                if "error" not in od:
+                    options_dict = od
+                    mode = "full_chain_fallback"
+                    breaker.record_success(f"exit_options:{ticker}")
+                else:
+                    print(f"[exit-pass] [{ticker}] full chain error: {od.get('error')}")
+                    breaker.record_failure(f"exit_options:{ticker}")
+            except MasterBotScanError as e:
+                print(f"[exit-pass] [{ticker}] full chain isolated: {e.step}: {e.message}")
                 breaker.record_failure(f"exit_options:{ticker}")
-                continue
-            breaker.record_success(f"exit_options:{ticker}")
-            scored[ticker] = {"options_dict": options_dict, "card": None, "pivot_data": {}}
-        except MasterBotScanError as e:
-            print(f"[exit-pass] [{ticker}] isolated: {e.step}: {e.message}")
-            breaker.record_failure(f"exit_options:{ticker}")
-        except Exception as e:
-            print(f"[exit-pass] [{ticker}] error: {e}")
+            except Exception as e:
+                print(f"[exit-pass] [{ticker}] full chain error: {e}")
+                breaker.record_failure(f"exit_options:{ticker}")
+
+        result["quote_mode_counts"][mode] = (
+            result["quote_mode_counts"].get(mode, 0) + 1
+        )
+        if options_dict is not None:
+            scored[ticker] = {
+                "options_dict": options_dict,
+                "card": None,
+                "pivot_data": {},
+            }
+            if mode == "single_contract":
+                breaker.record_success(f"exit_quote:{ticker}")
+
         if i < len(open_trades) - 1 and inter_ticker_sleep:
             import time as _time
             _time.sleep(inter_ticker_sleep)
+
+    print(
+        f"[exit-pass] quote modes: single={result['quote_mode_counts'].get('single_contract', 0)} "
+        f"fallback={result['quote_mode_counts'].get('full_chain_fallback', 0)} "
+        f"failed={result['quote_mode_counts'].get('failed', 0)}"
+    )
 
     try:
         exit_summary = position_exits.run_scan_exits(

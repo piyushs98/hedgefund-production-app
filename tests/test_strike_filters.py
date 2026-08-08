@@ -129,6 +129,57 @@ class TestEntryFilters(unittest.TestCase):
         self.assertAlmostEqual(dens, 93.0 / 5.5, places=2)
         self.assertGreater(dens, 8.0)
 
+    def test_fetch_contract_quote_shape(self):
+        """Light path returns options_dict with single strike for lookup_option_mark."""
+        import json
+        from data_engineer import fetch_contract_quote
+        import pandas as pd
+
+        calls = pd.DataFrame(
+            [
+                {
+                    "strike": 500.0,
+                    "bid": 1.0,
+                    "ask": 1.2,
+                    "lastPrice": 1.1,
+                    "volume": 10,
+                    "openInterest": 100,
+                    "impliedVolatility": 0.2,
+                }
+            ]
+        )
+        puts = pd.DataFrame(columns=calls.columns)
+
+        class _Chain:
+            def __init__(self):
+                self.calls = calls
+                self.puts = puts
+
+        class _T:
+            options = ["2026-08-14"]
+
+            def history(self, period="1d"):
+                return pd.DataFrame({"Close": [505.0]})
+
+            def option_chain(self, exp):
+                return _Chain()
+
+        with mock.patch("data_engineer.yf.Ticker", return_value=_T()):
+            raw = fetch_contract_quote("SPY", "2026-08-14", 500.0, "CALL")
+        od = json.loads(raw)
+        self.assertNotIn("error", od)
+        self.assertEqual(od.get("quote_mode"), "single_contract")
+        self.assertEqual(len(od["chains"]["2026-08-14"]["calls"]), 1)
+        trade = {
+            "ticker": "SPY",
+            "direction": "CALL",
+            "strike": 500.0,
+            "expiration": "2026-08-14",
+        }
+        info = __import__("position_exits").lookup_option_mark(trade, od)
+        self.assertTrue(info["found"])
+        self.assertAlmostEqual(info["mark"], 1.1)
+
     def test_bad_quote_negative_extrinsic(self):
         ok, tag = ss._passes_entry_filters(
             cal_dte=2, rm_atr=0.1, dens=1.0, extrinsic=-0.59, extrinsic_pct=-4.8

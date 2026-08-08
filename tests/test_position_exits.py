@@ -268,6 +268,42 @@ class TestExitRules(unittest.TestCase):
         self.assertEqual(close.call_args[0][2], "EOD_FLATTEN")
         self.assertEqual(close.call_args[0][0].get("trade_id"), "short")
 
+    def test_time_stop_skipped_logged_when_score_exempt(self):
+        from datetime import timezone as _tz, timedelta
+
+        trade = self._trade(expiration="2026-08-14")  # still live; not expiry flatten
+        trade["entry_timestamp"] = (
+            datetime(2026, 8, 7, 10, 0, 0, tzinfo=_tz.utc) - timedelta(hours=3)
+        ).isoformat()
+        trade["peak_pnl_pct"] = 5.0
+        trade["last_live_score"] = 84.0
+        # Mark near entry → |pnl| < 10%; options on future exp
+        scored = {
+            "IWM": {
+                "options_dict": self._options(1.40, 1.44, exp="2026-08-14"),
+                "card": mock.Mock(total_score=84.0),
+            }
+        }
+        with mock.patch("position_exits.close_open_position") as close:
+            with mock.patch("position_exits.record_position_mark", return_value=True):
+                with mock.patch("tracker_agent.save_active_trade", return_value=True):
+                    with mock.patch(
+                        "tracker_agent.load_active_trades", return_value=[trade]
+                    ):
+                        with mock.patch.object(config, "TIME_STOP_SCORE_EXEMPT", 80.0):
+                            summary = position_exits.run_scan_exits(
+                                [trade],
+                                scored,
+                                session_date=date(2026, 8, 7),
+                                force_eod=False,
+                                now_cdt=datetime(2026, 8, 7, 14, 0, 0),
+                            )
+        close.assert_not_called()
+        self.assertTrue(
+            any("TIME_STOP SKIPPED IWM" in s for s in summary.get("time_stop_skipped", [])),
+            summary.get("time_stop_skipped"),
+        )
+
     def test_mark_fail_streak_alerts_at_two(self):
         trade = self._trade()
         trade["mark_fail_streak"] = 1  # already failed once

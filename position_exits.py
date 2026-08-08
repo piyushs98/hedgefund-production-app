@@ -205,9 +205,12 @@ def evaluate_exit_reason_for_mark(
     pnl = _pnl_pct(entry, mark)
     # Path rules (optional time stop with score exempt)
     if include_time_stop:
-        b5 = _b5_exit_reason(
+        b5, skip_log = _b5_exit_reason(
             trade, mark, entry, pnl, datetime.now(timezone.utc), live_score=live_score
         )
+        if skip_log:
+            # Stash for run_scan_exits summary (caller may also log immediately)
+            trade["_time_stop_skip_log"] = skip_log
         if b5:
             return b5, mark
     else:
@@ -674,16 +677,16 @@ def _b5_exit_reason(
     pnl: float | None,
     now_utc: datetime,
     live_score: float | None = None,
-) -> str | None:
+) -> tuple[str | None, str | None]:
     """
-    B5 rules (checked after hard SL/TP):
-      * breakeven lock: peak >= +25% and mark back to entry
-      * trailing giveback: peak >= +40% and pnl <= peak * (1 - giveback_frac)
-      * time stop: open > 90m and |pnl| < 10% — skipped when live_score
-        (or trade last_live_score) >= TIME_STOP_SCORE_EXEMPT
+    B5 rules (checked after hard SL/TP).
+
+    Returns (exit_reason | None, skip_log_line | None).
+    skip_log_line is set when TIME_STOP would have fired but score exempted:
+      TIME_STOP SKIPPED MSFT score=84 >= 80
     """
     if entry is None or pnl is None:
-        return None
+        return None, None
 
     peak = _f(trade.get("peak_pnl_pct"))
     if peak is None:
@@ -698,28 +701,33 @@ def _b5_exit_reason(
 
     # Breakeven lock: was up enough, mark back to entry (or worse)
     if peak >= be_peak and mark <= entry:
-        return "BREAKEVEN_LOCK"
+        return "BREAKEVEN_LOCK", None
 
     # Trailing giveback of peak gain
     if peak >= trail_peak and peak > 0:
         floor_pnl = peak * (1.0 - giveback)
         if pnl <= floor_pnl:
-            return "TRAILING_GIVEBACK"
+            return "TRAILING_GIVEBACK", None
 
     # Time stop: dead money — not when thesis still strong
     score = live_score
     if score is None:
         score = _f(trade.get("last_live_score"))
-    if score is not None and score >= score_exempt:
-        return None
 
     ent = _parse_entry_time(trade)
     if ent is not None:
         age_min = (now_utc - ent.astimezone(timezone.utc)).total_seconds() / 60.0
         if age_min >= t_min and abs(pnl) < t_band:
-            return "TIME_STOP"
+            if score is not None and score >= score_exempt:
+                ticker = str(trade.get("ticker") or "?").upper()
+                skip = (
+                    f"TIME_STOP SKIPPED {ticker} "
+                    f"score={score:.0f} >= {score_exempt:.0f}"
+                )
+                return None, skip
+            return "TIME_STOP", None
 
-    return None
+    return None, None
 
 
 def _mark_fail_threshold() -> int:
@@ -777,6 +785,7 @@ def run_scan_exits(
         "marks_failed": 0,
         "skipped_no_mark": [],
         "mark_fail_alerts": [],
+        "time_stop_skipped": [],
         "eod_triggered": False,
         "open_before": len(open_trades),
         "open_after": None,
@@ -854,6 +863,7 @@ def run_scan_exits(
 
         # B1 selective EOD (cal_dte < CARRY_MIN_DTE only), C-D 0DTE, B2–B5
         # TIME_STOP uses live_score or last_live_score; exempt if >= TIME_STOP_SCORE_EXEMPT
+        trade.pop("_time_stop_skip_log", None)
         reason, exit_px = evaluate_exit_reason_for_mark(
             trade,
             mark,
@@ -863,6 +873,10 @@ def run_scan_exits(
             do_eod=do_eod,
             live_score=live_score,
         )
+        skip_log = trade.pop("_time_stop_skip_log", None)
+        if skip_log:
+            summary["time_stop_skipped"].append(skip_log)
+            print(f"[Exits] {skip_log}")
 
         if reason is None:
             continue
@@ -899,11 +913,13 @@ def run_scan_exits(
         summary["open_after"] = None
 
     n_closed = len(summary["closed"])
+    n_ts_skip = len(summary["time_stop_skipped"])
     # One-line health summary every exit pass (log always)
     mark_line = (
         f"[Exits] marks: checked={summary['positions_checked']} "
         f"ok={summary['marks_ok']} failed={summary['marks_failed']} "
-        f"closed={n_closed} eod={summary['eod_triggered']} "
+        f"closed={n_closed} time_stop_skipped={n_ts_skip} "
+        f"eod={summary['eod_triggered']} "
         f"carry_min_dte={_carry_min_dte()} "
         f"open {summary['open_before']}→{summary['open_after']}"
     )

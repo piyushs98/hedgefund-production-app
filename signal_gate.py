@@ -400,7 +400,7 @@ class SignalGate:
 def _compact_reason(reason: str) -> str:
     r = reason.lower()
     if "same_scan" in r:
-        return "same_scan_exit"
+        return "same_scan"
     if "post_exit" in r:
         return "post_exit_cd"
     if "persistence" in r:
