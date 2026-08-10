@@ -159,9 +159,10 @@ Do not output anything other than raw JSON.
             weights = {"recommended_weights": {"liquidity": 30, "technical": 40, "sentiment": 30}}
 
         try:
+            # Additive 30/40/30 weights are RETIRED — save_weights is a no-op.
             config.save_weights(weights.get("recommended_weights", {}))
         except Exception as w_err:
-            print(f"Could not persist recommended weights ({w_err}); engine keeps prior weights.")
+            print(f"Could not call save_weights ({w_err}); live scoring uses T/S/liq_mult.")
 
         report = f"""# 📊 Saturday Performance Audit
 **Closed trades:** {total_trades} (source: trade_history — real data only)
@@ -170,7 +171,11 @@ Do not output anything other than raw JSON.
 **Average Duration:** {avg_duration:.1f} hours
 **Exit reasons:** {reason_lines}
 
-**Weight Adjustment Output:**
+**Note:** Additive pillar weights are retired. Live scoring is
+T(0..TECH_CEIL)+S(-SENT_MAX..+SENT_MAX)×liq_mult with DEAD_ZONE_ATR.
+The weight JSON below is diagnostic only and does not change the engine.
+
+**Weight Adjustment Output (diagnostic / retired scheme):**
 ```json
 {json.dumps(weights, indent=2)}
 ```

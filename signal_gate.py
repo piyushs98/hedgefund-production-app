@@ -64,6 +64,8 @@ class Observation:
     score: float
     direction: str | None = None  # required for EXECUTE candidates
     action_flag: str = "PASS"  # "EXECUTE" or "PASS"
+    # Scorer hard-block (e.g. dead_zone) — surfaces on GATE as distinct reason
+    block_reason: str | None = None
 
 
 @dataclass
@@ -314,6 +316,17 @@ class SignalGate:
             score = float(obs.score)
             flag = (obs.action_flag or "PASS").upper()
             direction = _norm_direction(obs.direction)
+            block_reason = (obs.block_reason or "").strip().lower() or None
+
+            # Scorer hard blocks (dead zone, etc.) — distinct GATE reason, reset streak
+            if block_reason:
+                use_score = min(score, self.cfg.threshold - 0.1)
+                self._prefilter(ticker, None, use_score, now)
+                decisions[ticker] = GateDecision(
+                    ticker=ticker, admit=False, reason=block_reason,
+                    score=score, direction=None,
+                )
+                continue
 
             # Non-EXECUTE: still observe so streaks reset when thesis dies
             if flag != "EXECUTE" or direction is None or score < self.cfg.threshold:
@@ -399,6 +412,8 @@ class SignalGate:
 
 def _compact_reason(reason: str) -> str:
     r = reason.lower()
+    if "dead_zone" in r or "dead zone" in r:
+        return "dead_zone"
     if "same_scan" in r:
         return "same_scan"
     if "post_exit" in r:
@@ -471,6 +486,12 @@ def get_gate() -> SignalGate:
             f"threshold={cfg.threshold}"
         )
         log_entry_filter_config()
+        try:
+            import config as _cfg
+            if hasattr(_cfg, "log_scoring_config"):
+                _cfg.log_scoring_config()
+        except Exception as sc_err:
+            print(f"[Scoring] config unavailable: {sc_err}")
     return _GATE
 
 

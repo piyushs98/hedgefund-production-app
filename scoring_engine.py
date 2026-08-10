@@ -1,36 +1,45 @@
 """
-scoring_engine.py — Deterministic Multi-Factor Weighted Scoring (Task 2).
+scoring_engine.py — Floor-fixed conviction scoring.
 
-WHY THIS EXISTS
----------------
-The previous engine graded tickers by substring-matching LLM prose:
+Score = clamp( Technical(0..TECH_CEIL) + Sentiment(-SENT_MAX..+SENT_MAX), 0, 100 )
+        * liq_mult
 
-    if "Low Risk" in risk_report: ...
-    if ticker in ticker_manager_report and "warning" not in ticker_manager_report.lower(): ...
+Technical alone can clear EXECUTE_THRESHOLD (70). Sentiment is a signed
+modifier that confirms or vetoes; it cannot manufacture a signal from a
+weak technical setup. Liquidity is a multiplier/gate, never additive points.
 
-That second check was the root cause of the "hyper-conservative" behavior:
-the Ticker Team Manager's own report template contains a section literally
-titled "Technical Warning Flags", so the word "warning" appears in almost
-every report and the 20-point technical bonus was almost never awarded.
-Max realistic scores hovered around 50-65 -> systematic PASS.
+Dead zone: if |spot − pivot| / ATR < DEAD_ZONE_ATR, direction is undefined
+and the ticker hard-PASSes regardless of other pillars.
 
-This module scores from RAW NUMBERS instead of prose. Each pillar produces
-a normalized ratio in [0, 1] plus a metrics dict, then the ratio is scaled
-by the dynamic pillar weight (loaded from config / saturday_audit feedback).
-Every sub-factor is GRADED (partial credit), never binary — a single wide
-metric shaves points instead of killing the trade.
+Calibrated defaults (2026-08-10 two-sided Mon/Fri test, config/env-tunable):
+  tech_ceil=85, sent_max=15
+  pivot_scale=0.40 ATR, pivot_power=1.0, mom_scale=0.45 %, mix 70/30
+  dead_zone_atr=0.30
+  vol_mult in [0.70, 1.0]; liq bands <3%→1.0, 3–6%→0.85, 6–10%→0.6, >10%→0
 
-Pillars (default weights, dynamically adjustable):
-    Liquidity & Order Book Depth ... 30
-    Technical Momentum & Volatility  40
-    Macro & Sector Sentiment ....... 30
-Threshold: total >= 70 -> EXECUTE else PASS.
+KNOWN LIMITATION (do not fix without real telemetry):
+  mom_scale saturates near ~1.1–1.2% day-move under 0.45; revisit with multi-day
+  ground truth. vol_mult deliberately haircuts ATR% > 4% (e.g. TSLA) — do not
+  soften without ATR-based stop geometry.
+
+The additive 30/40/30 pillar weights are RETIRED. score_ticker ignores
+config.load_weights(); saturday_audit weight writes no longer affect live scoring.
 """
+
+from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
 
 import config
+
+
+def _cfg_float(name: str, default: float) -> float:
+    try:
+        return float(getattr(config, name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
 
 # Lightweight sentiment lexicon for headline scoring (deterministic, no LLM).
 _BULLISH_WORDS = {
@@ -51,38 +60,115 @@ _BEARISH_WORDS = {
 @dataclass
 class ScoreCard:
     ticker: str
-    liquidity_ratio: float = 0.0      # 0..1
-    technical_ratio: float = 0.0      # 0..1
-    sentiment_ratio: float = 0.0      # 0..1
-    liquidity_score: float = 0.0      # ratio * weight
-    technical_score: float = 0.0
-    sentiment_score: float = 0.0
+    # Legacy field names retained for telemetry/CEO payloads:
+    #   liquidity_score  -> liq_mult (0..1), NOT additive points
+    #   technical_score  -> T (0..TECH_CEIL)
+    #   sentiment_score  -> S (-SENT_MAX..+SENT_MAX), signed modifier
+    liquidity_ratio: float = 0.0      # same as liq_mult (0..1)
+    technical_ratio: float = 0.0      # tech_raw before ceil (0..1)
+    sentiment_ratio: float = 0.0      # signed alignment (-1..+1)
+    liquidity_score: float = 0.0      # liq_mult
+    technical_score: float = 0.0      # T
+    sentiment_score: float = 0.0      # S
     adversarial_penalty: float = 0.0
     total_score: float = 0.0
     action_flag: str = "PASS"
-    weights: dict = field(default_factory=dict)
-    metrics: dict = field(default_factory=dict)   # raw numbers for CEO prompt + telemetry
+    # Deprecated: no longer 30/40/30. Stored for schema compat only.
+    weights: dict = field(default_factory=lambda: {
+        "liquidity": 0,
+        "technical": _cfg_float("TECH_CEIL", 85.0),
+        "sentiment": _cfg_float("SENT_MAX", 15.0),
+    })
+    metrics: dict = field(default_factory=dict)
     reasons: list = field(default_factory=list)
+    # Scorer-level hard block (e.g. dead_zone) for GATE compact reasons
+    block_reason: str | None = None
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def _ramp(x: float, scale: float, power: float = 1.0) -> float:
+    """0 at x<=0; approaches 1 as x→+∞. power>1 slows the early curve."""
+    if x <= 0:
+        return 0.0
+    return max(0.0, math.tanh(x / max(scale, 1e-9))) ** power
+
+
+def _vol_mult(atr_pct) -> float:
+    """ATR regime as confidence multiplier on technical, not additive points.
+
+    Unchanged by the 2026-08 scoring rewrite: names with ATR% > 4 are haircut
+    deliberately (pairing needs ATR-based stops, not a softer score).
+    """
+    if atr_pct is None:
+        return 0.70
+    try:
+        a = float(atr_pct)
+    except (TypeError, ValueError):
+        return 0.70
+    if 1.0 <= a <= 4.0:
+        return 1.0
+    if a < 1.0:
+        return 0.70 + 0.30 * _clamp(a / 1.0, 0.0, 1.0)
+    return max(0.70, 1.0 - (a - 4.0) / 8.0)
+
+
+def _liq_mult_from_spread(med_spread) -> tuple[float, str | None]:
+    """
+    Liquidity is a GATE, not points.
+    <3% → 1.0; 3–6% → 0.85; 6–10% → 0.6; >10% → 0 (hard veto).
+    """
+    if med_spread is None:
+        return 0.85, None
+    if med_spread > 0.10:
+        return 0.0, "spread_untradeable"
+    if med_spread > 0.06:
+        return 0.60, None
+    if med_spread > 0.03:
+        return 0.85, None
+    return 1.0, None
+
+
+def _infer_direction_sign(pivot_data) -> tuple[float, str]:
+    """CALL → +1, PUT → -1. Matches strike_selector.infer_direction."""
+    try:
+        from strike_selector import infer_direction
+        d = infer_direction(pivot_data)
+        if str(d).upper().startswith("P"):
+            return -1.0, "PUT"
+        return 1.0, "CALL"
+    except Exception:
+        close = float(pivot_data.get("close") or 0.0)
+        pivot = float(pivot_data.get("pivot") or close)
+        pct = float(pivot_data.get("pct_change") or 0.0)
+        if close >= pivot and pct >= 0:
+            return 1.0, "CALL"
+        if close < pivot and pct < 0:
+            return -1.0, "PUT"
+        if close >= pivot:
+            return 1.0, "CALL"
+        return -1.0, "PUT"
 
 
 # ------------------------------------------------------------------
-# Pillar 1: Liquidity & Order Book Depth  (graded, max ratio 1.0)
+# Liquidity: multiplier only
 # ------------------------------------------------------------------
 def score_liquidity(options_dict):
     """
-    Grades the near-the-money option chain:
-      * median bid/ask spread as % of mid  (60% of pillar)
-      * total ATM volume                    (25% of pillar)
-      * total ATM open interest             (15% of pillar)
-    Returns (ratio 0..1, metrics dict, reasons list).
+    Returns (liq_mult 0..1, metrics dict, reasons list).
+    Does NOT contribute additive points.
     """
     reasons, metrics = [], {}
     spot = options_dict.get("current_price")
     chains = options_dict.get("chains", {})
     if not isinstance(spot, (int, float)) or not chains:
-        return 0.0, {"error": "no usable chain/spot"}, ["No usable options chain data."]
+        mult, _ = _liq_mult_from_spread(None)
+        metrics["error"] = "no usable chain/spot"
+        reasons.append("No usable options chain data; liquidity mult discounted.")
+        return mult, metrics, reasons
 
-    # Collect contracts within ±5% of spot across the nearest expirations
     atm = []
     for exp, sides in chains.items():
         for side in ("calls", "puts"):
@@ -91,7 +177,10 @@ def score_liquidity(options_dict):
                 if strike and abs(strike - spot) / spot <= 0.05:
                     atm.append(opt)
     if not atm:
-        return 0.0, {"error": "no ATM contracts"}, ["No contracts within 5% of spot."]
+        mult, _ = _liq_mult_from_spread(None)
+        metrics["error"] = "no ATM contracts"
+        reasons.append("No contracts within 5% of spot; liquidity mult discounted.")
+        return mult, metrics, reasons
 
     spreads = []
     total_volume, total_oi = 0, 0
@@ -104,177 +193,358 @@ def score_liquidity(options_dict):
         total_oi += int(opt.get("openInterest") or 0)
 
     med_spread = sorted(spreads)[len(spreads) // 2] if spreads else 1.0
+    mult, veto = _liq_mult_from_spread(med_spread)
     metrics.update({
         "atm_contracts": len(atm),
         "median_atm_spread_pct": round(med_spread * 100, 2),
         "total_atm_volume": total_volume,
         "total_atm_open_interest": total_oi,
         "spot": spot,
+        "liq_mult": mult,
+        "veto": veto,
     })
-
-    # Graded sub-scores (no cliffs):
-    # spread: 2% or tighter -> full credit, 15%+ -> zero, linear between
-    spread_sub = max(0.0, min(1.0, (0.15 - med_spread) / 0.13))
-    # volume: log-scaled, 10k ATM contracts -> full credit
-    vol_sub = max(0.0, min(1.0, math.log10(max(total_volume, 1)) / 4.0))
-    # open interest: 50k -> full credit
-    oi_sub = max(0.0, min(1.0, math.log10(max(total_oi, 1)) / 4.7))
-
-    ratio = 0.60 * spread_sub + 0.25 * vol_sub + 0.15 * oi_sub
     reasons.append(
-        f"Median ATM spread {med_spread*100:.1f}% (sub {spread_sub:.2f}), "
-        f"ATM volume {total_volume:,} (sub {vol_sub:.2f}), OI {total_oi:,} (sub {oi_sub:.2f})."
+        f"Median ATM spread {med_spread * 100:.1f}% → liq_mult {mult:.2f}"
+        + (f" ({veto})" if veto else "")
+        + f"; ATM vol {total_volume:,}, OI {total_oi:,}."
     )
-    return ratio, metrics, reasons
+    return mult, metrics, reasons
 
 
 # ------------------------------------------------------------------
-# Pillar 2: Technical Momentum & Volatility  (graded, max ratio 1.0)
+# Technical: directional, ATR-normalised, 0..TECH_CEIL
 # ------------------------------------------------------------------
-def score_technical(pivot_data, atr_pct=None):
+def score_technical(pivot_data, atr_pct=None, atr_abs=None, direction_sign=1.0):
     """
-    Grades price structure from ticker_desk pivot data:
-      * position vs daily pivot, distance-scaled     (45%)
-      * day-over-day momentum (pct_change)           (35%)
-      * volatility regime via ATR% (if provided)     (20%)
+    Returns (T points, metrics, reasons).
+    pivot_sub / mom_sub are 0 with no evidence; vol_mult multiplies technical only.
     """
     reasons, metrics = [], {}
-    close = pivot_data.get("close", 0.0)
-    pivot = pivot_data.get("pivot", close)
-    r1, s1 = pivot_data.get("r1", close), pivot_data.get("s1", close)
-    pct_change = pivot_data.get("pct_change", 0.0)
+    close = float(pivot_data.get("close") or 0.0)
+    pivot = float(pivot_data.get("pivot") or close)
+    r1 = float(pivot_data.get("r1") or close)
+    s1 = float(pivot_data.get("s1") or close)
+    pct_change = float(pivot_data.get("pct_change") or 0.0)
+    sign = 1.0 if direction_sign >= 0 else -1.0
+
+    pivot_scale = _cfg_float("PIVOT_SCALE", 0.40)
+    pivot_power = _cfg_float("PIVOT_POWER", 1.0)
+    mom_scale = _cfg_float("MOM_SCALE", 0.45)
+    w_pivot = _cfg_float("W_PIVOT", 0.70)
+    w_mom = _cfg_float("W_MOM", 0.30)
+    tech_ceil = _cfg_float("TECH_CEIL", 85.0)
+
+    atr = None
+    if atr_abs is not None:
+        try:
+            atr = float(atr_abs)
+        except (TypeError, ValueError):
+            atr = None
+    if atr is None or atr <= 0:
+        if atr_pct is not None and close:
+            try:
+                atr = abs(close) * float(atr_pct) / 100.0
+            except (TypeError, ValueError):
+                atr = None
+        if atr is None or atr <= 0:
+            atr = abs(close) * 0.012 if close else 1.0
+
+    dist_signed = sign * (close - pivot) / atr if atr else 0.0
+    dist_abs = abs(close - pivot) / atr if atr else 0.0
+
+    pivot_sub = _ramp(dist_signed, pivot_scale, pivot_power)
+    mom_sub = _ramp(sign * pct_change, mom_scale, 1.0)
+    vol_m = _vol_mult(atr_pct)
+    tech_raw = w_pivot * pivot_sub + w_mom * mom_sub
+    T = tech_raw * vol_m * tech_ceil
 
     metrics.update({
-        "close": close, "pivot": pivot, "r1": r1, "s1": s1,
-        "pct_change": pct_change, "atr_pct": atr_pct,
+        "close": round(close, 2),
+        "pivot": round(pivot, 2),
+        "r1": round(r1, 2),
+        "s1": round(s1, 2),
+        "pct_change": round(pct_change, 2),
+        "atr_pct": atr_pct,
+        "atr_abs": round(atr, 4) if atr else None,
+        "direction_sign": sign,
+        "atr_distance": round(dist_abs, 4),
+        "atr_distance_signed": round(dist_signed, 4),
+        "pivot_sub": round(pivot_sub, 4),
+        "mom_sub": round(mom_sub, 4),
+        "vol_mult": round(vol_m, 4),
+        "tech_raw": round(tech_raw, 4),
+        "T": round(T, 2),
+        "pivot_scale": pivot_scale,
+        "pivot_power": pivot_power,
+        "mom_scale": mom_scale,
+        "w_pivot": w_pivot,
+        "w_mom": w_mom,
+        "tech_ceil": tech_ceil,
     })
     if not close or not pivot:
-        return 0.0, metrics, ["Missing price/pivot data."]
+        reasons.append("Missing price/pivot data.")
+        return 0.0, metrics, reasons
 
-    # Position vs pivot: at/above pivot earns credit scaling toward R1;
-    # below pivot decays toward S1 (partial credit, not zero at first tick below).
-    if close >= pivot:
-        span = max(r1 - pivot, 1e-9)
-        pivot_sub = 0.6 + 0.4 * min(1.0, (close - pivot) / span)
-    else:
-        span = max(pivot - s1, 1e-9)
-        pivot_sub = max(0.0, 0.6 * (1 - (pivot - close) / span))
-
-    # Momentum: +2% day move -> full credit; -2% -> zero; linear
-    mom_sub = max(0.0, min(1.0, (pct_change + 2.0) / 4.0))
-
-    # Volatility regime: sweet spot ATR% in [1%, 4%] — enough movement to pay
-    # the premium, not so much that stops get shredded.
-    if atr_pct is None:
-        vol_sub = 0.5  # unknown -> neutral, never punitive
-    elif 1.0 <= atr_pct <= 4.0:
-        vol_sub = 1.0
-    elif atr_pct < 1.0:
-        vol_sub = max(0.0, atr_pct / 1.0)
-    else:
-        vol_sub = max(0.0, 1.0 - (atr_pct - 4.0) / 4.0)
-
-    ratio = 0.45 * pivot_sub + 0.35 * mom_sub + 0.20 * vol_sub
     reasons.append(
-        f"Close {close} vs pivot {pivot} (sub {pivot_sub:.2f}); day move {pct_change:+.2f}% "
-        f"(sub {mom_sub:.2f}); ATR% {atr_pct if atr_pct is not None else 'n/a'} (sub {vol_sub:.2f})."
+        f"dir={'C' if sign > 0 else 'P'}; ATR-dist {dist_signed:+.2f}; "
+        f"pivot_sub {pivot_sub:.3f}; mom_sub {mom_sub:.3f} (pct {pct_change:+.2f}%); "
+        f"vol_mult {vol_m:.2f} → T={T:.1f}/{tech_ceil:g}."
     )
-    return ratio, metrics, reasons
+    return T, metrics, reasons
 
 
 # ------------------------------------------------------------------
-# Pillar 3: Macro & Sector Sentiment  (graded, max ratio 1.0)
+# Sentiment: signed modifier -SENT_MAX..+SENT_MAX; 0 when no evidence
 # ------------------------------------------------------------------
-def score_sentiment(headlines_text, macro_vector="", futures_pct=None):
+def score_sentiment(headlines_text, macro_vector="", futures_pct=None, direction_sign=1.0):
     """
-    Grades news flow deterministically:
-      * lexicon-scored headline balance over DB window   (55%)
-      * overnight futures direction                       (25%)
-      * Innovation Hub macro vector modifiers             (20%, graded — not
-        the old hard zero-override)
+    Returns (S points, metrics, reasons).
+    Neutral / missing components contribute 0 and are excluded from the average.
+    Signed so adverse news subtracts from a call (and vice versa).
     """
     reasons, metrics = [], {}
+    sign = 1.0 if direction_sign >= 0 else -1.0
+    sent_max = _cfg_float("SENT_MAX", 15.0)
     text = (headlines_text or "").lower()
     lines = [l for l in text.splitlines() if l.strip()]
     bull = sum(1 for l in lines for w in _BULLISH_WORDS if w in l)
     bear = sum(1 for l in lines for w in _BEARISH_WORDS if w in l)
-    n = max(bull + bear, 1)
-    news_sub = 0.5 + 0.5 * ((bull - bear) / n)          # 0..1, 0.5 = balanced
-    news_sub = max(0.0, min(1.0, news_sub))
 
-    if futures_pct is None:
-        fut_sub = 0.5
+    parts: list[float] = []
+    weights: list[float] = []
+
+    if lines or (bull + bear) > 0:
+        n = max(bull + bear, 1)
+        raw_news = _clamp((bull - bear) / n, -1.0, 1.0)  # + = bullish
+        parts.append(sign * raw_news)
+        weights.append(0.55)
+        news_aligned = sign * raw_news
     else:
-        fut_sub = max(0.0, min(1.0, (futures_pct + 0.75) / 1.5))  # ±0.75% band
+        news_aligned = 0.0
+
+    if futures_pct is not None:
+        try:
+            raw_f = _clamp(float(futures_pct) / 0.75, -1.0, 1.0)
+        except (TypeError, ValueError):
+            raw_f = 0.0
+        parts.append(sign * raw_f)
+        weights.append(0.25)
+        fut_aligned = sign * raw_f
+    else:
+        fut_aligned = None  # excluded
 
     mv = (macro_vector or "").upper()
     if "EXPANSIONARY_TAILWIND" in mv:
-        macro_sub, macro_note = 1.0, "expansionary tailwind"
+        raw_m, macro_note = 1.0, "expansionary tailwind"
     elif "SUPPLY_CHAIN_BOTTLENECK" in mv:
-        macro_sub, macro_note = 0.15, "supply-chain bottleneck"
+        raw_m, macro_note = -0.7, "supply-chain bottleneck"
     elif "EARNINGS_IMMINENT" in mv:
-        macro_sub, macro_note = 0.25, "earnings imminent (IV-crush risk)"
+        raw_m, macro_note = -0.5, "earnings imminent (IV-crush risk)"
     else:
-        macro_sub, macro_note = 0.5, "neutral macro"
+        raw_m, macro_note = 0.0, "neutral macro"
 
-    ratio = 0.55 * news_sub + 0.25 * fut_sub + 0.20 * macro_sub
+    if abs(raw_m) > 1e-9:
+        parts.append(sign * raw_m)
+        weights.append(0.20)
+    macro_aligned = sign * raw_m if abs(raw_m) > 1e-9 else 0.0
+
+    if parts:
+        wsum = sum(weights)
+        aligned = sum(p * (w / wsum) for p, w in zip(parts, weights))
+    else:
+        aligned = 0.0
+
+    S = aligned * sent_max
     metrics.update({
-        "headline_count": len(lines), "bullish_hits": bull, "bearish_hits": bear,
-        "news_sub": round(news_sub, 3), "futures_pct": futures_pct,
+        "headline_count": len(lines),
+        "bullish_hits": bull,
+        "bearish_hits": bear,
+        "news_aligned": round(news_aligned, 4),
+        "futures_pct": futures_pct,
+        "futures_aligned": None if fut_aligned is None else round(fut_aligned, 4),
         "macro_note": macro_note,
+        "macro_aligned": round(macro_aligned, 4),
+        "sentiment_aligned": round(aligned, 4),
+        "S": round(S, 2),
+        "sent_max": sent_max,
     })
     reasons.append(
-        f"{len(lines)} headlines: {bull} bullish / {bear} bearish hits (sub {news_sub:.2f}); "
-        f"futures {futures_pct if futures_pct is not None else 'n/a'} (sub {fut_sub:.2f}); {macro_note} (sub {macro_sub:.2f})."
+        f"{len(lines)} headlines ({bull} bull/{bear} bear); "
+        f"futures {'n/a' if fut_aligned is None else f'{futures_pct}%'}; "
+        f"{macro_note}; aligned {aligned:+.2f} → S={S:+.1f}/{sent_max:g}."
     )
-    return ratio, metrics, reasons
+    return S, metrics, reasons
 
 
 # ------------------------------------------------------------------
 # Composite
 # ------------------------------------------------------------------
 def score_ticker(ticker, options_dict, pivot_data, headlines_text,
-                 macro_vector="", futures_pct=None, atr_pct=None, weights=None):
-    """Runs all three pillars and assembles the final ScoreCard."""
-    w = weights or config.load_weights()
-    card = ScoreCard(ticker=ticker, weights=dict(w))
+                 macro_vector="", futures_pct=None, atr_pct=None, atr_abs=None,
+                 weights=None):
+    """
+    Score = clamp(T + S, 0, 100) * liq_mult.
 
-    lr, lm, lreasons = score_liquidity(options_dict)
-    tr, tm, treasons = score_technical(pivot_data, atr_pct=atr_pct)
-    sr, sm, sreasons = score_sentiment(headlines_text, macro_vector, futures_pct)
+    Dead zone: |spot−pivot|/ATR < DEAD_ZONE_ATR → PASS + block_reason=dead_zone.
 
-    card.liquidity_ratio, card.technical_ratio, card.sentiment_ratio = lr, tr, sr
-    card.liquidity_score = round(lr * w["liquidity"], 1)
-    card.technical_score = round(tr * w["technical"], 1)
-    card.sentiment_score = round(sr * w["sentiment"], 1)
-    card.total_score = round(card.liquidity_score + card.technical_score + card.sentiment_score, 1)
-    card.action_flag = "EXECUTE" if card.total_score >= config.EXECUTE_THRESHOLD else "PASS"
-    card.metrics = {"liquidity": lm, "technical": tm, "sentiment": sm}
+    ``weights`` is accepted for call-site compatibility but IGNORED — the
+    30/40/30 additive scheme is retired.
+    """
+    if weights is not None:
+        pass  # explicit ignore
+
+    tech_ceil = _cfg_float("TECH_CEIL", 85.0)
+    sent_max = _cfg_float("SENT_MAX", 15.0)
+    dead_zone_atr = _cfg_float("DEAD_ZONE_ATR", 0.30)
+    threshold = float(getattr(config, "EXECUTE_THRESHOLD", 70))
+
+    card = ScoreCard(
+        ticker=ticker,
+        weights={"liquidity": 0, "technical": tech_ceil, "sentiment": sent_max},
+    )
+    direction_sign, direction_label = _infer_direction_sign(pivot_data)
+
+    liq_mult, lm, lreasons = score_liquidity(options_dict)
+    T, tm, treasons = score_technical(
+        pivot_data, atr_pct=atr_pct, atr_abs=atr_abs, direction_sign=direction_sign,
+    )
+    S, sm, sreasons = score_sentiment(
+        headlines_text, macro_vector, futures_pct, direction_sign=direction_sign,
+    )
+
+    raw = T + S
+    if liq_mult <= 0:
+        total = 0.0
+    else:
+        total = _clamp(raw * liq_mult, 0.0, 100.0)
+
+    atr_dist = tm.get("atr_distance")
+    in_dead_zone = (
+        atr_dist is not None
+        and dead_zone_atr > 0
+        and float(atr_dist) < float(dead_zone_atr)
+    )
+
+    card.liquidity_ratio = liq_mult
+    card.technical_ratio = round(tm.get("tech_raw", 0.0), 4)
+    card.sentiment_ratio = round(sm.get("sentiment_aligned", 0.0), 4)
+    card.liquidity_score = round(liq_mult, 4)
+    card.technical_score = round(T, 1)
+    card.sentiment_score = round(S, 1)
+    card.total_score = round(total, 1)
+    card.action_flag = "EXECUTE" if card.total_score >= threshold else "PASS"
+    card.block_reason = None
+
+    if in_dead_zone:
+        card.action_flag = "PASS"
+        card.block_reason = "dead_zone"
+        # total_score kept for forensics (components still visible)
+
+    subscores = {
+        "pivot_sub": tm.get("pivot_sub"),
+        "mom_sub": tm.get("mom_sub"),
+        "vol_mult": tm.get("vol_mult"),
+        "T": round(T, 2),
+        "S": round(S, 2),
+        "liq_mult": round(liq_mult, 4),
+        "atr_distance": tm.get("atr_distance"),
+        "atr_distance_signed": tm.get("atr_distance_signed"),
+        "direction": direction_label,
+        "raw_T_plus_S": round(raw, 2),
+        "final": card.total_score,
+        "dead_zone": in_dead_zone,
+        "dead_zone_atr": dead_zone_atr,
+    }
+    card.metrics = {
+        "liquidity": lm,
+        "technical": tm,
+        "sentiment": sm,
+        "subscores": subscores,
+    }
     card.reasons = lreasons + treasons + sreasons
+    if in_dead_zone:
+        card.reasons.append(
+            f"Dead zone: ATR-dist {atr_dist:.4f} < {dead_zone_atr:g} "
+            f"— direction undefined; hard PASS."
+        )
+
+    # Mandatory per-scan sub-score log (forensic reconstruction depends on this)
+    print(
+        f"[{ticker}] score subs "
+        f"piv={subscores['pivot_sub']} mom={subscores['mom_sub']} "
+        f"vol={subscores['vol_mult']} T={subscores['T']} S={subscores['S']} "
+        f"liq={subscores['liq_mult']} dATR={subscores['atr_distance']} "
+        f"dir={direction_label} final={subscores['final']}"
+        f"{' dead_zone' if in_dead_zone else ''} → {card.action_flag}"
+    )
     return card
 
 
 def apply_adversarial_penalty(card, penalty=15.0, reason=""):
     """Devil's Advocate veto: subtract penalty and re-evaluate the flag."""
+    threshold = float(getattr(config, "EXECUTE_THRESHOLD", 70))
     card.adversarial_penalty = penalty
     card.total_score = round(max(0.0, card.total_score - penalty), 1)
-    card.action_flag = "EXECUTE" if card.total_score >= config.EXECUTE_THRESHOLD else "PASS"
+    # Dead zone / existing hard PASS stays PASS; otherwise re-check threshold
+    if card.block_reason == "dead_zone":
+        card.action_flag = "PASS"
+    else:
+        card.action_flag = (
+            "EXECUTE" if card.total_score >= threshold else "PASS"
+        )
     if reason:
         card.reasons.append(f"Adversarial veto (-{penalty:g} pts): {reason}")
+    if isinstance(card.metrics.get("subscores"), dict):
+        card.metrics["subscores"]["final"] = card.total_score
+        card.metrics["subscores"]["adversarial_penalty"] = penalty
     return card
 
 
-def metrics_snapshot_text(card, *, include_futures=True):
-    """Compact, exact-numbers snapshot injected into the CEO prompt so the
-    final broadcast can cite real metrics instead of generic prose (Task 1).
+def format_subscore_bits(card) -> str:
+    """Compact piv=/mom=/vol=/T=/S=/liq=/dATR= for EXECUTE telemetry lines."""
+    sub = (card.metrics or {}).get("subscores") or {}
+    tm = (card.metrics or {}).get("technical") or {}
 
-    include_futures:
-      True  — session-open scan; overnight ES futures % may be cited once.
-      False — later scans; omit futures % so CEO does not reprint pre-market gap.
-    """
+    def _g(key, alt=None):
+        v = sub.get(key)
+        if v is None and alt is not None:
+            v = tm.get(alt)
+        return v
+
+    piv = _g("pivot_sub")
+    mom = _g("mom_sub")
+    vol = _g("vol_mult")
+    T = _g("T")
+    if T is None:
+        T = getattr(card, "technical_score", None)
+    S = _g("S")
+    if S is None:
+        S = getattr(card, "sentiment_score", None)
+    liq = _g("liq_mult")
+    if liq is None:
+        liq = getattr(card, "liquidity_score", None)
+    d_atr = _g("atr_distance")
+
+    def _f(v, nd=2):
+        try:
+            return f"{float(v):.{nd}f}"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    return (
+        f"piv={_f(piv, 3)} mom={_f(mom, 3)} vol={_f(vol, 2)} "
+        f"T={_f(T, 1)} S={_f(S, 1)} liq={_f(liq, 2)} dATR={_f(d_atr, 3)}"
+    )
+
+
+def metrics_snapshot_text(card, *, include_futures=True):
+    """Compact snapshot for CEO prompt — includes calibrated sub-scores."""
     lm = card.metrics.get("liquidity", {})
     tm = card.metrics.get("technical", {})
     sm = card.metrics.get("sentiment", {})
+    sub = card.metrics.get("subscores", {})
+    tech_ceil = _cfg_float("TECH_CEIL", 85.0)
+    sent_max = _cfg_float("SENT_MAX", 15.0)
     if include_futures:
         sentiment_line = (
             f"- Headlines scanned: {sm.get('headline_count')} ({sm.get('bullish_hits')} bullish / "
@@ -287,15 +557,19 @@ def metrics_snapshot_text(card, *, include_futures=True):
             f"{sm.get('bearish_hits')} bearish) | Macro: {sm.get('macro_note')}\n"
             f"- Session-open ES/NQ futures already briefed earlier; do not restate them.\n"
         )
+    dz = " yes" if sub.get("dead_zone") else " no"
     return (
         f"RAW METRICS SNAPSHOT for {card.ticker} (cite these numbers verbatim):\n"
         f"- Spot: {tm.get('close')} | Pivot: {tm.get('pivot')} | R1: {tm.get('r1')} | "
         f"S1: {tm.get('s1')} | Day change: {tm.get('pct_change')}% | ATR%: {tm.get('atr_pct')}\n"
+        f"- ATR-distance: {sub.get('atr_distance')} | dir: {sub.get('direction')} | "
+        f"pivot_sub: {sub.get('pivot_sub')} | mom_sub: {sub.get('mom_sub')} | "
+        f"vol_mult: {sub.get('vol_mult')} | dead_zone:{dz}\n"
         f"- Median ATM spread: {lm.get('median_atm_spread_pct')}% | ATM volume: "
-        f"{lm.get('total_atm_volume')} | ATM open interest: {lm.get('total_atm_open_interest')}\n"
+        f"{lm.get('total_atm_volume')} | ATM open interest: {lm.get('total_atm_open_interest')} | "
+        f"liq_mult: {sub.get('liq_mult')}\n"
         f"{sentiment_line}"
-        f"- Pillar scores: Liquidity {card.liquidity_score}/{card.weights.get('liquidity')} | "
-        f"Technical {card.technical_score}/{card.weights.get('technical')} | "
-        f"Sentiment {card.sentiment_score}/{card.weights.get('sentiment')} | "
-        f"Adversarial penalty: -{card.adversarial_penalty:g} | TOTAL: {card.total_score}/100"
+        f"- Score: T={card.technical_score}/{tech_ceil:g} + S={card.sentiment_score:+g}/{sent_max:g} "
+        f"× liq_mult {card.liquidity_score} "
+        f"(adversarial -{card.adversarial_penalty:g}) → TOTAL {card.total_score}/100 → {card.action_flag}"
     )

@@ -73,13 +73,15 @@ OUTPUT RULES (strict):
 2. Data-dense only: Spot, Pivot, Score, and Contract/Entry/SL/TP if provided.
 3. When the payload includes "ext" (e.g. ext=$0.51 (2.8%)), copy it verbatim after Entry/SL/TP.
    That is extrinsic premium — do not invent or omit it on EXECUTE rows.
-4. When "delta" is present, append δ=0.XX. Never invent delta.
-5. MAX 32 words after the Score clause on EXECUTE rows; 25 on PASS/change rows.
-6. BANNED phrases (never use any of these or close variants):
+4. When payload includes piv=/mom=/vol=/T=/S=/liq=/dATR= score components, copy them
+   verbatim after the contract/ext fields. Do not invent component values.
+5. When "delta" is present, append δ=0.XX. Never invent delta.
+6. MAX 40 words after the Score clause on EXECUTE rows; 25 on PASS/change rows.
+7. BANNED phrases (never use any of these or close variants):
    CEO, CEO says, No deltas to manage, No hesitation, We move, Let's work,
    Disciplined execution, No fluff, Load the position.
-7. No morning brief, no ES/NQ futures essays, no MIDDAY MEETING headers, no table.
-8. Output ONLY the bullet list. No preamble or closing.
+8. No morning brief, no ES/NQ futures essays, no MIDDAY MEETING headers, no table.
+9. Output ONLY the bullet list. No preamble or closing.
 """
 
 
@@ -125,11 +127,25 @@ def macro_vector_local(ticker: str) -> str:
 
 
 def adversarial_local(card) -> dict:
-    if card.liquidity_score < 20 or card.sentiment_score == 0:
+    """
+    Local adversarial fallback (no LLM).
+
+    Post floor-fix: liquidity_score is liq_mult (0..1), not 0..30 points.
+    sentiment_score is signed S (-15..+15); 0 means no news, not "hostile".
+    """
+    liq = getattr(card, "liquidity_score", 1.0)
+    try:
+        liq = float(liq)
+    except (TypeError, ValueError):
+        liq = 1.0
+    # Treat values >1 as legacy 0..30 scale
+    if liq > 1.0:
+        liq = liq / 30.0
+    if liq <= 0.0:
         return {
             "veto_triggered": True,
             "risk_confidence": 0.85,
-            "reason": "Local adversarial: weak liquidity or hostile sentiment.",
+            "reason": "Local adversarial: untradeable liquidity (liq_mult=0).",
         }
     return {
         "veto_triggered": False,
@@ -247,14 +263,28 @@ def _fmt_contract_cell(contract: dict | None) -> str:
     return f"{strike_s}{letter} {exp_s}"
 
 
-def _fmt_extrinsic(contract: dict | None) -> str:
+def _fmt_score_subs(card) -> str:
+    """piv= mom= vol= T= S= liq= dATR= for EXECUTE telemetry (forensic)."""
+    try:
+        return scoring_engine.format_subscore_bits(card)
+    except Exception:
+        return ""
+
+
+def _fmt_extrinsic(contract: dict | None, card=None) -> str:
     """
-    Compact moneyness + Stage 4 C-E fields:
+    Compact moneyness + Stage 4 C-E fields + score components:
+      piv=… mom=… vol=… T=… S=… liq=… dATR=…
       ext=$0.51 (2.8%) dte=1.2 rm_atr=0.31 decay=2.5%/hr
     Appends δ=… only when the chain already supplied delta (no local BS).
     """
+    parts: list[str] = []
+    if card is not None:
+        sub = _fmt_score_subs(card)
+        if sub:
+            parts.append(sub)
     if not contract or "error" in contract:
-        return ""
+        return " ".join(parts)
     entry = _num(contract.get("entry_premium"))
     ext = _num(contract.get("extrinsic"))
     ext_pct = _num(contract.get("extrinsic_pct"))
@@ -270,7 +300,6 @@ def _fmt_extrinsic(contract: dict | None) -> str:
                 intrinsic = max(0.0, spot - strike)
             ext = entry - intrinsic
             ext_pct = (ext / entry * 100.0) if entry > 0 else None
-    parts: list[str] = []
     if ext is not None and entry is not None:
         if ext_pct is None and entry > 0:
             ext_pct = ext / entry * 100.0
@@ -359,7 +388,7 @@ def deterministic_telemetry_bullet(row: dict) -> str:
         # Prefer row spot when contract.spot missing
         if c.get("spot") is None and row.get("spot") is not None:
             c["spot"] = row.get("spot")
-        ext_s = _fmt_extrinsic(c)
+        ext_s = _fmt_extrinsic(c, card=row.get("card"))
         ext_bit = f" {ext_s}" if ext_s else ""
         rationale = (
             f"Setup {_fmt_contract_cell(c)} entry {_fmt_money(c.get('entry_premium'))} "
@@ -370,8 +399,8 @@ def deterministic_telemetry_bullet(row: dict) -> str:
         f"- **{ticker}**: Spot ${spot} {rel} Pivot ${pivot}. "
         f"Score: {score_s}/100. {rationale}"
     )
-    # EXECUTE lines carry ext/dte/rm_atr/decay; allow room so C-E is not clipped.
-    max_words = 48 if row.get("action_flag") == "EXECUTE" else 25
+    # EXECUTE lines carry piv/mom/vol/T/S/liq/dATR + ext/dte/rm_atr/decay
+    max_words = 64 if row.get("action_flag") == "EXECUTE" else 25
     return _limit_rationale_words(_purge_banned(bullet), max_words)
 
 
@@ -633,12 +662,12 @@ def run_thirty_min_scan(
         baseline["morning_briefing"] = morning_macro_context[:12000]
 
     open_baseline = not bool(baseline.get("tickers"))
-    weights = config.load_weights()
     futures_pct = get_latest_futures_pct("ES=F")
     clock = cdt_clock_str()
     print(
         f"\n🚀 30-MIN SCAN {scan_id} | {clock} CDT | tickers={len(universe)} | "
-        f"open_baseline={open_baseline} | ES=F {futures_pct}%"
+        f"open_baseline={open_baseline} | ES=F {futures_pct}% | "
+        f"score=T+S×liq thr={config.EXECUTE_THRESHOLD}"
     )
 
     new_ticker_state = dict(baseline.get("tickers") or {})
@@ -682,11 +711,15 @@ def run_thirty_min_scan(
                 macro_vector=macro_vector,
                 futures_pct=futures_pct,
                 atr_pct=atr_pct,
-                weights=weights,
+                atr_abs=atr_abs,
             )
+            # Per-scan sub-score line already printed inside score_ticker
             print(
                 f"[{ticker}] ⚙️ score "
-                f"{card.total_score}/100 → {card.action_flag}"
+                f"T={card.technical_score} S={card.sentiment_score:+g} "
+                f"×liq={card.liquidity_score} = {card.total_score}/100 → "
+                f"{card.action_flag}"
+                + (f" ({card.block_reason})" if getattr(card, "block_reason", None) else "")
             )
 
             adv = None
@@ -849,6 +882,7 @@ def run_thirty_min_scan(
                 score=float(card.total_score),
                 direction=ctx.get("direction"),
                 action_flag=card.action_flag,
+                block_reason=getattr(card, "block_reason", None),
             )
         )
 
@@ -999,9 +1033,15 @@ def run_thirty_min_scan(
         except Exception as te:
             print(f"[{ticker}] telemetry WARNING: {te}")
 
-    # Append Part C contract-filter rejects to the GATE summary line
-    if strike_rejects:
-        reject_line = "REJECT " + " ".join(strike_rejects)
+    # Dead-zone + Part C contract-filter rejects on the GATE summary line
+    dead_rejects = []
+    for ticker, ctx in scored.items():
+        card = ctx.get("card")
+        if card is not None and getattr(card, "block_reason", None) == "dead_zone":
+            dead_rejects.append(f"{ticker}:dead_zone")
+    reject_bits = dead_rejects + strike_rejects
+    if reject_bits:
+        reject_line = "REJECT " + " ".join(reject_bits)
         gate_summary = f"{gate_summary} | {reject_line}"
         result["gate_summary"] = gate_summary
         print(f"[scan] {reject_line}")

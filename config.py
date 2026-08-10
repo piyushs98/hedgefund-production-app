@@ -3,11 +3,11 @@ config.py — Central configuration for the hedge fund bot.
 
 Single source of truth for:
   * Ticker universe
-  * Database paths (news_room.db for news memory, hedge_fund.db for telemetry/weights)
+  * Database paths (news_room.db for news memory, hedge_fund.db for telemetry)
   * API keys  (ENV-ONLY. Hardcoded fallback keys were removed deliberately —
                the old keys were committed to source and must be rotated.)
-  * Dynamic scoring weights (persisted, so saturday_audit.py recommendations
-    actually feed back into the live scoring engine instead of being ignored)
+  * Scoring knobs: T/S/liq_mult model in scoring_engine.py (env-tunable).
+    Additive 30/40/30 pillar weights are RETIRED.
 """
 
 import os
@@ -74,21 +74,15 @@ def assert_secrets(require_discord=True):
 
 
 # ------------------------------------------------------------------
-# Dynamic scoring weights (Task 2 + feedback loop from saturday_audit)
+# Scoring threshold + calibrated conviction model (env-tunable)
+# Live scoring: clamp(T(0..TECH_CEIL)+S(-SENT_MAX..+SENT_MAX),0,100)×liq_mult
+# Additive 30/40/30 pillar weights are RETIRED — load_weights/save_weights
+# remain as no-op-compatible stubs so saturday_audit does not crash.
 # ------------------------------------------------------------------
-DEFAULT_WEIGHTS = {"liquidity": 30, "technical": 40, "sentiment": 30}
-EXECUTE_THRESHOLD = 70
+EXECUTE_THRESHOLD = 70  # never change without explicit mandate
 
-# ------------------------------------------------------------------
-# Stage 3 signal gate — all knobs are env-overridable (no code change).
-# Set on Render / local shell and restart the process to apply.
-#   GATE_MAX_ENTRIES_PER_TICKER  default 6   (daily cap per ticker)
-#   GATE_MAX_CONCURRENT          default 10  (paper: exits protect the book)
-#   GATE_PERSIST_CYCLES          default 2
-#   GATE_FLIP_LOCK_MINUTES       default 60
-#   GATE_FLIP_OVERRIDE_SCORE     default 85
-#   GATE_REENTRY_COOLDOWN_MINUTES default 45
-# ------------------------------------------------------------------
+# Schema-compat only; not used by score_ticker.
+DEFAULT_WEIGHTS = {"liquidity": 0, "technical": 85, "sentiment": 15}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -187,8 +181,37 @@ REQUIRED_MOVE_ATR_K = _env_float("REQUIRED_MOVE_ATR_K", 0.5)
 EXIT_MAX_DECAY_DENSITY = _env_float("EXIT_MAX_DECAY_DENSITY", 8.0)
 MIN_EXTRINSIC_PCT = _env_float("MIN_EXTRINSIC_PCT", 10.0)
 
+# ------------------------------------------------------------------
+# Calibrated scoring (scoring_engine). All env-tunable; restart to apply.
+#   Defaults: compromise A retuned 2026-08-10 for Mon/Fri two-sided test.
+#   PIVOT_SCALE=0.40 ATR, PIVOT_POWER=1.0, MOM_SCALE=0.45 %,
+#   W_PIVOT=0.70 / W_MOM=0.30, TECH_CEIL=85, SENT_MAX=15,
+#   DEAD_ZONE_ATR=0.30 (hard PASS when |spot−pivot|/ATR below this).
+# ------------------------------------------------------------------
+PIVOT_SCALE = _env_float("PIVOT_SCALE", 0.40)
+PIVOT_POWER = _env_float("PIVOT_POWER", 1.0)
+MOM_SCALE = _env_float("MOM_SCALE", 0.45)
+W_PIVOT = _env_float("W_PIVOT", 0.70)
+W_MOM = _env_float("W_MOM", 0.30)
+TECH_CEIL = _env_float("TECH_CEIL", 85.0)
+SENT_MAX = _env_float("SENT_MAX", 15.0)
+DEAD_ZONE_ATR = _env_float("DEAD_ZONE_ATR", 0.30)
+
+
+def log_scoring_config() -> None:
+    """Boot log: resolved scoring knobs next to [Gate] / [EntryFilters]."""
+    print(
+        f"[Scoring] thr={EXECUTE_THRESHOLD} "
+        f"PIVOT_SCALE={PIVOT_SCALE} PIVOT_POWER={PIVOT_POWER} "
+        f"MOM_SCALE={MOM_SCALE} W_PIVOT={W_PIVOT} W_MOM={W_MOM} "
+        f"TECH_CEIL={TECH_CEIL} SENT_MAX={SENT_MAX} "
+        f"DEAD_ZONE_ATR={DEAD_ZONE_ATR} "
+        f"(env-tunable; restart process to apply)"
+    )
+
 
 def _init_weights_table():
+    """Deprecated table kept so old DBs do not error on accidental reads."""
     os.makedirs(os.path.dirname(HEDGE_DB_PATH), exist_ok=True)
     with sqlite3.connect(HEDGE_DB_PATH, timeout=30.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -203,41 +226,24 @@ def _init_weights_table():
 
 
 def load_weights():
-    """Returns the current pillar weights, validated to sum to 100.
-    Falls back to DEFAULT_WEIGHTS if the table is empty or corrupt."""
-    try:
-        _init_weights_table()
-        with sqlite3.connect(HEDGE_DB_PATH, timeout=30.0) as conn:
-            row = conn.execute(
-                "SELECT weights_json FROM scoring_weights WHERE id = 1"
-            ).fetchone()
-        if row:
-            w = json.loads(row[0])
-            if (set(w.keys()) == set(DEFAULT_WEIGHTS.keys())
-                    and all(isinstance(v, (int, float)) and v >= 0 for v in w.values())
-                    and abs(sum(w.values()) - 100) < 0.01):
-                return {k: float(v) for k, v in w.items()}
-            print("[Config] Stored weights invalid; using defaults.")
-    except Exception as e:
-        print(f"[Config] Could not load weights ({e}); using defaults.")
+    """DEPRECATED. Returns documentation-only caps; scoring_engine ignores this."""
     return dict(DEFAULT_WEIGHTS)
 
 
 def save_weights(weights):
-    """Persist new pillar weights (called by saturday_audit). Validates sum=100."""
-    if set(weights.keys()) != set(DEFAULT_WEIGHTS.keys()):
-        raise ValueError(f"Weights must have keys {sorted(DEFAULT_WEIGHTS)}")
-    if abs(sum(weights.values()) - 100) > 0.01:
-        raise ValueError(f"Weights must sum to 100, got {sum(weights.values())}")
-    _init_weights_table()
-    with sqlite3.connect(HEDGE_DB_PATH, timeout=30.0) as conn:
-        conn.execute(
-            """INSERT INTO scoring_weights (id, weights_json, updated_at)
-               VALUES (1, ?, CURRENT_TIMESTAMP)
-               ON CONFLICT(id) DO UPDATE SET
-                   weights_json = excluded.weights_json,
-                   updated_at = CURRENT_TIMESTAMP""",
-            (json.dumps(weights),),
+    """DEPRECATED no-op. Additive weight writes no longer affect live scoring.
+
+    Still validates shape so saturday_audit can call it without crashing, then
+    discards the payload. Does not write to the DB as active scoring input.
+    """
+    if weights and set(weights.keys()) != set(DEFAULT_WEIGHTS.keys()):
+        print(
+            f"[Config] save_weights ignored (retired scheme); "
+            f"unexpected keys {sorted(weights.keys())}."
         )
-        conn.commit()
-    print(f"[Config] Scoring weights persisted: {weights}")
+    else:
+        print(
+            f"[Config] save_weights DEPRECATED — ignored {weights!r}. "
+            "Live scoring uses scoring_engine T/S/liq_mult, not pillar weights."
+        )
+    return None

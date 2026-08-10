@@ -586,10 +586,9 @@ def format_ceo_deterministic(card, contract=None, *, include_session_open_contex
         f"* **Sentiment Alignment**: {sm.get('headline_count')} headlines scanned — "
         f"{sm.get('bullish_hits')} bullish vs {sm.get('bearish_hits')} bearish signals; "
         f"macro read: {sm.get('macro_note')}.\n"
-        f"* **Strategic Executive Decision**: Weighted engine scored Liquidity "
-        f"{card.liquidity_score}/{card.weights.get('liquidity')}, Technical "
-        f"{card.technical_score}/{card.weights.get('technical')}, Sentiment "
-        f"{card.sentiment_score}/{card.weights.get('sentiment')} "
+        f"* **Strategic Executive Decision**: Conviction engine scored "
+        f"T={card.technical_score} + S={card.sentiment_score:+g} "
+        f"× liq_mult={card.liquidity_score} "
         f"(adversarial penalty -{card.adversarial_penalty:g}) for a total of "
         f"{card.total_score}/100, mandating {card.action_flag}.{strat}"
     )
@@ -801,10 +800,10 @@ def run_portfolio_scan(
 
     scan_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     result["scan_id"] = scan_id
-    weights = config.load_weights()
     futures_pct = get_latest_futures_pct("ES=F")
     print(f"\n🚀 PORTFOLIO SCAN {scan_id} | tickers={universe} | "
-          f"weights={weights} | ES=F overnight {futures_pct}%")
+          f"score=T+S×liq thr={config.EXECUTE_THRESHOLD} | "
+          f"ES=F overnight {futures_pct}%")
 
     # Stage 3: reconcile gate book with durable open positions (Tracker may be
     # another process — on_close alone is not enough across process boundaries).
@@ -967,15 +966,19 @@ def run_portfolio_scan(
                     continue
                 macro_vector = "Neutral macroeconomic backdrop (LLM offline)."
 
-            # ---- Deterministic weighted scoring (Task 2) ----
+            # ---- Deterministic conviction scoring (T+S×liq; weights retired) ----
             card = scoring_engine.score_ticker(
                 ticker, options_dict, pivot_data, news_string,
                 macro_vector=macro_vector, futures_pct=futures_pct,
-                atr_pct=atr_pct, weights=weights,
+                atr_pct=atr_pct, atr_abs=atr_abs,
             )
-            print(f"[{ticker}] ⚙️ Scoring Engine: L {card.liquidity_score} + "
-                  f"T {card.technical_score} + S {card.sentiment_score} = "
-                  f"{card.total_score}/100 -> {card.action_flag}")
+            print(
+                f"[{ticker}] ⚙️ Scoring Engine: "
+                f"T={card.technical_score} S={card.sentiment_score:+g} "
+                f"×liq={card.liquidity_score} = {card.total_score}/100 -> "
+                f"{card.action_flag}"
+                + (f" ({card.block_reason})" if getattr(card, "block_reason", None) else "")
+            )
 
             is_execute = card.action_flag == "EXECUTE"
             # Reset gate streaks on PASS (same process_scan path as EXECUTE blocks).
@@ -987,6 +990,7 @@ def run_portfolio_scan(
                             score=float(card.total_score),
                             direction=None,
                             action_flag="PASS",
+                            block_reason=getattr(card, "block_reason", None),
                         )],
                         datetime.now(timezone.utc),
                     )
@@ -1105,6 +1109,7 @@ def run_portfolio_scan(
                         score=float(card.total_score),
                         direction=direction,
                         action_flag="EXECUTE",
+                        block_reason=getattr(card, "block_reason", None),
                     )],
                     datetime.now(timezone.utc),
                 )
@@ -1325,6 +1330,8 @@ def run_macro_loop():
         f"EXIT_MAX_DECAY_DENSITY={config.EXIT_MAX_DECAY_DENSITY}%/hr "
         f"MAX_EXPIRY_CALENDAR_DTE={config.MAX_EXPIRY_CALENDAR_DTE}"
     )
+    if hasattr(config, "log_scoring_config"):
+        config.log_scoring_config()
     print(
         f"[SessionCutoffs] EXIT_EOD_FLATTEN_CDT="
         f"{config.EXIT_EOD_FLATTEN_HOUR:02d}:{config.EXIT_EOD_FLATTEN_MINUTE:02d} "
