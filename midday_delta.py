@@ -71,12 +71,13 @@ OUTPUT RULES (strict):
 1. One bullet per ticker. Format exactly:
 - **TICKER**: Spot $X vs Pivot $Y. Score: Z/100. <brief technical rationale>
 2. Data-dense only: Spot, Pivot, Score, and Contract/Entry/SL/TP if provided.
-3. When the payload includes "ext" (e.g. ext=$0.51 (2.8%)), copy it verbatim after Entry/SL/TP.
-   That is extrinsic premium — do not invent or omit it on EXECUTE rows.
-4. When payload includes piv=/mom=/vol=/T=/S=/liq=/dATR= score components, copy them
-   verbatim after the contract/ext fields. Do not invent component values.
+3. ALWAYS copy piv= mom= vol= T= S= liq= dATR= (score_subs) verbatim after Score
+   on EVERY row (EXECUTE and PASS). Prefer numbers over prose; drop commentary first.
+4. When the payload includes "ext" (e.g. ext=$0.51 (2.8%)), copy it verbatim after
+   contract fields on EXECUTE rows. Do not invent extrinsic.
 5. When "delta" is present, append δ=0.XX. Never invent delta.
-6. MAX 40 words after the Score clause on EXECUTE rows; 25 on PASS/change rows.
+6. When "block" is present (no_liq_data / spread_untradeable / no_momentum_data /
+   dead_zone), state it briefly — that is a data/structure PASS, not weak technicals.
 7. BANNED phrases (never use any of these or close variants):
    CEO, CEO says, No deltas to manage, No hesitation, We move, Let's work,
    Disciplined execution, No fluff, Load the position.
@@ -372,7 +373,20 @@ def _limit_rationale_words(bullet: str, max_words: int = 25) -> str:
     return f"{head} {tail}".strip() if tail else head
 
 
+def _row_subscore_bits(row: dict) -> str:
+    """Sub-score string from card or precomputed bits — every telemetry row."""
+    card = row.get("card")
+    if card is not None:
+        return _fmt_score_subs(card)
+    bits = row.get("score_subs")
+    return str(bits) if bits else ""
+
+
 def deterministic_telemetry_bullet(row: dict) -> str:
+    """
+    KEY TELEMETRY bullet. Numbers first: always attach piv/mom/vol/T/S/liq/dATR.
+    Prose is secondary and truncated first if the payload is long.
+    """
     ticker = row.get("ticker")
     spot = _fmt_money(row.get("spot")).replace("$", "")
     pivot = _fmt_money(row.get("pivot")).replace("$", "")
@@ -382,25 +396,36 @@ def deterministic_telemetry_bullet(row: dict) -> str:
     except (TypeError, ValueError):
         score_s = str(score)
     rel = ">" if _num(row.get("spot"), 0) >= _num(row.get("pivot"), 0) else "<"
-    rationale = "Holding pivot structure." if rel == ">" else "Trading below pivot; caution."
+    sub_bits = _row_subscore_bits(row)
+    sub_tail = f" {sub_bits}" if sub_bits else ""
+
+    rationale = ""
     if row.get("action_flag") == "EXECUTE" and row.get("contract"):
         c = dict(row["contract"])
-        # Prefer row spot when contract.spot missing
         if c.get("spot") is None and row.get("spot") is not None:
             c["spot"] = row.get("spot")
-        ext_s = _fmt_extrinsic(c, card=row.get("card"))
+        # Contract fields only — subs already attached once
+        ext_s = _fmt_extrinsic(c, card=None)
         ext_bit = f" {ext_s}" if ext_s else ""
         rationale = (
             f"Setup {_fmt_contract_cell(c)} entry {_fmt_money(c.get('entry_premium'))} "
             f"SL {_fmt_money(c.get('stop_loss'))} TP {_fmt_money(c.get('take_profit'))}"
             f"{ext_bit}."
         )
+    elif row.get("block_reason") or (
+        row.get("card") and getattr(row.get("card"), "block_reason", None)
+    ):
+        br = row.get("block_reason") or getattr(row.get("card"), "block_reason", None)
+        rationale = f"block={br}."
+    # else: no prose — numbers only (prefer subs over "Holding pivot…")
+
     bullet = (
         f"- **{ticker}**: Spot ${spot} {rel} Pivot ${pivot}. "
-        f"Score: {score_s}/100. {rationale}"
+        f"Score: {score_s}/100.{sub_tail}"
+        + (f" {rationale}" if rationale else "")
     )
-    # EXECUTE lines carry piv/mom/vol/T/S/liq/dATR + ext/dte/rm_atr/decay
-    max_words = 64 if row.get("action_flag") == "EXECUTE" else 25
+    # Prefer keeping numbers: truncate prose first via high word budget on subs
+    max_words = 72 if row.get("action_flag") == "EXECUTE" else 48
     return _limit_rationale_words(_purge_banned(bullet), max_words)
 
 
@@ -476,7 +501,11 @@ def deepseek_key_telemetry(
             c_for_ext = dict(c)
             if c_for_ext.get("spot") is None and r.get("spot") is not None:
                 c_for_ext["spot"] = r.get("spot")
-            ext_label = _fmt_extrinsic(c_for_ext) or None
+            ext_label = _fmt_extrinsic(c_for_ext, card=None) or None
+        card = r.get("card")
+        sub = {}
+        if card is not None and isinstance(getattr(card, "metrics", None), dict):
+            sub = (card.metrics or {}).get("subscores") or {}
         payload_lines.append(
             json.dumps(
                 {
@@ -485,6 +514,18 @@ def deepseek_key_telemetry(
                     "spot": r.get("spot"),
                     "pivot": r.get("pivot"),
                     "score": r.get("total_score"),
+                    # Sub-scores first-class — copy verbatim; prefer over prose
+                    "piv": sub.get("pivot_sub"),
+                    "mom": sub.get("mom_sub"),
+                    "vol": sub.get("vol_mult"),
+                    "T": sub.get("T", getattr(card, "technical_score", None) if card else None),
+                    "S": sub.get("S", getattr(card, "sentiment_score", None) if card else None),
+                    "liq": sub.get("liq_mult"),
+                    "dATR": sub.get("atr_distance"),
+                    "block": sub.get("block_reason")
+                    or getattr(card, "block_reason", None)
+                    or r.get("block_reason"),
+                    "score_subs": _row_subscore_bits(r) or None,
                     "changes": r.get("changes") or [],
                     "contract": _fmt_contract_cell(c) if c else None,
                     "entry": c.get("entry_premium") if c else None,
@@ -499,13 +540,16 @@ def deepseek_key_telemetry(
                     "delta": c.get("delta") if c else None,
                 },
                 separators=(",", ":"),
+                default=str,
             )
         )
 
     user = (
         "Produce KEY TICKER TELEMETRY bullets for these rows only:\n"
         + "\n".join(payload_lines)
-        + "\n\nOne bullet per ticker. ≤25 words after Score. Banned filler enforced."
+        + "\n\nOne bullet per ticker. ALWAYS copy piv= mom= vol= T= S= liq= dATR= "
+        "from score_subs (or piv/mom/vol/T/S/liq/dATR fields) verbatim after Score. "
+        "Prefer numbers over prose; omit commentary if long. Banned filler enforced."
     )
     print(
         f"[scan] KEY TELEMETRY via DeepSeek primary "
@@ -995,6 +1039,8 @@ def run_thirty_min_scan(
             "changes": changes,
             "contract": contract,
             "card": card,
+            "block_reason": getattr(card, "block_reason", None),
+            "score_subs": _fmt_score_subs(card),
             "gate_reason": None if gdec is None else gdec.reason,
             "gate_admit": None if gdec is None else gdec.admit,
         }
@@ -1033,18 +1079,46 @@ def run_thirty_min_scan(
         except Exception as te:
             print(f"[{ticker}] telemetry WARNING: {te}")
 
-    # Dead-zone + Part C contract-filter rejects on the GATE summary line
-    dead_rejects = []
+    # Data-failure + dead-zone + Part C rejects on the GATE summary line
+    DATA_BLOCKS = (
+        "no_liq_data",
+        "spread_untradeable",
+        "no_momentum_data",
+        "dead_zone",
+    )
+    data_rejects: list[str] = []
+    data_fail_count = 0  # no_liq_data + no_momentum_data only (outages)
     for ticker, ctx in scored.items():
         card = ctx.get("card")
-        if card is not None and getattr(card, "block_reason", None) == "dead_zone":
-            dead_rejects.append(f"{ticker}:dead_zone")
-    reject_bits = dead_rejects + strike_rejects
+        br = getattr(card, "block_reason", None) if card is not None else None
+        if br in DATA_BLOCKS:
+            data_rejects.append(f"{ticker}:{br}")
+        if br in ("no_liq_data", "no_momentum_data"):
+            data_fail_count += 1
+    reject_bits = data_rejects + strike_rejects
     if reject_bits:
         reject_line = "REJECT " + " ".join(reject_bits)
         gate_summary = f"{gate_summary} | {reject_line}"
         result["gate_summary"] = gate_summary
         print(f"[scan] {reject_line}")
+
+    # Whole-book data outage: loud, not silent
+    DATA_FAIL_CRITICAL_N = 3
+    if data_fail_count > DATA_FAIL_CRITICAL_N:
+        msg = (
+            f"🚨 **CRITICAL: SCORE DATA OUTAGE** | "
+            f"{data_fail_count} tickers hit no_liq_data/no_momentum_data "
+            f"this scan (>{DATA_FAIL_CRITICAL_N}). "
+            f"Failures: {', '.join(data_rejects) or 'n/a'}. "
+            f"Not scoring as weak setups — investigate Yahoo/options/pivot feed."
+        )
+        print(f"[scan] {msg}")
+        try:
+            broadcaster.send_discord_alert(msg)
+        except Exception as crit_err:
+            print(f"[scan] data-outage Discord warn: {crit_err}")
+        result["data_outage_critical"] = True
+        result["data_fail_count"] = data_fail_count
 
     baseline["tickers"] = new_ticker_state
     if open_baseline:

@@ -411,7 +411,21 @@ class SignalGate:
 
 
 def _compact_reason(reason: str) -> str:
-    r = reason.lower()
+    r = (reason or "").lower().strip()
+    # Exact data-failure tags from scorer block_reason (must stay distinct)
+    if r in (
+        "no_liq_data",
+        "spread_untradeable",
+        "no_momentum_data",
+        "dead_zone",
+    ):
+        return r
+    if "no_liq_data" in r or "no liq" in r:
+        return "no_liq_data"
+    if "spread_untradeable" in r or "untradeable" in r:
+        return "spread_untradeable"
+    if "no_momentum_data" in r or "no momentum" in r:
+        return "no_momentum_data"
     if "dead_zone" in r or "dead zone" in r:
         return "dead_zone"
     if "same_scan" in r:

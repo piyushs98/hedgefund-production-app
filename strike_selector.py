@@ -146,10 +146,20 @@ def _days_to_expiration(exp_str: str, now: datetime | None = None) -> float:
 
 def infer_direction(pivot_data):
     """CALL if price holds above pivot with non-negative momentum, PUT if
-    decisively below pivot with negative momentum, else side with posture."""
+    decisively below pivot with negative momentum, else side with posture.
+
+    pct_change may be None (unknown day-change) — treat as neutral for
+    direction so we do not force PUT/CALL from a data hole.
+    """
     close = pivot_data.get("close", 0.0)
     pivot = pivot_data.get("pivot", close)
-    pct = pivot_data.get("pct_change", 0.0)
+    raw_pct = pivot_data.get("pct_change", None)
+    try:
+        pct = float(raw_pct) if raw_pct is not None else None
+    except (TypeError, ValueError):
+        pct = None
+    if pct is None:
+        return "CALL" if close >= pivot else "PUT"
     if close >= pivot and pct >= 0:
         return "CALL"
     if close < pivot and pct < 0:

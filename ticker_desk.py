@@ -75,10 +75,12 @@ def _levels_from_ohlc(high, low, close):
 
 def _select_completed_session(hist, today):
     """
-    Return (basis_row_as_dict, basis_date, live_close) from daily history.
+    Return (basis_dict, live_close, live_from_today_bar) from daily history.
 
     Basis = last bar whose date is strictly before `today` (completed session).
     live_close = today's developing close if present, else basis close.
+    live_from_today_bar = True only when today's bar was present (pct_change is
+    then measurable). When False, pct_change is UNKNOWN — not a flat day.
     Raises ValueError if no completed session is available.
     """
     if hist is None or hist.empty:
@@ -100,13 +102,19 @@ def _select_completed_session(hist, today):
     high = float(basis_row["High"])
     low = float(basis_row["Low"])
     close = float(basis_row["Close"])
-    live_close = today_close if today_close is not None else close
+    if today_close is not None:
+        return {
+            "high": high,
+            "low": low,
+            "close": close,
+            "basis_date": basis_date,
+        }, float(today_close), True
     return {
         "high": high,
         "low": low,
         "close": close,
         "basis_date": basis_date,
-    }, live_close
+    }, float(close), False
 
 
 def fetch_pivot_data(ticker):
@@ -128,6 +136,7 @@ def fetch_pivot_data(ticker):
         # Extra days so weekends/holidays still leave a completed bar
         hist = stock.history(period="10d")
 
+        live_from_today = False
         if hist.empty:
             info = stock.info or {}
             live_close = (
@@ -143,8 +152,11 @@ def fetch_pivot_data(ticker):
             basis_date = None
             basis = {"high": high, "low": low, "close": basis_close, "basis_date": basis_date}
             live_close = float(live_close)
+            # info.regularMarketPrice may be live, but without a today bar we
+            # cannot trust pct vs basis as a measured day-change for scoring.
+            live_from_today = info.get("regularMarketPrice") is not None
         else:
-            basis, live_close = _select_completed_session(hist, today)
+            basis, live_close, live_from_today = _select_completed_session(hist, today)
             high, low, basis_close = basis["high"], basis["low"], basis["close"]
             basis_date = basis["basis_date"]
 
@@ -191,10 +203,17 @@ def fetch_pivot_data(ticker):
                 f"P={levels['pivot']:.2f} R1={levels['r1']:.2f} S1={levels['s1']:.2f}"
             )
 
-        if basis_close and basis_close > 0:
-            pct_change = ((live_close - basis_close) / basis_close) * 100.0
+        # pct_change is UNKNOWN (None) when we cannot measure day move — never
+        # costume a missing today bar as a flat day (pct=0.0).
+        if live_from_today and basis_close and basis_close > 0:
+            pct_change = round(((live_close - basis_close) / basis_close) * 100.0, 2)
         else:
-            pct_change = 0.0
+            pct_change = None
+            if not live_from_today:
+                print(
+                    f"[{ticker_key}] pct_change UNKNOWN: no today bar in history "
+                    f"(live_close fell back to basis); not scoring as flat day."
+                )
 
         return {
             "close": round(live_close, 2),
@@ -203,11 +222,14 @@ def fetch_pivot_data(ticker):
             "s1": levels["s1"],
             "r2": levels["r2"],
             "s2": levels["s2"],
-            "pct_change": round(pct_change, 2),
+            "pct_change": pct_change,
+            "basis_close": round(float(basis_close), 2) if basis_close else None,
+            "live_from_today": bool(live_from_today),
         }
     except Exception as e:
         print(f"❌ [Specialist Desk] Error fetching pivot data for {ticker}: {e}")
         # Default placeholder safe return (not cached — avoid freezing garbage)
+        # pct_change=None so scorer flags no_momentum_data, not silent mom=0.
         return {
             "close": 100.0,
             "pivot": 100.0,
@@ -215,7 +237,9 @@ def fetch_pivot_data(ticker):
             "s1": 99.0,
             "r2": 102.0,
             "s2": 98.0,
-            "pct_change": 0.0,
+            "pct_change": None,
+            "basis_close": None,
+            "live_from_today": False,
         }
 
 def get_specialist_briefing(ticker, pivot_data, news_headlines):

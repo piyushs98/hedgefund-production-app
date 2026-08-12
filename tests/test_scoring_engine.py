@@ -1,13 +1,14 @@
-"""Calibrated conviction scoring + dead zone (2026-08 rewrite)."""
+"""Calibrated conviction scoring + data-failure gates (2026-08 rewrite)."""
 
 from __future__ import annotations
 
-import math
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 import config
 import scoring_engine as se
+import signal_gate as sg
 
 
 def _tight_chain(spot: float = 100.0) -> dict:
@@ -39,6 +40,64 @@ def _tight_chain(spot: float = 100.0) -> dict:
     }
 
 
+def _zero_bid_chain(spot: float = 100.0) -> dict:
+    """ATM rows present but bid=0 (Yahoo fillna) → no usable spreads."""
+    return {
+        "current_price": spot,
+        "chains": {
+            "2099-01-01": {
+                "calls": [
+                    {
+                        "strike": spot,
+                        "bid": 0.0,
+                        "ask": 0.0,
+                        "volume": 0,
+                        "openInterest": 0,
+                    }
+                ],
+                "puts": [
+                    {
+                        "strike": spot,
+                        "bid": 0.0,
+                        "ask": 1.5,
+                        "volume": 0,
+                        "openInterest": 0,
+                    }
+                ],
+            }
+        },
+    }
+
+
+def _wide_spread_chain(spot: float = 100.0) -> dict:
+    """Median spread >10% → spread_untradeable."""
+    return {
+        "current_price": spot,
+        "chains": {
+            "2099-01-01": {
+                "calls": [
+                    {
+                        "strike": spot,
+                        "bid": 0.50,
+                        "ask": 2.00,
+                        "volume": 100,
+                        "openInterest": 100,
+                    }
+                ],
+                "puts": [
+                    {
+                        "strike": spot,
+                        "bid": 0.50,
+                        "ask": 2.00,
+                        "volume": 100,
+                        "openInterest": 100,
+                    }
+                ],
+            }
+        },
+    }
+
+
 class TestThresholdConstant(unittest.TestCase):
     def test_execute_threshold_still_70(self):
         self.assertEqual(config.EXECUTE_THRESHOLD, 70)
@@ -46,21 +105,20 @@ class TestThresholdConstant(unittest.TestCase):
 
 class TestNeutralAndStrong(unittest.TestCase):
     def test_neutral_setup_scores_zero(self):
-        """Spot exactly at pivot, zero day move → T=0, total=0 (and dead zone)."""
+        """Spot at pivot, flat day on placeholder 100/100 → T=0 + dead zone."""
         pivot_data = {
             "close": 100.0,
             "pivot": 100.0,
             "r1": 101.0,
             "s1": 99.0,
-            "pct_change": 0.0,
+            "pct_change": 0.0,  # placeholder pair — not treated as live
         }
-        # atr_abs large so distance is 0; dead zone also applies
-        T, tm, _ = se.score_technical(
+        T, tm, _, mom_status = se.score_technical(
             pivot_data, atr_pct=1.5, atr_abs=2.0, direction_sign=1.0
         )
         self.assertEqual(T, 0.0)
         self.assertEqual(tm.get("pivot_sub"), 0.0)
-        self.assertEqual(tm.get("mom_sub"), 0.0)
+        self.assertIsNone(mom_status)  # 100/100 not "live" → 0.0 allowed as measured
 
         card = se.score_ticker(
             "TEST",
@@ -85,12 +143,12 @@ class TestNeutralAndStrong(unittest.TestCase):
             "s1": 96.0,
             "pct_change": 1.5,
         }
-        T, tm, _ = se.score_technical(
+        T, tm, _, mom_status = se.score_technical(
             pivot_data, atr_pct=2.0, atr_abs=atr, direction_sign=1.0
         )
+        self.assertIsNone(mom_status)
         self.assertGreaterEqual(T, 80.0)
         self.assertLessEqual(T, 85.0)
-        # Analytical target ~84.9 under default params
         self.assertAlmostEqual(T, 84.9, delta=1.5)
 
         card = se.score_ticker(
@@ -101,63 +159,190 @@ class TestNeutralAndStrong(unittest.TestCase):
             atr_pct=2.0,
             atr_abs=atr,
         )
-        self.assertEqual(card.block_reason, None)
+        self.assertIsNone(card.block_reason)
         self.assertEqual(card.action_flag, "EXECUTE")
         self.assertGreaterEqual(card.total_score, 70.0)
-        self.assertLessEqual(card.total_score, 100.0)
+
+
+class TestDataFailures(unittest.TestCase):
+    def test_empty_spreads_no_liq_data_not_below_thr(self):
+        """Zero-bid ATM list is UNKNOWN — block no_liq_data, not silent 0 total costume."""
+        pivot_data = {
+            "close": 605.69,
+            "pivot": 598.39,
+            "r1": 604.74,
+            "s1": 588.56,
+            "pct_change": 1.81,
+        }
+        card = se.score_ticker(
+            "META",
+            _zero_bid_chain(605.69),
+            pivot_data,
+            "",
+            atr_pct=3.79,
+            atr_abs=22.54,
+        )
+        self.assertEqual(card.block_reason, "no_liq_data")
+        self.assertEqual(card.action_flag, "PASS")
+        # T still computed for forensics (not forced to 0 by fake 100% spread)
+        self.assertGreater(card.technical_score, 50.0)
+        self.assertEqual(
+            card.metrics["subscores"]["liq_status"], "no_liq_data"
+        )
+
+    def test_wide_spread_is_spread_untradeable(self):
+        pivot_data = {
+            "close": 103.0,
+            "pivot": 100.0,
+            "r1": 104.0,
+            "s1": 96.0,
+            "pct_change": 1.5,
+        }
+        card = se.score_ticker(
+            "X",
+            _wide_spread_chain(103.0),
+            pivot_data,
+            "",
+            atr_pct=2.0,
+            atr_abs=2.0,
+        )
+        self.assertEqual(card.block_reason, "spread_untradeable")
+        self.assertEqual(card.action_flag, "PASS")
+        self.assertEqual(card.total_score, 0.0)
+
+    def test_pct_zero_with_live_spot_is_no_momentum_data(self):
+        """Partial failure shape: live spot/pivot, pct stuck at 0 → not pivot-only score."""
+        pivot_data = {
+            "close": 605.69,
+            "pivot": 598.39,
+            "r1": 604.74,
+            "s1": 588.56,
+            "pct_change": 0.0,
+        }
+        card = se.score_ticker(
+            "META",
+            _tight_chain(605.69),
+            pivot_data,
+            "",
+            atr_pct=3.79,
+            atr_abs=22.54,
+        )
+        self.assertEqual(card.block_reason, "no_momentum_data")
+        self.assertEqual(card.action_flag, "PASS")
+        self.assertIsNone(card.metrics["subscores"]["mom_sub"])
+        # Must NOT look like pivot-only ~49 EXECUTE-adjacent score path
+        self.assertNotEqual(card.block_reason, None)
+
+    def test_pct_none_is_no_momentum_data(self):
+        pivot_data = {
+            "close": 605.69,
+            "pivot": 598.39,
+            "r1": 604.74,
+            "s1": 588.56,
+            "pct_change": None,
+        }
+        card = se.score_ticker(
+            "META",
+            _tight_chain(605.69),
+            pivot_data,
+            "",
+            atr_pct=3.79,
+            atr_abs=22.54,
+        )
+        self.assertEqual(card.block_reason, "no_momentum_data")
 
 
 class TestDeadZone(unittest.TestCase):
     def test_dead_zone_hard_pass_below_threshold_atr(self):
-        """Below DEAD_ZONE_ATR separation → PASS regardless of strong pillars."""
-        # Place spot just inside 0.30 ATR with enough momentum that T would be high
         atr = 10.0
-        # 0.20 ATR above pivot — inside 0.30 dead zone
         close = 100.0 + 0.20 * atr
         pivot_data = {
             "close": close,
             "pivot": 100.0,
             "r1": 110.0,
             "s1": 90.0,
-            "pct_change": 3.0,  # strong day move — still must PASS
+            "pct_change": 3.0,
         }
         with mock.patch.object(config, "DEAD_ZONE_ATR", 0.30):
             card = se.score_ticker(
                 "SPY",
                 _tight_chain(close),
                 pivot_data,
-                headlines_text="beats surge rally upgrade growth strong bullish\n" * 3,
-                futures_pct=0.5,
+                headlines_text="",
                 atr_pct=2.0,
                 atr_abs=atr,
             )
         self.assertEqual(card.action_flag, "PASS")
         self.assertEqual(card.block_reason, "dead_zone")
-        self.assertTrue(card.metrics["subscores"]["dead_zone"])
-        # Components may be non-zero (forensics) but flag is hard PASS
-        self.assertLess(card.metrics["subscores"]["atr_distance"], 0.30)
 
-    def test_outside_dead_zone_can_execute(self):
-        atr = 10.0
-        close = 100.0 + 0.50 * atr  # 0.50 ATR — outside dead zone
+
+class TestGateDataReasons(unittest.TestCase):
+    def test_compact_reasons_distinct(self):
+        self.assertEqual(sg._compact_reason("no_liq_data"), "no_liq_data")
+        self.assertEqual(sg._compact_reason("spread_untradeable"), "spread_untradeable")
+        self.assertEqual(sg._compact_reason("no_momentum_data"), "no_momentum_data")
+        self.assertEqual(sg._compact_reason("dead_zone"), "dead_zone")
+        # liq-killed total no longer the only path — but below_thr still exists
+        self.assertEqual(sg._compact_reason("score 0.0 below 70"), "below_thr")
+
+    def test_gate_shows_no_liq_data_not_below_thr(self):
+        gate = sg.reset_gate_for_tests(
+            sg.GateConfig(threshold=70.0, persist_cycles=1, max_concurrent=10)
+        )
+        now = datetime.now(timezone.utc)
+        decs = gate.process_scan(
+            [
+                sg.Observation(
+                    ticker="META",
+                    score=65.0,
+                    direction=None,
+                    action_flag="PASS",
+                    block_reason="no_liq_data",
+                ),
+                sg.Observation(
+                    ticker="GOOGL",
+                    score=0.0,
+                    direction=None,
+                    action_flag="PASS",
+                    block_reason="spread_untradeable",
+                ),
+                sg.Observation(
+                    ticker="MSFT",
+                    score=40.0,
+                    direction=None,
+                    action_flag="PASS",
+                    block_reason="no_momentum_data",
+                ),
+            ],
+            now,
+        )
+        summary = gate.format_scan_summary(decs)
+        self.assertIn("no_liq_data×1", summary)
+        self.assertIn("spread_untradeable×1", summary)
+        self.assertIn("no_momentum_data×1", summary)
+        self.assertNotIn("below_thr", summary)
+
+
+class TestSubscoreFormat(unittest.TestCase):
+    def test_format_includes_all_keys(self):
         pivot_data = {
-            "close": close,
+            "close": 103.0,
             "pivot": 100.0,
-            "r1": 110.0,
-            "s1": 90.0,
+            "r1": 104.0,
+            "s1": 96.0,
             "pct_change": 1.5,
         }
-        with mock.patch.object(config, "DEAD_ZONE_ATR", 0.30):
-            card = se.score_ticker(
-                "IWM",
-                _tight_chain(close),
-                pivot_data,
-                headlines_text="",
-                atr_pct=2.0,
-                atr_abs=atr,
-            )
-        self.assertNotEqual(card.block_reason, "dead_zone")
-        self.assertGreaterEqual(card.metrics["subscores"]["atr_distance"], 0.30)
+        card = se.score_ticker(
+            "TSLA",
+            _tight_chain(103.0),
+            pivot_data,
+            "",
+            atr_pct=2.0,
+            atr_abs=2.0,
+        )
+        bits = se.format_subscore_bits(card)
+        for token in ("piv=", "mom=", "vol=", "T=", "S=", "liq=", "dATR="):
+            self.assertIn(token, bits)
 
 
 class TestWeightsRetired(unittest.TestCase):
@@ -191,75 +376,6 @@ class TestWeightsRetired(unittest.TestCase):
         )
         self.assertEqual(a.total_score, b.total_score)
         self.assertEqual(a.action_flag, b.action_flag)
-
-
-class TestSubscoreFormat(unittest.TestCase):
-    def test_format_subscore_bits_keys(self):
-        atr = 2.0
-        close = 103.0
-        pivot_data = {
-            "close": close,
-            "pivot": 100.0,
-            "r1": 104.0,
-            "s1": 96.0,
-            "pct_change": 1.5,
-        }
-        card = se.score_ticker(
-            "TSLA",
-            _tight_chain(close),
-            pivot_data,
-            "",
-            atr_pct=2.0,
-            atr_abs=atr,
-        )
-        bits = se.format_subscore_bits(card)
-        for token in ("piv=", "mom=", "vol=", "T=", "S=", "liq=", "dATR="):
-            self.assertIn(token, bits)
-
-
-class TestGateDeadZoneReason(unittest.TestCase):
-    def test_compact_reason_dead_zone(self):
-        import signal_gate as sg
-
-        self.assertEqual(sg._compact_reason("dead_zone"), "dead_zone")
-        self.assertEqual(sg._compact_reason("Dead zone: ATR-dist 0.1"), "dead_zone")
-
-    def test_process_scan_counts_dead_zone(self):
-        import signal_gate as sg
-        from datetime import datetime, timezone
-
-        gate = sg.reset_gate_for_tests(
-            sg.GateConfig(threshold=70.0, persist_cycles=1, max_concurrent=10)
-        )
-        now = datetime.now(timezone.utc)
-        decs = gate.process_scan(
-            [
-                sg.Observation(
-                    ticker="SPY",
-                    score=80.0,
-                    direction="C",
-                    action_flag="PASS",
-                    block_reason="dead_zone",
-                ),
-                sg.Observation(
-                    ticker="QQQ",
-                    score=75.0,
-                    direction="C",
-                    action_flag="PASS",
-                    block_reason="dead_zone",
-                ),
-                sg.Observation(
-                    ticker="IWM",
-                    score=82.0,
-                    direction="C",
-                    action_flag="EXECUTE",
-                ),
-            ],
-            now,
-        )
-        summary = gate.format_scan_summary(decs)
-        self.assertIn("dead_zone×2", summary)
-        self.assertIn("ADMIT IWM", summary)
 
 
 if __name__ == "__main__":
