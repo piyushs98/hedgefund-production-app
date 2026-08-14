@@ -2,11 +2,15 @@
 scoring_engine.py — Floor-fixed conviction scoring.
 
 Score = clamp( Technical(0..TECH_CEIL) + Sentiment(-SENT_MAX..+SENT_MAX), 0, 100 )
-        * liq_mult
 
 Technical alone can clear EXECUTE_THRESHOLD (70). Sentiment is a signed
 modifier that confirms or vetoes; it cannot manufacture a signal from a
-weak technical setup. Liquidity is a multiplier/gate, never additive points.
+weak technical setup.
+
+Liquidity is NOT in the score. The chain-wide ATM median is a breadth
+statistic (138–740 contracts); it is logged as atm_n/med_spr/usable for
+Discord forensics only. Tradability is a Part C reject on the chosen
+contract (MAX_CONTRACT_SPREAD_PCT).
 
 Dead zone: if |spot − pivot| / ATR < DEAD_ZONE_ATR, direction is undefined
 and the ticker hard-PASSes regardless of other pillars.
@@ -15,7 +19,7 @@ Calibrated defaults (2026-08-10 two-sided Mon/Fri test, config/env-tunable):
   tech_ceil=85, sent_max=15
   pivot_scale=0.40 ATR, pivot_power=1.0, mom_scale=0.45 %, mix 70/30
   dead_zone_atr=0.30
-  vol_mult in [0.70, 1.0]; liq bands <3%→1.0, 3–6%→0.85, 6–10%→0.6, >10%→0
+  vol_mult in [0.70, 1.0]
 
 KNOWN LIMITATION (do not fix without real telemetry):
   mom_scale saturates near ~1.1–1.2% day-move under 0.45; revisit with multi-day
@@ -473,10 +477,9 @@ def score_sentiment(headlines_text, macro_vector="", futures_pct=None, direction
     return S, metrics, reasons
 
 
-# Data / structure block reasons (gate compact tags). Priority high → low.
+# Scorer-level hard blocks (gate compact tags). Priority high → low.
+# Liquidity is no longer a score block — Part C rejects the chosen contract.
 _BLOCK_PRIORITY = (
-    "no_liq_data",
-    "spread_untradeable",
     "no_momentum_data",
     "dead_zone",
 )
@@ -499,11 +502,13 @@ def score_ticker(ticker, options_dict, pivot_data, headlines_text,
                  macro_vector="", futures_pct=None, atr_pct=None, atr_abs=None,
                  weights=None):
     """
-    Score = clamp(T + S, 0, 100) * liq_mult  (when liq known and >0).
+    Score = clamp(T + S, 0, 100). Liquidity is not a term.
 
-    Data failures (no_liq_data, no_momentum_data, spread_untradeable) hard-PASS
-    with distinct block_reason — never folded into below_thr alone.
+    Chain-level ATM aggregates (atm_n / med_spr / usable) are computed for
+    Discord forensics only. A wide chain median does not zero the score and
+    does not hard-PASS. Contract tradability is Part C.
 
+    Data failure still hard-PASS: no_momentum_data.
     Dead zone: |spot−pivot|/ATR < DEAD_ZONE_ATR → PASS + block_reason=dead_zone.
 
     ``weights`` is accepted for call-site compatibility but IGNORED — the
@@ -532,15 +537,11 @@ def score_ticker(ticker, options_dict, pivot_data, headlines_text,
     )
 
     raw = T + S
-    # Forensic total: only apply liq when known. Unknown/untradeable → PASS via block.
+    total = _clamp(raw, 0.0, 100.0)
+    # Chain-median liq is forensic only — never a multiplier or 0.0 costume.
     if liq_status == "no_liq_data" or liq_mult is None:
-        total = round(raw, 1)  # show T+S forensics; will not EXECUTE
         liq_display = None
-    elif liq_status == "spread_untradeable" or (liq_mult is not None and liq_mult <= 0):
-        total = 0.0
-        liq_display = 0.0
     else:
-        total = _clamp(raw * float(liq_mult), 0.0, 100.0)
         liq_display = float(liq_mult)
 
     atr_dist = tm.get("atr_distance")
@@ -563,9 +564,9 @@ def score_ticker(ticker, options_dict, pivot_data, headlines_text,
     card.sentiment_score = round(S, 1)
     card.total_score = round(float(total), 1)
 
-    data_block = _pick_block_reason(liq_status, mom_status)
+    # Liquidity is not a scorer block (Part C / CRITICAL use liq_status).
     dz_block = "dead_zone" if in_dead_zone else None
-    card.block_reason = _pick_block_reason(data_block, dz_block)
+    card.block_reason = _pick_block_reason(mom_status, dz_block)
 
     if card.block_reason:
         card.action_flag = "PASS"
@@ -582,6 +583,9 @@ def score_ticker(ticker, options_dict, pivot_data, headlines_text,
         "S": round(S, 2),
         "liq_mult": liq_display,
         "liq_status": liq_status,
+        "atm_n": lm.get("atm_contracts"),
+        "med_spr": lm.get("median_atm_spread_pct"),
+        "usable": lm.get("usable_spread_quotes"),
         "mom_status": mom_status,
         "atr_distance": tm.get("atr_distance"),
         "atr_distance_signed": tm.get("atr_distance_signed"),
@@ -599,10 +603,6 @@ def score_ticker(ticker, options_dict, pivot_data, headlines_text,
         "subscores": subscores,
     }
     card.reasons = lreasons + treasons + sreasons
-    if liq_status == "no_liq_data":
-        card.reasons.append("PASS: no_liq_data — missing ATM quotes, not a weak setup.")
-    if liq_status == "spread_untradeable":
-        card.reasons.append("PASS: spread_untradeable — measured ATM median >10%.")
     if mom_status == "no_momentum_data":
         card.reasons.append(
             "PASS: no_momentum_data — pct_change missing/0 with live spot; "
@@ -616,6 +616,10 @@ def score_ticker(ticker, options_dict, pivot_data, headlines_text,
 
     mom_log = "n/a" if tm.get("mom_sub") is None else tm.get("mom_sub")
     liq_log = "n/a" if liq_display is None else liq_display
+    atm_n = lm.get("atm_contracts")
+    med_spr = lm.get("median_atm_spread_pct")
+    usable = lm.get("usable_spread_quotes")
+    med_s = "n/a" if med_spr is None else f"{med_spr}%"
     br = f" {card.block_reason}" if card.block_reason else ""
     # Mandatory per-scan sub-score log (forensic reconstruction depends on this)
     print(
@@ -623,6 +627,8 @@ def score_ticker(ticker, options_dict, pivot_data, headlines_text,
         f"piv={subscores['pivot_sub']} mom={mom_log} "
         f"vol={subscores['vol_mult']} T={subscores['T']} S={subscores['S']} "
         f"liq={liq_log} dATR={subscores['atr_distance']} "
+        f"atm_n={atm_n if atm_n is not None else 'n/a'} "
+        f"med_spr={med_s} usable={usable if usable is not None else 'n/a'} "
         f"dir={direction_label} final={subscores['final']}"
         f"{br} → {card.action_flag}"
     )
@@ -650,9 +656,10 @@ def apply_adversarial_penalty(card, penalty=15.0, reason=""):
 
 
 def format_subscore_bits(card) -> str:
-    """Compact piv=/mom=/vol=/T=/S=/liq=/dATR= for every telemetry row."""
+    """Compact piv=/mom=/vol=/T=/S=/liq=/dATR=/atm_n=/med_spr=/usable=."""
     sub = (card.metrics or {}).get("subscores") or {}
     tm = (card.metrics or {}).get("technical") or {}
+    lm = (card.metrics or {}).get("liquidity") or {}
 
     def _g(key, alt=None):
         v = sub.get(key)
@@ -672,6 +679,15 @@ def format_subscore_bits(card) -> str:
     liq = _g("liq_mult")
     # Unknown liq is None in subscores — do not fall back to 0.0 card field
     d_atr = _g("atr_distance")
+    atm_n = sub.get("atm_n")
+    if atm_n is None:
+        atm_n = lm.get("atm_contracts")
+    med_spr = sub.get("med_spr")
+    if med_spr is None:
+        med_spr = lm.get("median_atm_spread_pct")
+    usable = sub.get("usable")
+    if usable is None:
+        usable = lm.get("usable_spread_quotes")
 
     def _f(v, nd=2):
         if v is None:
@@ -681,9 +697,19 @@ def format_subscore_bits(card) -> str:
         except (TypeError, ValueError):
             return "n/a"
 
+    def _i(v):
+        if v is None:
+            return "n/a"
+        try:
+            return str(int(v))
+        except (TypeError, ValueError):
+            return "n/a"
+
+    med_s = "n/a" if med_spr is None else f"{_f(med_spr, 1)}%"
     bits = (
         f"piv={_f(piv, 3)} mom={_f(mom, 3)} vol={_f(vol, 2)} "
-        f"T={_f(T, 1)} S={_f(S, 1)} liq={_f(liq, 2)} dATR={_f(d_atr, 3)}"
+        f"T={_f(T, 1)} S={_f(S, 1)} liq={_f(liq, 2)} dATR={_f(d_atr, 3)} "
+        f"atm_n={_i(atm_n)} med_spr={med_s} usable={_i(usable)}"
     )
     br = sub.get("block_reason") or getattr(card, "block_reason", None)
     if br:
@@ -719,11 +745,12 @@ def metrics_snapshot_text(card, *, include_futures=True):
         f"- ATR-distance: {sub.get('atr_distance')} | dir: {sub.get('direction')} | "
         f"pivot_sub: {sub.get('pivot_sub')} | mom_sub: {sub.get('mom_sub')} | "
         f"vol_mult: {sub.get('vol_mult')} | dead_zone:{dz}\n"
-        f"- Median ATM spread: {lm.get('median_atm_spread_pct')}% | ATM volume: "
-        f"{lm.get('total_atm_volume')} | ATM open interest: {lm.get('total_atm_open_interest')} | "
-        f"liq_mult: {sub.get('liq_mult')}\n"
+        f"- Median ATM spread: {lm.get('median_atm_spread_pct')}% | ATM n: "
+        f"{lm.get('atm_contracts')} | usable quotes: {lm.get('usable_spread_quotes')} | "
+        f"ATM volume: {lm.get('total_atm_volume')} | "
+        f"ATM open interest: {lm.get('total_atm_open_interest')} "
+        f"(chain-median forensic; not in score)\n"
         f"{sentiment_line}"
         f"- Score: T={card.technical_score}/{tech_ceil:g} + S={card.sentiment_score:+g}/{sent_max:g} "
-        f"× liq_mult {card.liquidity_score} "
         f"(adversarial -{card.adversarial_penalty:g}) → TOTAL {card.total_score}/100 → {card.action_flag}"
     )

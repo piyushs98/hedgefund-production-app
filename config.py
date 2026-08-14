@@ -6,7 +6,7 @@ Single source of truth for:
   * Database paths (news_room.db for news memory, hedge_fund.db for telemetry)
   * API keys  (ENV-ONLY. Hardcoded fallback keys were removed deliberately —
                the old keys were committed to source and must be rotated.)
-  * Scoring knobs: T/S/liq_mult model in scoring_engine.py (env-tunable).
+  * Scoring knobs: T+S model in scoring_engine.py (env-tunable).
     Additive 30/40/30 pillar weights are RETIRED.
 """
 
@@ -75,7 +75,8 @@ def assert_secrets(require_discord=True):
 
 # ------------------------------------------------------------------
 # Scoring threshold + calibrated conviction model (env-tunable)
-# Live scoring: clamp(T(0..TECH_CEIL)+S(-SENT_MAX..+SENT_MAX),0,100)×liq_mult
+# Live scoring: clamp(T(0..TECH_CEIL)+S(-SENT_MAX..+SENT_MAX), 0, 100)
+# Liquidity is a Part C contract reject (MAX_CONTRACT_SPREAD_PCT), not a score term.
 # Additive 30/40/30 pillar weights are RETIRED — load_weights/save_weights
 # remain as no-op-compatible stubs so saturday_audit does not crash.
 # ------------------------------------------------------------------
@@ -174,12 +175,14 @@ TIME_STOP_SCORE_EXEMPT = _env_float("TIME_STOP_SCORE_EXEMPT", 80.0)
 #   REQUIRED_MOVE_ATR_K         default 0.5 (reject if need/(ATR*√dte) > k)
 #   EXIT_MAX_DECAY_DENSITY      default 8.0 (% extrinsic per RTH hour to expiry)
 #   MIN_EXTRINSIC_PCT           default 10  (reject deep-ITM / synthetic stock)
+#   MAX_CONTRACT_SPREAD_PCT     default 8.0 (hard reject on chosen contract)
 # ------------------------------------------------------------------
 MIN_DTE = _env_int("MIN_DTE", 1)
 MAX_EXPIRY_CALENDAR_DTE = _env_int("MAX_EXPIRY_CALENDAR_DTE", 10)
 REQUIRED_MOVE_ATR_K = _env_float("REQUIRED_MOVE_ATR_K", 0.5)
 EXIT_MAX_DECAY_DENSITY = _env_float("EXIT_MAX_DECAY_DENSITY", 8.0)
 MIN_EXTRINSIC_PCT = _env_float("MIN_EXTRINSIC_PCT", 10.0)
+MAX_CONTRACT_SPREAD_PCT = _env_float("MAX_CONTRACT_SPREAD_PCT", 8.0)
 
 # ------------------------------------------------------------------
 # Calibrated scoring (scoring_engine). All env-tunable; restart to apply.
@@ -206,6 +209,7 @@ def log_scoring_config() -> None:
         f"MOM_SCALE={MOM_SCALE} W_PIVOT={W_PIVOT} W_MOM={W_MOM} "
         f"TECH_CEIL={TECH_CEIL} SENT_MAX={SENT_MAX} "
         f"DEAD_ZONE_ATR={DEAD_ZONE_ATR} "
+        f"score=T+S (no liq_mult) "
         f"(env-tunable; restart process to apply)"
     )
 
@@ -244,6 +248,6 @@ def save_weights(weights):
     else:
         print(
             f"[Config] save_weights DEPRECATED — ignored {weights!r}. "
-            "Live scoring uses scoring_engine T/S/liq_mult, not pillar weights."
+            "Live scoring uses scoring_engine T+S, not pillar weights."
         )
     return None

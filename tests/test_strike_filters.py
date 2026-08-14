@@ -86,8 +86,8 @@ class TestEntryFilters(unittest.TestCase):
                     "calls": [
                         {
                             "strike": 303.0,
-                            "bid": 2.00,
-                            "ask": 2.20,
+                            "bid": 2.06,
+                            "ask": 2.14,
                             "openInterest": 8000,
                             "volume": 3000,
                             "impliedVolatility": 0.28,
@@ -114,7 +114,8 @@ class TestEntryFilters(unittest.TestCase):
         """C-F alone catches IWM-class when MIN_DTE env-lowered to 0."""
         now = datetime(2026, 8, 5, 10, 32, tzinfo=ET)
         # ~93% extrinsic ATM: strike 302, spot 302.10, mid 1.40 → almost all ext
-        od = self._chain("2026-08-05", 302.0, 1.30, 1.50, oi=50000, vol=20000)
+        # Tight spread so the binding filter is decay, not MAX_CONTRACT_SPREAD_PCT
+        od = self._chain("2026-08-05", 302.0, 1.38, 1.42, oi=50000, vol=20000)
         pivot = {"close": 302.10, "pivot": 300.0, "pct_change": 0.5}
         with mock.patch.object(config, "MIN_DTE", 0):
             with mock.patch.object(config, "REQUIRED_MOVE_ATR_K", 5.0):
@@ -193,6 +194,94 @@ class TestEntryFilters(unittest.TestCase):
         )
         self.assertFalse(ok)
         self.assertIn("min_ext", tag or "")
+
+    def test_spread_cap_rejects_and_formats_tag(self):
+        ok, tag = ss._passes_entry_filters(
+            cal_dte=2, rm_atr=0.1, dens=1.0,
+            extrinsic=0.50, extrinsic_pct=25.0,
+            bid=1.00, ask=1.28, spread_pct=12.4,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(tag, "spread(12.4>8.0)")
+
+    def test_no_two_sided_quote_is_no_liq_data(self):
+        ok, tag = ss._passes_entry_filters(
+            cal_dte=2, rm_atr=0.1, dens=1.0,
+            extrinsic=0.50, extrinsic_pct=25.0,
+            bid=0.0, ask=2.00, spread_pct=200.0,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(tag, "no_liq_data")
+
+    def test_spread_walks_to_next_ranked_candidate(self):
+        """Top rank can be a wide market; selector must try the next row."""
+        now = datetime(2026, 8, 5, 10, 32, tzinfo=ET)
+        options = {
+            "current_price": 302.10,
+            "chains": {
+                "2026-08-06": {
+                    "calls": [
+                        {
+                            # ~12% spread, huge OI/vol so it ranks first
+                            "strike": 303.0,
+                            "bid": 1.88,
+                            "ask": 2.12,
+                            "openInterest": 100_000,
+                            "volume": 50_000,
+                            "impliedVolatility": 0.20,
+                        },
+                        {
+                            # ~3% spread, thin — ranks second, should be chosen
+                            "strike": 302.0,
+                            "bid": 1.97,
+                            "ask": 2.03,
+                            "openInterest": 10,
+                            "volume": 1,
+                            "impliedVolatility": 0.80,
+                        },
+                    ],
+                    "puts": [],
+                }
+            },
+        }
+        pivot = {"close": 302.10, "pivot": 300.0, "pct_change": 0.5}
+        with mock.patch.object(config, "MIN_DTE", 1):
+            with mock.patch.object(config, "REQUIRED_MOVE_ATR_K", 5.0):
+                with mock.patch.object(config, "EXIT_MAX_DECAY_DENSITY", 100.0):
+                    with mock.patch.object(config, "MAX_CONTRACT_SPREAD_PCT", 8.0):
+                        out = ss.select_optimal_contract(
+                            options, pivot, atr_abs=5.0, now=now
+                        )
+        self.assertNotIn("error", out)
+        self.assertEqual(out["strike"], 302.0)
+        self.assertLessEqual(out["bid_ask_spread_pct"], 8.0)
+        self.assertGreaterEqual(out.get("rejected_better_ranks") or 0, 1)
+
+    def test_all_wide_rejects_ticker_with_spread_tag(self):
+        now = datetime(2026, 8, 5, 10, 32, tzinfo=ET)
+        od = self._chain("2026-08-06", 303.0, 1.88, 2.12)
+        pivot = {"close": 302.10, "pivot": 300.0, "pct_change": 0.5}
+        with mock.patch.object(config, "MIN_DTE", 1):
+            with mock.patch.object(config, "REQUIRED_MOVE_ATR_K", 5.0):
+                with mock.patch.object(config, "EXIT_MAX_DECAY_DENSITY", 100.0):
+                    with mock.patch.object(config, "MAX_CONTRACT_SPREAD_PCT", 8.0):
+                        out = ss.select_optimal_contract(
+                            od, pivot, atr_abs=5.0, now=now
+                        )
+        self.assertIn("error", out)
+        self.assertTrue(
+            str(out.get("reject_tag") or "").startswith("spread("),
+            out.get("reject_tag"),
+        )
+
+    def test_zero_bids_in_band_are_no_liq_data(self):
+        now = datetime(2026, 8, 5, 10, 32, tzinfo=ET)
+        od = self._chain("2026-08-06", 303.0, 0.0, 0.0)
+        pivot = {"close": 302.10, "pivot": 300.0, "pct_change": 0.5}
+        with mock.patch.object(config, "MIN_DTE", 1):
+            out = ss.select_optimal_contract(od, pivot, atr_abs=5.0, now=now)
+        self.assertIn("error", out)
+        self.assertEqual(out.get("reject_tag"), "no_liq_data")
 
 
 class TestRequiredMove(unittest.TestCase):

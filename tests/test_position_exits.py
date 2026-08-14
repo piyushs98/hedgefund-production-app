@@ -30,6 +30,7 @@ class TestGateDefaults(unittest.TestCase):
         self.assertEqual(config.FULL_SCAN_INTERVAL_SECONDS, 1800)
         self.assertEqual(config.TIME_STOP_SCORE_EXEMPT, 80.0)
         self.assertEqual(config.MIN_EXTRINSIC_PCT, 10.0)
+        self.assertEqual(config.MAX_CONTRACT_SPREAD_PCT, 8.0)
         self.assertEqual(config.GATE_POST_EXIT_COOLDOWN_MINUTES, 45)
 
 

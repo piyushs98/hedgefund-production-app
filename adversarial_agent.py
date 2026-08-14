@@ -68,22 +68,8 @@ Only output the raw JSON. Do not include markdown code blocks or any other text.
                 "Defaulting to fallback Veto assessment."
             )
             # Local fallback when both providers are dark.
-            # Post floor-fix: liquidity_score is liq_mult (0..1), not 0..30 points.
+            # Liquidity is a Part C contract reject, not an adversarial veto.
             # sentiment_score is signed S (-15..+15); 0 means no news, not "hostile".
-            liq = payload.get("liq_mult", payload.get("liquidity_score", 1.0))
-            try:
-                liq = float(liq)
-            except (TypeError, ValueError):
-                liq = 1.0
-            # Treat values >1 as legacy 0..30 scale
-            if liq > 1.0:
-                liq = liq / 30.0
-            if liq <= 0.0:
-                return {
-                    "veto_triggered": True,
-                    "risk_confidence": 0.85,
-                    "reason": "Fallback: untradeable liquidity (liq_mult=0).",
-                }
             return {
                 "veto_triggered": False,
                 "risk_confidence": 0.20,

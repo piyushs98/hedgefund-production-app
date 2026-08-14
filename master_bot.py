@@ -588,7 +588,6 @@ def format_ceo_deterministic(card, contract=None, *, include_session_open_contex
         f"macro read: {sm.get('macro_note')}.\n"
         f"* **Strategic Executive Decision**: Conviction engine scored "
         f"T={card.technical_score} + S={card.sentiment_score:+g} "
-        f"× liq_mult={card.liquidity_score} "
         f"(adversarial penalty -{card.adversarial_penalty:g}) for a total of "
         f"{card.total_score}/100, mandating {card.action_flag}.{strat}"
     )
@@ -802,7 +801,7 @@ def run_portfolio_scan(
     result["scan_id"] = scan_id
     futures_pct = get_latest_futures_pct("ES=F")
     print(f"\n🚀 PORTFOLIO SCAN {scan_id} | tickers={universe} | "
-          f"score=T+S×liq thr={config.EXECUTE_THRESHOLD} | "
+          f"score=T+S thr={config.EXECUTE_THRESHOLD} | "
           f"ES=F overnight {futures_pct}%")
 
     # Stage 3: reconcile gate book with durable open positions (Tracker may be
@@ -966,7 +965,7 @@ def run_portfolio_scan(
                     continue
                 macro_vector = "Neutral macroeconomic backdrop (LLM offline)."
 
-            # ---- Deterministic conviction scoring (T+S×liq; weights retired) ----
+            # ---- Deterministic conviction scoring (T+S; weights retired) ----
             card = scoring_engine.score_ticker(
                 ticker, options_dict, pivot_data, news_string,
                 macro_vector=macro_vector, futures_pct=futures_pct,
@@ -975,7 +974,7 @@ def run_portfolio_scan(
             print(
                 f"[{ticker}] ⚙️ Scoring Engine: "
                 f"T={card.technical_score} S={card.sentiment_score:+g} "
-                f"×liq={card.liquidity_score} = {card.total_score}/100 -> "
+                f"= {card.total_score}/100 -> "
                 f"{card.action_flag}"
                 + (f" ({card.block_reason})" if getattr(card, "block_reason", None) else "")
             )
@@ -1328,6 +1327,8 @@ def run_macro_loop():
         f"[EntryFilters] MIN_DTE={config.MIN_DTE} "
         f"REQUIRED_MOVE_ATR_K={config.REQUIRED_MOVE_ATR_K} "
         f"EXIT_MAX_DECAY_DENSITY={config.EXIT_MAX_DECAY_DENSITY}%/hr "
+        f"MAX_CONTRACT_SPREAD_PCT={config.MAX_CONTRACT_SPREAD_PCT}% "
+        f"MIN_EXTRINSIC_PCT={config.MIN_EXTRINSIC_PCT} "
         f"MAX_EXPIRY_CALENDAR_DTE={config.MAX_EXPIRY_CALENDAR_DTE}"
     )
     if hasattr(config, "log_scoring_config"):

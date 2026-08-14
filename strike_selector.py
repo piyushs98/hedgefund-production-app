@@ -14,7 +14,10 @@ contract algorithmically instead of leaving it to LLM prose:
        C-A  calendar DTE >= MIN_DTE (default 1)
        C-C  required_move_atr <= REQUIRED_MOVE_ATR_K (default 0.5)
        C-F  decay_density <= EXIT_MAX_DECAY_DENSITY (default 8 %/hr)
-     Error payloads include reject_tag for GATE line logging, e.g. decay(9.3>8.0).
+       spread  (ask-bid)/mid <= MAX_CONTRACT_SPREAD_PCT (default 8 %)
+               on the candidate only; no two-sided quote → no_liq_data
+     Error payloads include reject_tag for GATE line logging, e.g. decay(9.3>8.0)
+     or spread(12.4>8.0).
 """
 
 from __future__ import annotations
@@ -223,18 +226,39 @@ def _passes_entry_filters(
     dens: float | None,
     extrinsic: float | None = None,
     extrinsic_pct: float | None = None,
+    bid: float | None = None,
+    ask: float | None = None,
+    spread_pct: float | None = None,
 ) -> tuple[bool, str | None]:
     """
     Return (ok, reject_tag). reject_tag is compact for GATE lines:
-      min_dte(0) | rm_atr(0.61>0.50) | decay(9.3>8.0) | bad_quote(ext=…) | min_ext(1.5<10)
+      min_dte(0) | rm_atr(0.61>0.50) | decay(9.3>8.0) | bad_quote(ext=…)
+      | min_ext(1.5<10) | spread(12.4>8.0) | no_liq_data
     """
     min_dte = int(getattr(config, "MIN_DTE", 1))
     k = float(getattr(config, "REQUIRED_MOVE_ATR_K", 0.5))
     max_dens = float(getattr(config, "EXIT_MAX_DECAY_DENSITY", 8.0))
     min_ext_pct = float(getattr(config, "MIN_EXTRINSIC_PCT", 10.0))
+    max_spread = float(getattr(config, "MAX_CONTRACT_SPREAD_PCT", 8.0))
 
     if cal_dte < min_dte:
         return False, f"min_dte({cal_dte})"
+    # Two-sided quote required; missing bid is UNKNOWN, not a 200% spread.
+    if bid is not None or ask is not None:
+        try:
+            b = float(bid) if bid is not None else 0.0
+            a = float(ask) if ask is not None else 0.0
+        except (TypeError, ValueError):
+            return False, "no_liq_data"
+        if not (a >= b > 0):
+            return False, "no_liq_data"
+    if spread_pct is not None:
+        try:
+            spr = float(spread_pct)
+        except (TypeError, ValueError):
+            spr = None
+        if spr is not None and spr > max_spread:
+            return False, f"spread({spr:.1f}>{max_spread:.1f})"
     # Stale/crossed mid: extrinsic cannot be non-positive in a real market
     if extrinsic is not None and extrinsic <= 0:
         return False, f"bad_quote(ext={extrinsic:.2f})"
@@ -269,6 +293,7 @@ def select_optimal_contract(options_dict, pivot_data, atr_abs=None, now=None):
 
     # Rank all liquid near-target contracts across loaded expiries
     ranked: list[dict[str, Any]] = []
+    in_band = 0
     for exp, sides in chains.items():
         try:
             cal = calendar_dte(exp, now)
@@ -297,6 +322,7 @@ def select_optimal_contract(options_dict, pivot_data, atr_abs=None, now=None):
             strike = c.get("strike") or 0
             if not strike or abs(strike - target) / spot > 0.04:
                 continue
+            in_band += 1
             bid, ask = c.get("bid") or 0.0, c.get("ask") or 0.0
             mid = (bid + ask) / 2.0
             if mid <= 0.05:
@@ -336,6 +362,8 @@ def select_optimal_contract(options_dict, pivot_data, atr_abs=None, now=None):
                     "expected_move": round(expected_move, 2),
                     "median_iv": round(median_iv, 4),
                     "spread_pct": round(spread_pct * 100, 2),
+                    "bid": bid,
+                    "ask": ask,
                     "mid": round(mid, 2),
                     "intrinsic": intrinsic,
                     "extrinsic": extrinsic,
@@ -346,6 +374,14 @@ def select_optimal_contract(options_dict, pivot_data, atr_abs=None, now=None):
             )
 
     if not ranked:
+        if in_band > 0:
+            return {
+                "error": (
+                    f"No two-sided quotes on {in_band} {direction} contract(s) "
+                    f"within 4% of the ATR-derived target strike."
+                ),
+                "reject_tag": "no_liq_data",
+            }
         return {
             "error": (
                 f"No liquid {direction} contract within 4% of the ATR-derived "
@@ -366,6 +402,9 @@ def select_optimal_contract(options_dict, pivot_data, atr_abs=None, now=None):
             dens=cand["decay_density"],
             extrinsic=cand.get("extrinsic"),
             extrinsic_pct=cand.get("extrinsic_pct"),
+            bid=cand.get("bid"),
+            ask=cand.get("ask"),
+            spread_pct=cand.get("spread_pct"),
         )
         if not ok:
             tag = why or "filter"
@@ -384,7 +423,7 @@ def select_optimal_contract(options_dict, pivot_data, atr_abs=None, now=None):
         return {
             "error": (
                 f"All {direction} candidates failed entry filters "
-                f"(MIN_DTE/required_move/decay_density). "
+                f"(MIN_DTE/required_move/decay_density/spread). "
                 f"Tried {len(ranked)}; e.g. {sample}"
             ),
             "reject_tag": primary,

@@ -517,6 +517,8 @@ def log_entry_filter_config() -> None:
             f"[EntryFilters] MIN_DTE={getattr(_cfg, 'MIN_DTE', 1)} "
             f"REQUIRED_MOVE_ATR_K={getattr(_cfg, 'REQUIRED_MOVE_ATR_K', 0.5)} "
             f"EXIT_MAX_DECAY_DENSITY={getattr(_cfg, 'EXIT_MAX_DECAY_DENSITY', 8.0)}%/hr "
+            f"MAX_CONTRACT_SPREAD_PCT={getattr(_cfg, 'MAX_CONTRACT_SPREAD_PCT', 8.0)}% "
+            f"MIN_EXTRINSIC_PCT={getattr(_cfg, 'MIN_EXTRINSIC_PCT', 10.0)} "
             f"MAX_EXPIRY_CALENDAR_DTE={getattr(_cfg, 'MAX_EXPIRY_CALENDAR_DTE', 10)} "
             f"(env-tunable; restart process to apply)"
         )

@@ -162,11 +162,46 @@ class TestNeutralAndStrong(unittest.TestCase):
         self.assertIsNone(card.block_reason)
         self.assertEqual(card.action_flag, "EXECUTE")
         self.assertGreaterEqual(card.total_score, 70.0)
+        # No-news S ≈ 0, so final ≈ T (liq no longer haircuts)
+        self.assertAlmostEqual(card.total_score, card.technical_score, delta=0.2)
+        self.assertLessEqual(card.total_score, 85.0)
+
+    def test_t_plus_s_ceiling_is_100_not_compressed(self):
+        """TECH_CEIL + SENT_MAX = 100; clamp does not squash the top."""
+        self.assertEqual(config.TECH_CEIL + config.SENT_MAX, 100.0)
+        atr = 2.0
+        close = 100.0 + 1.5 * atr
+        pivot_data = {
+            "close": close,
+            "pivot": 100.0,
+            "r1": 104.0,
+            "s1": 96.0,
+            "pct_change": 1.5,
+        }
+        card = se.score_ticker(
+            "TEST",
+            _tight_chain(close),
+            pivot_data,
+            headlines_text="beats record surge rally upgrade outperform",
+            macro_vector="EXPANSIONARY_TAILWIND",
+            futures_pct=0.75,
+            atr_pct=2.0,
+            atr_abs=atr,
+        )
+        self.assertGreaterEqual(card.technical_score, 80.0)
+        self.assertLessEqual(card.technical_score, 85.0)
+        self.assertGreater(card.sentiment_score, 8.0)
+        self.assertLessEqual(card.total_score, 100.0)
+        self.assertAlmostEqual(
+            card.total_score,
+            min(100.0, card.technical_score + card.sentiment_score),
+            places=1,
+        )
 
 
 class TestDataFailures(unittest.TestCase):
-    def test_empty_spreads_no_liq_data_not_below_thr(self):
-        """Zero-bid ATM list is UNKNOWN — block no_liq_data, not silent 0 total costume."""
+    def test_empty_spreads_do_not_zero_or_block_score(self):
+        """Zero-bid ATM list is forensic no_liq_data — T+S still stands."""
         pivot_data = {
             "close": 605.69,
             "pivot": 598.39,
@@ -182,15 +217,20 @@ class TestDataFailures(unittest.TestCase):
             atr_pct=3.79,
             atr_abs=22.54,
         )
-        self.assertEqual(card.block_reason, "no_liq_data")
-        self.assertEqual(card.action_flag, "PASS")
-        # T still computed for forensics (not forced to 0 by fake 100% spread)
+        self.assertNotEqual(card.block_reason, "no_liq_data")
         self.assertGreater(card.technical_score, 50.0)
+        self.assertGreater(card.total_score, 50.0)
         self.assertEqual(
             card.metrics["subscores"]["liq_status"], "no_liq_data"
         )
+        self.assertAlmostEqual(
+            card.total_score,
+            card.technical_score + card.sentiment_score,
+            places=1,
+        )
 
-    def test_wide_spread_is_spread_untradeable(self):
+    def test_wide_chain_median_does_not_zero_score(self):
+        """Chain-median >10% is forensic only — score is T+S, not 0.0."""
         pivot_data = {
             "close": 103.0,
             "pivot": 100.0,
@@ -206,9 +246,12 @@ class TestDataFailures(unittest.TestCase):
             atr_pct=2.0,
             atr_abs=2.0,
         )
-        self.assertEqual(card.block_reason, "spread_untradeable")
-        self.assertEqual(card.action_flag, "PASS")
-        self.assertEqual(card.total_score, 0.0)
+        self.assertNotEqual(card.block_reason, "spread_untradeable")
+        self.assertGreater(card.total_score, 70.0)
+        self.assertEqual(card.action_flag, "EXECUTE")
+        self.assertEqual(
+            card.metrics["subscores"]["liq_status"], "spread_untradeable"
+        )
 
     def test_pct_zero_with_live_spot_is_no_momentum_data(self):
         """Partial failure shape: live spot/pivot, pct stuck at 0 → not pivot-only score."""
@@ -341,7 +384,10 @@ class TestSubscoreFormat(unittest.TestCase):
             atr_abs=2.0,
         )
         bits = se.format_subscore_bits(card)
-        for token in ("piv=", "mom=", "vol=", "T=", "S=", "liq=", "dATR="):
+        for token in (
+            "piv=", "mom=", "vol=", "T=", "S=", "liq=", "dATR=",
+            "atm_n=", "med_spr=", "usable=",
+        ):
             self.assertIn(token, bits)
 
 

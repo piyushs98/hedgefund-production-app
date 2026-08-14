@@ -71,13 +71,15 @@ OUTPUT RULES (strict):
 1. One bullet per ticker. Format exactly:
 - **TICKER**: Spot $X vs Pivot $Y. Score: Z/100. <brief technical rationale>
 2. Data-dense only: Spot, Pivot, Score, and Contract/Entry/SL/TP if provided.
-3. ALWAYS copy piv= mom= vol= T= S= liq= dATR= (score_subs) verbatim after Score
-   on EVERY row (EXECUTE and PASS). Prefer numbers over prose; drop commentary first.
+3. ALWAYS copy piv= mom= vol= T= S= liq= dATR= atm_n= med_spr= usable=
+   (score_subs) verbatim after Score on EVERY row (EXECUTE and PASS).
+   Prefer numbers over prose; drop commentary first.
 4. When the payload includes "ext" (e.g. ext=$0.51 (2.8%)), copy it verbatim after
    contract fields on EXECUTE rows. Do not invent extrinsic.
 5. When "delta" is present, append δ=0.XX. Never invent delta.
-6. When "block" is present (no_liq_data / spread_untradeable / no_momentum_data /
-   dead_zone), state it briefly — that is a data/structure PASS, not weak technicals.
+6. When "block" is present (no_momentum_data / dead_zone), state it briefly —
+   that is a data/structure PASS, not weak technicals. Chain atm_n/med_spr/usable
+   are forensics, not a score haircut.
 7. BANNED phrases (never use any of these or close variants):
    CEO, CEO says, No deltas to manage, No hesitation, We move, Let's work,
    Disciplined execution, No fluff, Load the position.
@@ -131,23 +133,9 @@ def adversarial_local(card) -> dict:
     """
     Local adversarial fallback (no LLM).
 
-    Post floor-fix: liquidity_score is liq_mult (0..1), not 0..30 points.
+    Liquidity is a Part C contract reject, not an adversarial veto.
     sentiment_score is signed S (-15..+15); 0 means no news, not "hostile".
     """
-    liq = getattr(card, "liquidity_score", 1.0)
-    try:
-        liq = float(liq)
-    except (TypeError, ValueError):
-        liq = 1.0
-    # Treat values >1 as legacy 0..30 scale
-    if liq > 1.0:
-        liq = liq / 30.0
-    if liq <= 0.0:
-        return {
-            "veto_triggered": True,
-            "risk_confidence": 0.85,
-            "reason": "Local adversarial: untradeable liquidity (liq_mult=0).",
-        }
     return {
         "veto_triggered": False,
         "risk_confidence": 0.20,
@@ -425,7 +413,7 @@ def deterministic_telemetry_bullet(row: dict) -> str:
         + (f" {rationale}" if rationale else "")
     )
     # Prefer keeping numbers: truncate prose first via high word budget on subs
-    max_words = 72 if row.get("action_flag") == "EXECUTE" else 48
+    max_words = 80 if row.get("action_flag") == "EXECUTE" else 56
     return _limit_rationale_words(_purge_banned(bullet), max_words)
 
 
@@ -522,6 +510,9 @@ def deepseek_key_telemetry(
                     "S": sub.get("S", getattr(card, "sentiment_score", None) if card else None),
                     "liq": sub.get("liq_mult"),
                     "dATR": sub.get("atr_distance"),
+                    "atm_n": sub.get("atm_n"),
+                    "med_spr": sub.get("med_spr"),
+                    "usable": sub.get("usable"),
                     "block": sub.get("block_reason")
                     or getattr(card, "block_reason", None)
                     or r.get("block_reason"),
@@ -650,6 +641,74 @@ Write a Discord post MAX 900 characters:
         )
 
 
+def _discord_scan_fail_threshold() -> int:
+    try:
+        return max(1, int(getattr(config, "MARK_FAIL_ALERT_STREAK", 2)))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _note_scan_discord_result(
+    ok: bool,
+    *,
+    scan_id: str,
+    clock: str,
+    n_admits: int,
+    gate_summary: str | None = None,
+) -> None:
+    """
+    Failed 30-min scan Discord posts are otherwise silent while admits persist.
+
+    Same CRITICAL shape as mark failures: after MARK_FAIL_ALERT_STREAK
+    consecutive misses, or immediately if this scan admitted positions.
+    write_guard also counts store=discord_scan.
+    """
+    try:
+        import write_guard
+        if ok:
+            write_guard.record_write_ok("discord_scan")
+            return
+        n = write_guard.record_write_fail(
+            "discord_scan",
+            detail=f"scan={scan_id} clock={clock} admits={n_admits}",
+        )
+    except Exception as wg_err:
+        print(f"[scan] write_guard discord_scan warn: {wg_err}")
+        if ok:
+            return
+        n = 1
+
+    thresh = _discord_scan_fail_threshold()
+    if n_admits <= 0 and n < thresh:
+        print(
+            f"[scan] Discord 30-min payload FAILED scan={scan_id} "
+            f"consecutive={n}/{thresh} admits=0 — no CRITICAL yet"
+        )
+        return
+
+    why = (
+        f"{n_admits} position(s) admitted this scan — book changed while Discord is dark"
+        if n_admits > 0
+        else f"{n} consecutive 30-min scan Discord failures"
+    )
+    msg = (
+        f"🚨 **CRITICAL: SCAN DISCORD FAILED**\n"
+        f"30-MIN SCAN `{scan_id}` at {clock} CDT did **not** post.\n"
+        f"{why}.\n"
+        f"Admits this scan: **{n_admits}**. "
+        f"Consecutive post failures: **{n}**.\n"
+        f"`{gate_summary or 'GATE n/a'}`\n"
+        f"Scan itself succeeded — check webhook / Render logs."
+    )
+    print(f"[scan] {msg.replace(chr(10), ' | ')}")
+    try:
+        import broadcaster
+        delivered = broadcaster.send_discord_alert(msg)
+        print(f"[scan] scan-discord CRITICAL delivered={delivered}")
+    except Exception as e:
+        print(f"[scan] scan-discord CRITICAL send failed: {e}")
+
+
 def run_thirty_min_scan(
     breaker: CircuitBreaker,
     *,
@@ -711,7 +770,7 @@ def run_thirty_min_scan(
     print(
         f"\n🚀 30-MIN SCAN {scan_id} | {clock} CDT | tickers={len(universe)} | "
         f"open_baseline={open_baseline} | ES=F {futures_pct}% | "
-        f"score=T+S×liq thr={config.EXECUTE_THRESHOLD}"
+        f"score=T+S thr={config.EXECUTE_THRESHOLD}"
     )
 
     new_ticker_state = dict(baseline.get("tickers") or {})
@@ -761,7 +820,7 @@ def run_thirty_min_scan(
             print(
                 f"[{ticker}] ⚙️ score "
                 f"T={card.technical_score} S={card.sentiment_score:+g} "
-                f"×liq={card.liquidity_score} = {card.total_score}/100 → "
+                f"= {card.total_score}/100 → "
                 f"{card.action_flag}"
                 + (f" ({card.block_reason})" if getattr(card, "block_reason", None) else "")
             )
@@ -1079,22 +1138,35 @@ def run_thirty_min_scan(
         except Exception as te:
             print(f"[{ticker}] telemetry WARNING: {te}")
 
-    # Data-failure + dead-zone + Part C rejects on the GATE summary line
+    # Data-failure + dead-zone + Part C rejects on the GATE summary line.
+    # Chain-level no_liq_data is forensic/CRITICAL only — it does not zero the score.
     DATA_BLOCKS = (
-        "no_liq_data",
-        "spread_untradeable",
         "no_momentum_data",
         "dead_zone",
     )
     data_rejects: list[str] = []
-    data_fail_count = 0  # no_liq_data + no_momentum_data only (outages)
+    data_fail_count = 0  # no_liq_data + no_momentum_data (outages)
+    seen_liq: set[str] = set()
     for ticker, ctx in scored.items():
         card = ctx.get("card")
         br = getattr(card, "block_reason", None) if card is not None else None
+        liq_status = None
+        if card is not None and isinstance(getattr(card, "metrics", None), dict):
+            liq_status = (card.metrics.get("subscores") or {}).get("liq_status")
+        if liq_status == "no_liq_data":
+            data_rejects.append(f"{ticker}:no_liq_data")
+            data_fail_count += 1
+            seen_liq.add(str(ticker).upper())
         if br in DATA_BLOCKS:
             data_rejects.append(f"{ticker}:{br}")
-        if br in ("no_liq_data", "no_momentum_data"):
+        if br == "no_momentum_data":
             data_fail_count += 1
+    for bit in strike_rejects:
+        tag = str(bit)
+        name = tag.split(":", 1)[0].upper() if ":" in tag else ""
+        if "no_liq_data" in tag and name not in seen_liq:
+            data_fail_count += 1
+            seen_liq.add(name)
     reject_bits = data_rejects + strike_rejects
     if reject_bits:
         reject_line = "REJECT " + " ".join(reject_bits)
@@ -1152,6 +1224,14 @@ def run_thirty_min_scan(
     ok = broadcaster.send_discord_alert(payload)
     result["discord_delivered"] = bool(ok)
     result["payload_preview"] = payload[:200]
+    n_admits = len(result.get("trades") or [])
+    _note_scan_discord_result(
+        ok,
+        scan_id=scan_id,
+        clock=clock,
+        n_admits=n_admits,
+        gate_summary=gate_summary,
+    )
     print(f"✅ 30-MIN SCAN {scan_id} complete | discord={ok} | telemetry={len(bullets)}")
     return result
 
