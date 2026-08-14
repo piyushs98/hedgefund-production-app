@@ -772,6 +772,14 @@ def run_thirty_min_scan(
         f"open_baseline={open_baseline} | ES=F {futures_pct}% | "
         f"score=T+S thr={config.EXECUTE_THRESHOLD}"
     )
+    # Heartbeat BEFORE the Yahoo loop so a hung chain fetch cannot look like a dead bot.
+    try:
+        start_ok = broadcaster.send_discord_alert(
+            f"📡 **SCAN START** [{clock} CDT] `{scan_id}` | n={len(universe)}"
+        )
+        print(f"[scan] start ping delivered={start_ok}")
+    except Exception as start_err:
+        print(f"[scan] start ping failed: {start_err}")
 
     new_ticker_state = dict(baseline.get("tickers") or {})
     rows_by_ticker: dict[str, dict] = {}

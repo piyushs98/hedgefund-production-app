@@ -186,18 +186,23 @@ def _call_with_timeout(fn, *, timeout_s=API_CALL_TIMEOUT_S, step="api_call"):
     but yfinance multi-request sequences and SDK edge cases can still stall.
     This wrapper guarantees the trading thread resumes within ``timeout_s``.
 
+    IMPORTANT: do not use ``with ThreadPoolExecutor`` — its __exit__ calls
+    shutdown(wait=True) and will block forever on a hung Yahoo thread after
+    Future.result has already timed out.
+
     Raises:
         MasterBotScanError: on wall-clock timeout (is_timeout=True) or when
             the underlying call raises a requests/timeout-class error.
     """
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
         future = pool.submit(fn)
         try:
             return future.result(timeout=timeout_s)
         except FuturesTimeoutError as exc:
             print(
                 f"[master_bot] TIMEOUT step={step} after {timeout_s}s — "
-                "aborting this call cleanly"
+                "aborting this call cleanly (worker not joined)"
             )
             raise MasterBotScanError(
                 f"Timed out after {timeout_s}s",
@@ -223,6 +228,11 @@ def _call_with_timeout(fn, *, timeout_s=API_CALL_TIMEOUT_S, step="api_call"):
                     is_timeout=True,
                 ) from exc
             raise
+    finally:
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            pool.shutdown(wait=False)
 
 # Shared with main.py / tracker_agent.py — absolute path so cwd cannot desync.
 ACTIVE_TRADES_PATH = os.environ.get(
@@ -1383,6 +1393,24 @@ def run_macro_loop():
         f"[Cadence] EXIT_INTERVAL={exit_interval}s "
         f"FULL_SCAN_INTERVAL={full_scan_interval}s"
     )
+    try:
+        hook = "set" if (config.DISCORD_WEBHOOK or broadcaster.WEBHOOK_URL) else "MISSING"
+        boot_clock = cdt_clock_str(datetime.now(cdt_tz) if cdt_tz else datetime.now())
+        boot_msg = (
+            f"🟢 **BOT UP** {boot_clock} CDT | webhook={hook} | "
+            f"score=T+S | spread_cap={getattr(config, 'MAX_CONTRACT_SPREAD_PCT', 8)}%"
+        )
+        print(f"[System] {boot_msg}")
+        ok_boot = broadcaster.send_discord_alert(boot_msg)
+        print(f"[System] boot Discord ping delivered={ok_boot}")
+        if not ok_boot:
+            print(
+                "[System] CRITICAL: boot Discord ping failed — "
+                "scans will be silent if the webhook is dark. "
+                f"DISCORD_WEBHOOK={'set' if config.DISCORD_WEBHOOK else 'empty'}"
+            )
+    except Exception as boot_err:
+        print(f"[System] boot Discord ping raised: {boot_err}")
     CRITICAL_ERROR_BACKOFF_S = 60
 
     while True:
