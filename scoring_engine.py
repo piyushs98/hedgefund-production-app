@@ -299,12 +299,23 @@ def _parse_pct_change(pivot_data) -> tuple[float | None, str | None]:
 # ------------------------------------------------------------------
 # Technical: directional, ATR-normalised, 0..TECH_CEIL
 # ------------------------------------------------------------------
-def score_technical(pivot_data, atr_pct=None, atr_abs=None, direction_sign=1.0):
+def score_technical(
+    pivot_data,
+    atr_pct=None,
+    atr_abs=None,
+    direction_sign=1.0,
+    drift_pct=None,
+):
     """
     Returns (T points, metrics, reasons, mom_status).
 
     pivot_sub is 0 with no evidence; mom_sub is only scored when pct_change
-    is known. vol_mult multiplies technical only.
+    is known. drift_sub is 30-minute direction-of-travel (None at the open).
+    When drift is missing, mom weight falls back to (1 - W_PIVOT) so the
+    mix stays 70/30. vol_mult multiplies technical only.
+
+    Queued: whether W_PIVOT=0.70 should stay this high — Aug 21 AAPL 09:16
+    survived almost entirely on pivot distance while 30m drift was against.
     """
     reasons, metrics = [], {}
     close = float(pivot_data.get("close") or 0.0)
@@ -318,7 +329,9 @@ def score_technical(pivot_data, atr_pct=None, atr_abs=None, direction_sign=1.0):
     pivot_power = _cfg_float("PIVOT_POWER", 1.0)
     mom_scale = _cfg_float("MOM_SCALE", 0.45)
     w_pivot = _cfg_float("W_PIVOT", 0.70)
-    w_mom = _cfg_float("W_MOM", 0.30)
+    w_mom = _cfg_float("W_MOM", 0.18)
+    w_drift = _cfg_float("W_DRIFT", 0.12)
+    drift_scale = _cfg_float("DRIFT_SCALE", 0.25)
     tech_ceil = _cfg_float("TECH_CEIL", 85.0)
 
     atr = None
@@ -340,9 +353,27 @@ def score_technical(pivot_data, atr_pct=None, atr_abs=None, direction_sign=1.0):
     dist_abs = abs(close - pivot) / atr if atr else 0.0
 
     pivot_sub = _ramp(dist_signed, pivot_scale, pivot_power)
+    drift_sub = None
+    drift_used = False
+    try:
+        if drift_pct is not None and drift_pct != "":
+            dlt = float(drift_pct)
+            if dlt == dlt and abs(dlt) < 50:
+                drift_sub = _ramp(sign * dlt, drift_scale, 1.0)
+                drift_used = True
+    except (TypeError, ValueError):
+        drift_sub = None
+        drift_used = False
+
     if mom_status is None and pct_change is not None:
         mom_sub = _ramp(sign * pct_change, mom_scale, 1.0)
-        tech_raw = w_pivot * pivot_sub + w_mom * mom_sub
+        if drift_used:
+            tech_raw = (
+                w_pivot * pivot_sub + w_mom * mom_sub + w_drift * float(drift_sub)
+            )
+        else:
+            # Open / missing 30m bars: do not haircut the open drive.
+            tech_raw = w_pivot * pivot_sub + (1.0 - w_pivot) * mom_sub
     else:
         # Do not silently score mom_sub=0 — momentum excluded (forensic only)
         mom_sub = None
@@ -364,6 +395,9 @@ def score_technical(pivot_data, atr_pct=None, atr_abs=None, direction_sign=1.0):
         "atr_distance_signed": round(dist_signed, 4),
         "pivot_sub": round(pivot_sub, 4),
         "mom_sub": None if mom_sub is None else round(mom_sub, 4),
+        "drift_sub": None if drift_sub is None else round(drift_sub, 4),
+        "drift_pct": None if not drift_used else round(float(drift_pct), 3),
+        "drift_used": drift_used,
         "vol_mult": round(vol_m, 4),
         "tech_raw": round(tech_raw, 4),
         "T": round(T, 2),
@@ -372,6 +406,8 @@ def score_technical(pivot_data, atr_pct=None, atr_abs=None, direction_sign=1.0):
         "mom_scale": mom_scale,
         "w_pivot": w_pivot,
         "w_mom": w_mom,
+        "w_drift": w_drift,
+        "drift_scale": drift_scale,
         "tech_ceil": tech_ceil,
     })
     if not close or not pivot:
@@ -389,7 +425,12 @@ def score_technical(pivot_data, atr_pct=None, atr_abs=None, direction_sign=1.0):
             f"dir={'C' if sign > 0 else 'P'}; ATR-dist {dist_signed:+.2f}; "
             f"pivot_sub {pivot_sub:.3f}; mom_sub {mom_sub:.3f} "
             f"(pct {pct_change:+.2f}%); "
-            f"vol_mult {vol_m:.2f} → T={T:.1f}/{tech_ceil:g}."
+            + (
+                f"drift_sub {drift_sub:.3f} (30m {float(drift_pct):+.2f}%); "
+                if drift_used
+                else "drift n/a; "
+            )
+            + f"vol_mult {vol_m:.2f} → T={T:.1f}/{tech_ceil:g}."
         )
     return T, metrics, reasons, mom_status
 
@@ -500,7 +541,7 @@ def _pick_block_reason(*candidates: str | None) -> str | None:
 # ------------------------------------------------------------------
 def score_ticker(ticker, options_dict, pivot_data, headlines_text,
                  macro_vector="", futures_pct=None, atr_pct=None, atr_abs=None,
-                 weights=None):
+                 weights=None, drift_pct=None):
     """
     Score = clamp(T + S, 0, 100). Liquidity is not a term.
 
@@ -530,7 +571,11 @@ def score_ticker(ticker, options_dict, pivot_data, headlines_text,
 
     liq_mult, lm, lreasons, liq_status = score_liquidity(options_dict)
     T, tm, treasons, mom_status = score_technical(
-        pivot_data, atr_pct=atr_pct, atr_abs=atr_abs, direction_sign=direction_sign,
+        pivot_data,
+        atr_pct=atr_pct,
+        atr_abs=atr_abs,
+        direction_sign=direction_sign,
+        drift_pct=drift_pct,
     )
     S, sm, sreasons = score_sentiment(
         headlines_text, macro_vector, futures_pct, direction_sign=direction_sign,
@@ -578,6 +623,8 @@ def score_ticker(ticker, options_dict, pivot_data, headlines_text,
     subscores = {
         "pivot_sub": tm.get("pivot_sub"),
         "mom_sub": tm.get("mom_sub"),
+        "drift_sub": tm.get("drift_sub"),
+        "drift_pct": tm.get("drift_pct"),
         "vol_mult": tm.get("vol_mult"),
         "T": round(T, 2),
         "S": round(S, 2),
@@ -625,6 +672,8 @@ def score_ticker(ticker, options_dict, pivot_data, headlines_text,
     print(
         f"[{ticker}] score subs "
         f"piv={subscores['pivot_sub']} mom={mom_log} "
+        f"dft={tm.get('drift_sub') if tm.get('drift_sub') is not None else 'n/a'} "
+        f"d30={tm.get('drift_pct') if tm.get('drift_pct') is not None else 'n/a'} "
         f"vol={subscores['vol_mult']} T={subscores['T']} S={subscores['S']} "
         f"liq={liq_log} dATR={subscores['atr_distance']} "
         f"atm_n={atm_n if atm_n is not None else 'n/a'} "
@@ -705,9 +754,14 @@ def format_subscore_bits(card) -> str:
         except (TypeError, ValueError):
             return "n/a"
 
+    dft = _g("drift_sub")
+    d30 = sub.get("drift_pct")
+    if d30 is None:
+        d30 = tm.get("drift_pct")
     med_s = "n/a" if med_spr is None else f"{_f(med_spr, 1)}%"
     bits = (
-        f"piv={_f(piv, 3)} mom={_f(mom, 3)} vol={_f(vol, 2)} "
+        f"piv={_f(piv, 3)} mom={_f(mom, 3)} dft={_f(dft, 3)} "
+        f"d30={_f(d30, 2)} vol={_f(vol, 2)} "
         f"T={_f(T, 1)} S={_f(S, 1)} liq={_f(liq, 2)} dATR={_f(d_atr, 3)} "
         f"atm_n={_i(atm_n)} med_spr={med_s} usable={_i(usable)}"
     )

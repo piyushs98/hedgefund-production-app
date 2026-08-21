@@ -41,6 +41,10 @@ class TestGateDefaults(unittest.TestCase):
         self.assertEqual(config.MAX_RISK_BREACH_PCT, 1.0)
         self.assertEqual(config.risk_per_trade_dollars(), 150.0)
         self.assertFalse(config.RESET_LEDGER_ON_BOOT)
+        self.assertEqual(config.MIN_PREMIUM, 1.00)
+        self.assertEqual(config.W_MOM, 0.18)
+        self.assertEqual(config.W_DRIFT, 0.12)
+        self.assertEqual(config.DRIFT_SCALE, 0.25)
         self.assertEqual(config.FIRST_FULL_SCAN_HOUR, 8)
         self.assertEqual(config.FIRST_FULL_SCAN_MINUTE, 45)
 
@@ -580,7 +584,8 @@ class TestExitRules(unittest.TestCase):
         self.assertTrue(line.startswith("BOOK: start "))
         self.assertIn("peak deployed", line)
         self.assertIn("realized", line)
-        self.assertIn("end ", line)
+        self.assertIn("open value", line)
+        self.assertIn("equity", line)
         self.assertIsNone(again)  # once per day
         self.assertEqual(len(alerts), 1)
 
@@ -661,6 +666,54 @@ class TestAug20ThesisReplay(unittest.TestCase):
         self.assertEqual(reason, "TAKE_PROFIT")
         self.assertAlmostEqual(px, 1.45)
         self.assertNotEqual(reason, "THESIS_VOID")
+
+
+class TestStopSlippage(unittest.TestCase):
+    def test_aapl_aug21_cheap_stop_leak(self):
+        trade = {
+            "ticker": "AAPL",
+            "direction": "PUT",
+            "entry_price": 0.67,
+            "stop_loss": 0.54,
+            "quantity": 10,
+        }
+        with mock.patch(
+            "ticker_desk.option_5m_atr_pct", return_value=(12.0, 0.50)
+        ):
+            stats = position_exits.stop_loss_slippage(trade, 0.445, -225.0)
+        self.assertAlmostEqual(stats["planned_risk"], 130.0)
+        self.assertAlmostEqual(stats["actual_loss"], 225.0)
+        self.assertAlmostEqual(stats["slippage_pct"], 73.1, places=0)
+        self.assertAlmostEqual(stats["stop_pct"], 19.4, places=0)
+        self.assertAlmostEqual(stats["atr5_pct"], 12.0)
+        self.assertTrue(stats["coin_flip"])
+        line = position_exits.format_closed_discord_line(
+            {
+                "ticker": "AAPL",
+                "reason": "STOP_LOSS",
+                "exit_price": 0.445,
+                "pnl": -225.0,
+                **stats,
+            }
+        )
+        self.assertIn("STOP_LOSS", line)
+        self.assertIn("planned $-130", line)
+        self.assertIn("slip 73%", line)
+        self.assertIn("stop=19% of entry", line)
+        self.assertIn("5m ATR 12%", line)
+        self.assertIn("coin_flip", line)
+
+    def test_non_stop_has_no_slip_clause(self):
+        line = position_exits.format_closed_discord_line(
+            {
+                "ticker": "SPY",
+                "reason": "THESIS_VOID",
+                "exit_price": 1.20,
+                "pnl": -105.0,
+            }
+        )
+        self.assertNotIn("planned", line)
+        self.assertIn("THESIS_VOID", line)
 
 
 class TestCloseWiresGate(unittest.TestCase):

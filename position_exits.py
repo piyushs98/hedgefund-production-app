@@ -653,6 +653,98 @@ def record_position_mark(
         return False
 
 
+def stop_loss_slippage(
+    trade: dict[str, Any],
+    exit_price: float,
+    pnl: float | None,
+) -> dict[str, Any] | None:
+    """
+    Planned stop risk vs realized loss on a STOP_LOSS fill.
+
+    planned_risk = (entry - SL) * 100 * qty   (dollars, positive)
+    actual_loss  = -pnl                       (dollars, positive when losing)
+    slippage_pct = (actual_loss - planned) / planned * 100
+    """
+    entry = _entry_premium(trade)
+    sl = _f(trade.get("stop_loss"))
+    qty = virtual_broker.resolve_quantity(trade)
+    if entry is None or sl is None or entry <= 0:
+        return None
+    planned = (entry - sl) * 100.0 * qty
+    if pnl is not None:
+        try:
+            actual = -float(pnl)
+        except (TypeError, ValueError):
+            actual = (entry - float(exit_price)) * 100.0 * qty
+    else:
+        try:
+            actual = (entry - float(exit_price)) * 100.0 * qty
+        except (TypeError, ValueError):
+            return None
+    slip = None
+    if planned > 0:
+        slip = (actual - planned) / planned * 100.0
+    stop_pct = (entry - sl) / entry * 100.0
+    atr5_pct = None
+    delta_used = None
+    coin_flip = None
+    try:
+        import ticker_desk as _td
+        delta = trade.get("delta")
+        if delta is None and isinstance(trade.get("option_contract"), dict):
+            delta = trade["option_contract"].get("delta")
+        ticker = trade.get("ticker")
+        if ticker:
+            atr5_pct, delta_used = _td.option_5m_atr_pct(entry, delta, ticker)
+    except Exception:
+        atr5_pct, delta_used = None, None
+    if atr5_pct is not None and stop_pct is not None:
+        coin_flip = stop_pct < (2.0 * float(atr5_pct))
+    return {
+        "planned_risk": round(planned, 2),
+        "actual_loss": round(actual, 2),
+        "slippage_pct": None if slip is None else round(slip, 1),
+        "stop_pct": round(stop_pct, 1),
+        "atr5_pct": None if atr5_pct is None else round(float(atr5_pct), 1),
+        "atr5_delta": delta_used,
+        "coin_flip": coin_flip,
+        "quantity": qty,
+    }
+
+
+def format_closed_discord_line(closed: dict[str, Any]) -> str:
+    """SCAN EXITS / EXIT PASS row, with stop-leak stats when present."""
+    ticker = closed.get("ticker") or "?"
+    reason = closed.get("reason") or "?"
+    px = closed.get("exit_price")
+    try:
+        px_s = f"${float(px):g}" if px is not None else "?"
+    except (TypeError, ValueError):
+        px_s = str(px)
+    line = f"**{ticker}** {reason} @ {px_s}"
+    pnl = closed.get("pnl")
+    if pnl is not None:
+        try:
+            line += f" PnL ${float(pnl):.0f}"
+        except (TypeError, ValueError):
+            pass
+    if "STOP_LOSS" in str(reason) and closed.get("planned_risk") is not None:
+        planned = float(closed["planned_risk"])
+        slip = closed.get("slippage_pct")
+        slip_s = f"{slip:.0f}%" if isinstance(slip, (int, float)) else "n/a"
+        extra = f"planned ${-abs(planned):.0f}, slip {slip_s}"
+        stop_pct = closed.get("stop_pct")
+        atr5 = closed.get("atr5_pct")
+        if stop_pct is not None:
+            extra += f", stop={stop_pct:.0f}% of entry"
+            if atr5 is not None:
+                extra += f" vs 5m ATR {atr5:.0f}% (δ×und)"
+                if closed.get("coin_flip"):
+                    extra += ", coin_flip"
+        line += f" ({extra})"
+    return line
+
+
 def close_open_position(
     trade: dict[str, Any],
     exit_price: float,
@@ -690,9 +782,17 @@ def close_open_position(
         result["ok"] = bool(sell.get("ok"))
         if sell.get("pnl") is not None:
             result["pnl"] = sell["pnl"]
+        if "STOP_LOSS" in str(reason):
+            stats = stop_loss_slippage(trade, exit_price, sell.get("pnl"))
+            if stats:
+                result.update(stats)
     except Exception as e:
         print(f"[Exits] paper_sell failed for {ticker}: {e}")
         result["sell_error"] = str(e)
+        if "STOP_LOSS" in str(reason):
+            stats = stop_loss_slippage(trade, exit_price, None)
+            if stats:
+                result.update(stats)
 
     try:
         removed = remove_active_trade(trade)
@@ -708,6 +808,26 @@ def close_open_position(
         except Exception:
             pass
 
+    if "STOP_LOSS" in str(reason) and result.get("planned_risk") is not None:
+        slip = result.get("slippage_pct")
+        slip_s = f"{slip:.0f}%" if isinstance(slip, (int, float)) else "n/a"
+        pnl_s = result.get("pnl")
+        try:
+            pnl_s = f"{float(pnl_s):.0f}"
+        except (TypeError, ValueError):
+            pnl_s = str(pnl_s)
+        noise = ""
+        if result.get("stop_pct") is not None:
+            noise = f", stop={result['stop_pct']:.0f}% of entry"
+            if result.get("atr5_pct") is not None:
+                noise += f" vs 5m ATR {result['atr5_pct']:.0f}% (δ×und)"
+                if result.get("coin_flip"):
+                    noise += ", coin_flip"
+        print(
+            f"[Exits] {ticker} STOP_LOSS @ {exit_price:g} "
+            f"PnL {pnl_s} (planned {-abs(float(result['planned_risk'])):.0f}, "
+            f"slip {slip_s}{noise})"
+        )
     print(
         f"[Exits] CLOSED {ticker} reason={reason} "
         f"exit=${exit_price:.4f} entry={entry} qty={qty} ok={result.get('ok')}"

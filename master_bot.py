@@ -438,6 +438,32 @@ def fetch_atr(ticker, breaker=None):
         return None, None
 
 
+def fetch_intraday_drift(ticker, breaker=None):
+    """30-minute signed return (%). None in the first ~30m of RTH."""
+    try:
+        import ticker_desk as _td
+
+        def _fetch():
+            return _td.session_drift_pct(ticker)
+
+        drift = _call_with_timeout(
+            _fetch, timeout_s=API_CALL_TIMEOUT_S, step=f"yf_drift:{ticker}"
+        )
+        if breaker and drift is not None:
+            breaker.record_success(f"drift:{ticker}")
+        return drift
+    except MasterBotScanError as e:
+        print(f"[{ticker}] drift fetch failed at {e.step}: {e.message}")
+        if breaker:
+            breaker.record_failure(f"drift:{ticker}")
+        return None
+    except Exception as e:
+        print(f"[{ticker}] drift fetch failed: {e}")
+        if breaker:
+            breaker.record_failure(f"drift:{ticker}")
+        return None
+
+
 def ensure_news_context(ticker, breaker=None):
     """DB-first news retrieval with the live yfinance cold-start fallback."""
     news_string = get_historical_context(ticker, days=90)
@@ -978,10 +1004,12 @@ def run_portfolio_scan(
                 macro_vector = "Neutral macroeconomic backdrop (LLM offline)."
 
             # ---- Deterministic conviction scoring (T+S; weights retired) ----
+            drift_pct = fetch_intraday_drift(ticker, breaker)
             card = scoring_engine.score_ticker(
                 ticker, options_dict, pivot_data, news_string,
                 macro_vector=macro_vector, futures_pct=futures_pct,
                 atr_pct=atr_pct, atr_abs=atr_abs,
+                drift_pct=drift_pct,
             )
             print(
                 f"[{ticker}] ⚙️ Scoring Engine: "
@@ -1394,6 +1422,7 @@ def run_macro_loop():
         f"REQUIRED_MOVE_ATR_K={config.REQUIRED_MOVE_ATR_K} "
         f"EXIT_MAX_DECAY_DENSITY={config.EXIT_MAX_DECAY_DENSITY}%/hr "
         f"MAX_CONTRACT_SPREAD_PCT={config.MAX_CONTRACT_SPREAD_PCT}% "
+        f"MIN_PREMIUM={getattr(config, 'MIN_PREMIUM', 1.0)} "
         f"MIN_EXTRINSIC_PCT={config.MIN_EXTRINSIC_PCT} "
         f"MAX_EXPIRY_CALENDAR_DTE={config.MAX_EXPIRY_CALENDAR_DTE} "
         f"MAX_RISK_BREACH_PCT={getattr(config, 'MAX_RISK_BREACH_PCT', 1.0)}"

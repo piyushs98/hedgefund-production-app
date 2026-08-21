@@ -446,6 +446,8 @@ def _compact_reason(reason: str) -> str:
         return "day_cap"
     if "risk_too_large" in r:
         return "risk_too_large"
+    if "min_premium" in r:
+        return "min_premium"
     if "below" in r:
         return "below_thr"
     return "other"

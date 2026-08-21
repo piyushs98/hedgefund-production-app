@@ -71,7 +71,7 @@ OUTPUT RULES (strict):
 1. One bullet per ticker. Format exactly:
 - **TICKER**: Spot $X vs Pivot $Y. Score: Z/100. <brief technical rationale>
 2. Data-dense only: Spot, Pivot, Score, and Contract/Entry/SL/TP if provided.
-3. ALWAYS copy piv= mom= vol= T= S= liq= dATR= atm_n= med_spr= usable=
+3. ALWAYS copy piv= mom= dft= d30= vol= T= S= liq= dATR= atm_n= med_spr= usable=
    (score_subs) verbatim after Score on EVERY row (EXECUTE and PASS).
    Prefer numbers over prose; drop commentary first.
 4. When the payload includes "ext" (e.g. ext=$0.51 (2.8%)), copy it verbatim after
@@ -760,6 +760,7 @@ def score_tickers_for_book(
     """
     from master_bot import (
         fetch_atr,
+        fetch_intraday_drift,
         get_latest_futures_pct,
         ensure_news_context,
         MasterBotScanError,
@@ -798,6 +799,7 @@ def score_tickers_for_book(
             )
             atr_abs, atr_pct = fetch_atr(ticker, breaker)
             news_string = ensure_news_context(ticker, breaker)
+            drift_pct = fetch_intraday_drift(ticker, breaker)
             card = scoring_engine.score_ticker(
                 ticker,
                 options_dict,
@@ -807,6 +809,7 @@ def score_tickers_for_book(
                 futures_pct=futures_pct,
                 atr_pct=atr_pct,
                 atr_abs=atr_abs,
+                drift_pct=drift_pct,
             )
             print(
                 f"[score-book] [{ticker}] T={card.technical_score} "
@@ -845,6 +848,7 @@ def run_thirty_min_scan(
     from master_bot import (
         TICKERS,
         fetch_atr,
+        fetch_intraday_drift,
         get_latest_futures_pct,
         ensure_news_context,
         record_executed_trade,
@@ -932,6 +936,7 @@ def run_thirty_min_scan(
             atr_abs, atr_pct = fetch_atr(ticker, breaker)
             news_string = ensure_news_context(ticker, breaker)
             macro_vector = macro_vector_local(ticker)
+            drift_pct = fetch_intraday_drift(ticker, breaker)
 
             card = scoring_engine.score_ticker(
                 ticker,
@@ -942,6 +947,7 @@ def run_thirty_min_scan(
                 futures_pct=futures_pct,
                 atr_pct=atr_pct,
                 atr_abs=atr_abs,
+                drift_pct=drift_pct,
             )
             # Per-scan sub-score line already printed inside score_ticker
             print(
@@ -1068,9 +1074,7 @@ def run_thirty_min_scan(
             if exit_summary.get("closed"):
                 try:
                     lines = [
-                        f"**{c.get('ticker')}** {c.get('reason')} "
-                        f"@ ${c.get('exit_price')}"
-                        + (f" PnL ${c.get('pnl'):.0f}" if c.get("pnl") is not None else "")
+                        position_exits.format_closed_discord_line(c)
                         for c in exit_summary["closed"]
                     ]
                     broadcaster.send_discord_alert(
@@ -1646,9 +1650,7 @@ def run_exit_only_pass(
         if exit_summary.get("closed"):
             try:
                 lines = [
-                    f"**{c.get('ticker')}** {c.get('reason')} "
-                    f"@ ${c.get('exit_price')}"
-                    + (f" PnL ${c.get('pnl'):.0f}" if c.get("pnl") is not None else "")
+                    position_exits.format_closed_discord_line(c)
                     for c in exit_summary["closed"]
                 ]
                 broadcaster.send_discord_alert(

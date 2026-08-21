@@ -329,6 +329,10 @@ class TestGateDataReasons(unittest.TestCase):
             sg._compact_reason("risk_too_large($210>$150 at qty1)"),
             "risk_too_large",
         )
+        self.assertEqual(
+            sg._compact_reason("min_premium($0.67<1.00)"),
+            "min_premium",
+        )
         # liq-killed total no longer the only path — but below_thr still exists
         self.assertEqual(sg._compact_reason("score 0.0 below 70"), "below_thr")
 
@@ -370,6 +374,67 @@ class TestGateDataReasons(unittest.TestCase):
         self.assertNotIn("below_thr", summary)
 
 
+class TestDriftTerm(unittest.TestCase):
+    def _aapl_1018(self):
+        # Below pivot, red on the day, rising last 30m (the Aug 21 10:18 put)
+        atr = 6.66
+        return {
+            "close": 309.99,
+            "pivot": 314.08,
+            "r1": 317.5,
+            "s1": 307.9,
+            "pct_change": -0.42,
+        }, atr
+
+    def test_against_drift_drops_below_threshold(self):
+        pivot_data, atr = self._aapl_1018()
+        T_now, _, _, _ = se.score_technical(
+            pivot_data, atr_pct=2.14, atr_abs=atr, direction_sign=-1.0
+        )
+        T_new, tm, _, _ = se.score_technical(
+            pivot_data,
+            atr_pct=2.14,
+            atr_abs=atr,
+            direction_sign=-1.0,
+            drift_pct=0.43,
+        )
+        self.assertGreaterEqual(T_now, 70.0)
+        self.assertLess(T_new, 70.0)
+        self.assertEqual(tm.get("drift_sub"), 0.0)
+
+    def test_aligned_drift_keeps_tsla_call(self):
+        pivot_data = {
+            "close": 358.83,
+            "pivot": 343.86,
+            "r1": 348.8,
+            "s1": 340.2,
+            "pct_change": 3.97,
+        }
+        T, tm, _, _ = se.score_technical(
+            pivot_data,
+            atr_pct=3.19,
+            atr_abs=11.0,
+            direction_sign=1.0,
+            drift_pct=2.60,
+        )
+        self.assertGreaterEqual(T, 80.0)
+        self.assertGreater(tm.get("drift_sub"), 0.9)
+
+    def test_missing_drift_falls_back_to_70_30(self):
+        pivot_data = {
+            "close": 103.0,
+            "pivot": 100.0,
+            "r1": 104.0,
+            "s1": 96.0,
+            "pct_change": 1.5,
+        }
+        T, tm, _, _ = se.score_technical(
+            pivot_data, atr_pct=2.0, atr_abs=2.0, direction_sign=1.0
+        )
+        self.assertFalse(tm.get("drift_used"))
+        self.assertGreaterEqual(T, 80.0)
+
+
 class TestSubscoreFormat(unittest.TestCase):
     def test_format_includes_all_keys(self):
         pivot_data = {
@@ -389,7 +454,7 @@ class TestSubscoreFormat(unittest.TestCase):
         )
         bits = se.format_subscore_bits(card)
         for token in (
-            "piv=", "mom=", "vol=", "T=", "S=", "liq=", "dATR=",
+            "piv=", "mom=", "dft=", "d30=", "vol=", "T=", "S=", "liq=", "dATR=",
             "atm_n=", "med_spr=", "usable=",
         ):
             self.assertIn(token, bits)

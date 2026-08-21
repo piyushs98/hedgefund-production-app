@@ -45,6 +45,7 @@ def calculate_swing_targets(options_json):
                 "reference_expiration": first_exp,
                 "reference_strike": atm["strike"],
                 "entry_premium": entry,
+                # QUEUED: ATR/delta stops (same 20%/50% still duplicated here).
                 "stop_loss": round(entry * 0.80, 2),    # 20% stop-loss
                 "take_profit": round(entry * 1.50, 2),  # 50% take-profit
             }

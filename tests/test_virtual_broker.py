@@ -147,7 +147,9 @@ class TestPaperQty(unittest.TestCase):
         # (2.115-1.35)*100*2 = +153
         self.assertIn("realized +153", line)
         self.assertIn("peak deployed 270", line)
-        self.assertIn("end 10,153", line)
+        self.assertIn("open value 0", line)
+        self.assertIn("equity 10,153", line)
+        self.assertNotIn("end ", line)
 
     def test_legacy_100k_seed_rebases_when_flat(self):
         with vb._connect() as conn:

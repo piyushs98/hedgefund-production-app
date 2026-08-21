@@ -242,6 +242,135 @@ def fetch_pivot_data(ticker):
             "live_from_today": False,
         }
 
+
+# 1-minute session cache: one Yahoo pull per ticker per minute, reused for
+# 30m drift scoring and 5m ATR stop-noise labels.
+_INTRADAY_1M: dict = {}
+
+
+def session_1m_history(ticker):
+    """Today's RTH 1-minute bars, cached per ticker per clock-minute."""
+    ticker_key = str(ticker).upper().strip()
+    now = datetime.now(_ET) if _ET is not None else datetime.now()
+    bucket = now.strftime("%Y%m%d%H%M")
+    key = (ticker_key, bucket)
+    if key in _INTRADAY_1M:
+        return _INTRADAY_1M[key]
+    hist = None
+    try:
+        hist = yf.Ticker(ticker_key, session=SESSION).history(
+            period="1d", interval="1m"
+        )
+        if hist is None or getattr(hist, "empty", True):
+            hist = None
+    except Exception as e:
+        print(f"[ticker_desk] 1m history failed for {ticker_key}: {e}")
+        hist = None
+    stale = [k for k in _INTRADAY_1M if k[0] == ticker_key and k != key]
+    for k in stale:
+        _INTRADAY_1M.pop(k, None)
+    _INTRADAY_1M[key] = hist
+    return hist
+
+
+def session_drift_pct(ticker, lookback_min=None, min_history_min=None):
+    """
+    Percent return over the last `lookback_min` minutes (default 30).
+
+    None when the session is shorter than lookback (open drive) so scoring
+    can fall back to 70/30 day-change only.
+    """
+    try:
+        import config as _cfg
+        lookback = int(lookback_min or getattr(_cfg, "DRIFT_LOOKBACK_MINUTES", 30))
+        min_hist = int(
+            min_history_min or getattr(_cfg, "DRIFT_MIN_HISTORY_MINUTES", 15)
+        )
+    except Exception:
+        lookback = int(lookback_min or 30)
+        min_hist = int(min_history_min or 15)
+    hist = session_1m_history(ticker)
+    if hist is None or getattr(hist, "empty", True) or len(hist) < 2:
+        return None
+    try:
+        span_min = (hist.index[-1] - hist.index[0]).total_seconds() / 60.0
+    except Exception:
+        return None
+    if span_min < float(lookback) or span_min < float(min_hist):
+        return None
+    try:
+        import pandas as pd
+        cutoff = hist.index[-1] - pd.Timedelta(minutes=lookback)
+        earlier = hist.loc[hist.index <= cutoff]
+        if earlier.empty:
+            return None
+        prev = float(earlier["Close"].iloc[-1])
+        last = float(hist["Close"].iloc[-1])
+    except Exception:
+        return None
+    if prev <= 0:
+        return None
+    return (last / prev - 1.0) * 100.0
+
+
+def underlying_5m_atr(ticker):
+    """(atr_abs, atr_pct_of_spot) from today's 1m bars resampled to 5m."""
+    hist = session_1m_history(ticker)
+    if hist is None or getattr(hist, "empty", True) or len(hist) < 15:
+        return None, None
+    try:
+        r = hist.resample("5min").agg(
+            {"High": "max", "Low": "min", "Close": "last"}
+        ).dropna()
+    except Exception:
+        return None, None
+    if r is None or len(r) < 3:
+        return None, None
+    try:
+        high, low, close = r["High"], r["Low"], r["Close"]
+        prev = close.shift(1)
+        tr = (high - low).combine((high - prev).abs(), max).combine(
+            (low - prev).abs(), max
+        )
+        tr = tr.dropna()
+        n = min(14, len(tr))
+        if n < 2:
+            return None, None
+        atr = float(tr.iloc[-n:].mean())
+        last = float(close.iloc[-1])
+        if last <= 0 or atr != atr:
+            return None, None
+        return atr, atr / last * 100.0
+    except Exception:
+        return None, None
+
+
+def option_5m_atr_pct(entry, delta, ticker):
+    """
+    Proxy for the contract's 5-minute range as % of entry:
+      |delta| * underlying_5m_ATR / entry * 100
+    Missing/bogus delta → 0.50 (ATM). Returns (pct, delta_used) or (None, None).
+    """
+    try:
+        prem = float(entry)
+    except (TypeError, ValueError):
+        return None, None
+    if prem <= 0 or not ticker:
+        return None, None
+    atr_abs, _ = underlying_5m_atr(ticker)
+    if atr_abs is None:
+        return None, None
+    d = 0.50
+    try:
+        if delta is not None and delta != "":
+            d = abs(float(delta))
+            if d <= 0 or d > 1.5:
+                d = 0.50
+    except (TypeError, ValueError):
+        d = 0.50
+    return (d * atr_abs / prem) * 100.0, d
+
+
 def get_specialist_briefing(ticker, pivot_data, news_headlines):
     """
     Individual specialist micro-agent:

@@ -230,19 +230,27 @@ REQUIRED_MOVE_ATR_K = _env_float("REQUIRED_MOVE_ATR_K", 0.5)
 EXIT_MAX_DECAY_DENSITY = _env_float("EXIT_MAX_DECAY_DENSITY", 8.0)
 MIN_EXTRINSIC_PCT = _env_float("MIN_EXTRINSIC_PCT", 10.0)
 MAX_CONTRACT_SPREAD_PCT = _env_float("MAX_CONTRACT_SPREAD_PCT", 8.0)
+# Cheap premium cannot hold a 20% stop at 5-min mark cadence.
+MIN_PREMIUM = _env_float("MIN_PREMIUM", 1.00)
 
 # ------------------------------------------------------------------
 # Calibrated scoring (scoring_engine). All env-tunable; restart to apply.
 #   Defaults: compromise A retuned 2026-08-10 for Mon/Fri two-sided test.
 #   PIVOT_SCALE=0.40 ATR, PIVOT_POWER=1.0, MOM_SCALE=0.45 %,
-#   W_PIVOT=0.70 / W_MOM=0.30, TECH_CEIL=85, SENT_MAX=15,
+#   W_PIVOT=0.70 / W_MOM=0.18 (day-change) / W_DRIFT=0.12 (30m),
+#   DRIFT_SCALE=0.25 %, TECH_CEIL=85, SENT_MAX=15,
 #   DEAD_ZONE_ATR=0.30 (hard PASS when |spot−pivot|/ATR below this).
+#   Queued (not this commit): ATR/delta stops; whether pivot should stay 70% of T.
 # ------------------------------------------------------------------
 PIVOT_SCALE = _env_float("PIVOT_SCALE", 0.40)
 PIVOT_POWER = _env_float("PIVOT_POWER", 1.0)
 MOM_SCALE = _env_float("MOM_SCALE", 0.45)
 W_PIVOT = _env_float("W_PIVOT", 0.70)
-W_MOM = _env_float("W_MOM", 0.30)
+W_MOM = _env_float("W_MOM", 0.18)  # day-change vs prior close
+W_DRIFT = _env_float("W_DRIFT", 0.12)  # last 30m, signed vs trade direction
+DRIFT_SCALE = _env_float("DRIFT_SCALE", 0.25)
+DRIFT_LOOKBACK_MINUTES = _env_int("DRIFT_LOOKBACK_MINUTES", 30)
+DRIFT_MIN_HISTORY_MINUTES = _env_int("DRIFT_MIN_HISTORY_MINUTES", 15)
 TECH_CEIL = _env_float("TECH_CEIL", 85.0)
 SENT_MAX = _env_float("SENT_MAX", 15.0)
 DEAD_ZONE_ATR = _env_float("DEAD_ZONE_ATR", 0.30)
@@ -264,6 +272,7 @@ def log_scoring_config() -> None:
         f"[Scoring] thr={EXECUTE_THRESHOLD} "
         f"PIVOT_SCALE={PIVOT_SCALE} PIVOT_POWER={PIVOT_POWER} "
         f"MOM_SCALE={MOM_SCALE} W_PIVOT={W_PIVOT} W_MOM={W_MOM} "
+        f"W_DRIFT={W_DRIFT} DRIFT_SCALE={DRIFT_SCALE} "
         f"TECH_CEIL={TECH_CEIL} SENT_MAX={SENT_MAX} "
         f"DEAD_ZONE_ATR={DEAD_ZONE_ATR} "
         f"score=T+S (no liq_mult) "

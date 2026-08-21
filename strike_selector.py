@@ -18,6 +18,8 @@ contract algorithmically instead of leaving it to LLM prose:
                on the candidate only; no two-sided quote → no_liq_data
        risk    1-lot (entry-SL)*100 <= RISK_PER_TRADE_DOLLARS * MAX_RISK_BREACH_PCT
                (no qty-1 floor that blows the budget)
+       min_premium  mid >= MIN_PREMIUM (default $1.00) — cheap options cannot
+               hold a 20% stop at 5-min mark cadence
      Error payloads include reject_tag for GATE line logging, e.g. decay(9.3>8.0)
      or spread(12.4>8.0) or risk_too_large($210>$150 at qty1).
 """
@@ -265,7 +267,7 @@ def _passes_entry_filters(
     Return (ok, reject_tag). reject_tag is compact for GATE lines:
       min_dte(0) | rm_atr(0.61>0.50) | decay(9.3>8.0) | bad_quote(ext=…)
       | min_ext(1.5<10) | spread(12.4>8.0) | no_liq_data
-      | risk_too_large($210>$150 at qty1)
+      | risk_too_large($210>$150 at qty1) | min_premium($0.67<1.00)
     """
     min_dte = int(getattr(config, "MIN_DTE", 1))
     k = float(getattr(config, "REQUIRED_MOVE_ATR_K", 0.5))
@@ -303,6 +305,15 @@ def _passes_entry_filters(
         return False, f"rm_atr({rm_atr:.2f}>{k:.2f})"
     if dens is not None and dens > max_dens:
         return False, f"decay({dens:.1f}>{max_dens:.1f})"
+    min_prem = float(getattr(config, "MIN_PREMIUM", 1.00))
+    if entry is not None:
+        try:
+            prem = float(entry)
+        except (TypeError, ValueError):
+            prem = None
+        else:
+            if prem > 0 and prem < min_prem:
+                return False, f"min_premium(${prem:.2f}<{min_prem:.2f})"
     risk_tag = risk_too_large_tag(entry)
     if risk_tag:
         return False, risk_tag
@@ -450,7 +461,7 @@ def select_optimal_contract(
             rejects.append(
                 f"{cand['expiration']} {cand['contract'].get('strike')}: {tag}"
             )
-            if tag.startswith("risk_too_large"):
+            if tag.startswith("risk_too_large") or tag.startswith("min_premium"):
                 print(f"REJECT {ticker or '?'}:{tag}")
             continue
         chosen = cand
@@ -494,6 +505,7 @@ def select_optimal_contract(
         "days_to_expiration": round(chosen["dte_eff"], 3),
         "calendar_dte": chosen["cal_dte"],
         "entry_premium": entry,
+        # QUEUED next: ATR/delta stops — replace this flat 20%/50% of premium.
         "stop_loss": round(entry * 0.80, 2),
         "take_profit": round(entry * 1.50, 2),
         "implied_volatility": round(best.get("impliedVolatility") or 0.0, 4),

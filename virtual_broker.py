@@ -133,6 +133,31 @@ def ensure_session_book() -> None:
     _book["peak_deployed"] = open_cost
 
 
+def open_mark_value() -> float:
+    """Mark-to-market of open lots: last_mark (else entry) × 100 × qty."""
+    try:
+        from tracker_agent import load_active_trades
+        trades = load_active_trades() or []
+    except Exception:
+        return 0.0
+    total = 0.0
+    for t in trades:
+        if not isinstance(t, dict):
+            continue
+        try:
+            mark = t.get("last_mark")
+            if mark is None:
+                mark = t.get("entry_price") or t.get("entry_premium")
+            mark = float(mark)
+        except (TypeError, ValueError):
+            continue
+        if mark <= 0:
+            continue
+        qty = resolve_quantity(t)
+        total += mark * CONTRACT_MULTIPLIER * qty
+    return total
+
+
 def _deployed_from_open_trades() -> float:
     try:
         from tracker_agent import load_active_trades
@@ -172,21 +197,25 @@ def note_session_close(entry_cost: float) -> None:
 
 def format_book_line() -> str:
     """
-    BOOK: start 10,000 | peak deployed X | realized +/-Y | end Z
+    BOOK: start 10,000 | peak deployed X | realized +/-Y | open value Y | equity Z
+
+    equity = buying_power (cash) + open mark value. That is account value.
     """
     ensure_session_book()
     port = get_portfolio()
     start = starting_buying_power()
     peak = float(_book.get("peak_deployed") or 0.0)
-    # Current open book is a floor on peak if we restarted mid-session
     peak = max(peak, _deployed_from_open_trades())
     realized = float(port.get("total_realized_pnl") or 0.0) - float(
         _book.get("start_realized") or 0.0
     )
-    end = float(port.get("buying_power") or 0.0)
+    bp = float(port.get("buying_power") or 0.0)
+    open_val = open_mark_value()
+    equity = bp + open_val
     return (
         f"BOOK: start {start:,.0f} | peak deployed {peak:,.0f} | "
-        f"realized {realized:+,.0f} | end {end:,.0f}"
+        f"realized {realized:+,.0f} | open value {open_val:,.0f} | "
+        f"equity {equity:,.0f}"
     )
 
 

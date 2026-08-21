@@ -285,6 +285,61 @@ class TestEntryFilters(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(tag, "risk_too_large($210>$150 at qty1)")
 
+    def test_min_premium_rejects_cheap(self):
+        ok, tag = ss._passes_entry_filters(
+            cal_dte=2, rm_atr=0.1, dens=1.0,
+            extrinsic=0.50, extrinsic_pct=75.0,
+            bid=0.64, ask=0.70, spread_pct=9.0,
+            entry=0.67,
+        )
+        # spread 9% also fails first — use tight quotes
+        ok, tag = ss._passes_entry_filters(
+            cal_dte=2, rm_atr=0.1, dens=1.0,
+            extrinsic=0.50, extrinsic_pct=75.0,
+            bid=0.66, ask=0.68, spread_pct=3.0,
+            entry=0.67,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(tag, "min_premium($0.67<1.00)")
+
+    def test_min_premium_walks_to_richer_candidate(self):
+        now = datetime(2026, 8, 5, 10, 32, tzinfo=ET)
+        options = {
+            "current_price": 302.10,
+            "chains": {
+                "2026-08-06": {
+                    "calls": [
+                        {
+                            "strike": 304.0,
+                            "bid": 0.64,
+                            "ask": 0.70,
+                            "openInterest": 100_000,
+                            "volume": 50_000,
+                            "impliedVolatility": 0.20,
+                        },
+                        {
+                            "strike": 303.0,
+                            "bid": 2.06,
+                            "ask": 2.14,
+                            "openInterest": 10,
+                            "volume": 1,
+                            "impliedVolatility": 0.80,
+                        },
+                    ],
+                    "puts": [],
+                }
+            },
+        }
+        pivot = {"close": 302.10, "pivot": 300.0, "pct_change": 0.5}
+        with mock.patch.object(config, "MIN_DTE", 1):
+            with mock.patch.object(config, "REQUIRED_MOVE_ATR_K", 5.0):
+                with mock.patch.object(config, "EXIT_MAX_DECAY_DENSITY", 100.0):
+                    out = ss.select_optimal_contract(
+                        options, pivot, atr_abs=5.0, now=now, ticker="AAPL"
+                    )
+        self.assertNotIn("error", out)
+        self.assertGreaterEqual(out["entry_premium"], 1.00)
+
     def test_tsla_610_does_not_breach_150(self):
         ok, tag = ss._passes_entry_filters(
             cal_dte=2, rm_atr=0.1, dens=1.0,
