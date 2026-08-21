@@ -76,6 +76,7 @@ OUTPUT RULES (strict):
    Prefer numbers over prose; drop commentary first.
 4. When the payload includes "ext" (e.g. ext=$0.51 (2.8%)), copy it verbatim after
    contract fields on EXECUTE rows. Do not invent extrinsic.
+   When "qty" is present, copy qty=N after the contract.
 5. When "delta" is present, append δ=0.XX. Never invent delta.
 6. When "block" is present (no_momentum_data / dead_zone), state it briefly —
    that is a data/structure PASS, not weak technicals. Chain atm_n/med_spr/usable
@@ -113,6 +114,25 @@ def is_midday_macro_window(dt=None) -> bool:
     if getattr(tt, "tzinfo", None) is not None:
         tt = tt.replace(tzinfo=None)
     return MIDDAY_MACRO_START <= tt <= MIDDAY_MACRO_END
+
+
+def is_full_scan_window(dt=None) -> bool:
+    """
+    True at/after FIRST_FULL_SCAN_CDT (default 08:45 America/Chicago).
+
+    The 08:30 CDT tick is the ET cash open; Yahoo option chains are not
+    populated yet and a full universe scan prints no_liq_data on all 10
+    names. Carry review + exits still run on that tick via exit-only.
+    """
+    dt = dt or _chicago_now()
+    tt = dt.time()
+    if getattr(tt, "tzinfo", None) is not None:
+        tt = tt.replace(tzinfo=None)
+    boundary = time(
+        int(getattr(config, "FIRST_FULL_SCAN_HOUR", 8)),
+        int(getattr(config, "FIRST_FULL_SCAN_MINUTE", 45)),
+    )
+    return tt >= boundary
 
 
 def macro_vector_local(ticker: str) -> str:
@@ -395,8 +415,13 @@ def deterministic_telemetry_bullet(row: dict) -> str:
         # Contract fields only — subs already attached once
         ext_s = _fmt_extrinsic(c, card=None)
         ext_bit = f" {ext_s}" if ext_s else ""
+        try:
+            qty_s = str(int(c.get("quantity") or 1))
+        except (TypeError, ValueError):
+            qty_s = "1"
         rationale = (
-            f"Setup {_fmt_contract_cell(c)} entry {_fmt_money(c.get('entry_premium'))} "
+            f"Setup {_fmt_contract_cell(c)} qty={qty_s} "
+            f"entry {_fmt_money(c.get('entry_premium'))} "
             f"SL {_fmt_money(c.get('stop_loss'))} TP {_fmt_money(c.get('take_profit'))}"
             f"{ext_bit}."
         )
@@ -435,8 +460,8 @@ def format_thirty_min_scan_discord(
     lines = [
         f"📊 **30-MIN SCAN [{clock} CDT]**",
         "",
-        "| Ticker | Status | Contract | Entry | SL | TP |",
-        "|---|---|---|---|---|---|",
+        "| Ticker | Status | Contract | Qty | Entry | SL | TP |",
+        "|---|---|---|---|---|---|---|",
     ]
     for ticker in universe:
         r = rows_by_ticker.get(ticker) or {}
@@ -444,12 +469,18 @@ def format_thirty_min_scan_discord(
         contract = r.get("contract")
         if status == "EXECUTE" and contract and "error" not in contract:
             c_cell = _fmt_contract_cell(contract)
+            try:
+                qty_s = str(int(contract.get("quantity") or 1))
+            except (TypeError, ValueError):
+                qty_s = "1"
             entry = _fmt_money(contract.get("entry_premium"))
             sl = _fmt_money(contract.get("stop_loss"))
             tp = _fmt_money(contract.get("take_profit"))
         else:
-            c_cell, entry, sl, tp = "-", "-", "-", "-"
-        lines.append(f"| {ticker} | {status} | {c_cell} | {entry} | {sl} | {tp} |")
+            c_cell, qty_s, entry, sl, tp = "-", "-", "-", "-", "-"
+        lines.append(
+            f"| {ticker} | {status} | {c_cell} | {qty_s} | {entry} | {sl} | {tp} |"
+        )
 
     if gate_summary:
         lines.append("")
@@ -519,6 +550,7 @@ def deepseek_key_telemetry(
                     "score_subs": _row_subscore_bits(r) or None,
                     "changes": r.get("changes") or [],
                     "contract": _fmt_contract_cell(c) if c else None,
+                    "qty": (c.get("quantity") if c else None) or (1 if c else None),
                     "entry": c.get("entry_premium") if c else None,
                     "sl": c.get("stop_loss") if c else None,
                     "tp": c.get("take_profit") if c else None,
@@ -707,6 +739,88 @@ def _note_scan_discord_result(
         print(f"[scan] scan-discord CRITICAL delivered={delivered}")
     except Exception as e:
         print(f"[scan] scan-discord CRITICAL send failed: {e}")
+
+
+def score_tickers_for_book(
+    tickers: list[str],
+    breaker: CircuitBreaker,
+    *,
+    inter_ticker_sleep: float = 0.5,
+) -> dict[str, dict[str, Any]]:
+    """
+    Score a ticker subset (open book for morning carry / thesis void).
+
+    No gate, no admits, no Discord table. Returns ticker ->
+    {card, options_dict, pivot_data, atr_abs} for run_morning_carry_review.
+    """
+    from master_bot import (
+        fetch_atr,
+        get_latest_futures_pct,
+        ensure_news_context,
+        MasterBotScanError,
+        _call_with_timeout,
+        API_CALL_TIMEOUT_S,
+    )
+
+    scored: dict[str, dict[str, Any]] = {}
+    if not tickers:
+        return scored
+    futures_pct = get_latest_futures_pct("ES=F")
+    universe = [str(t).upper().strip() for t in tickers if t]
+    print(
+        f"[score-book] scoring {len(universe)} open ticker(s) "
+        f"(no universe admit): {', '.join(universe)}"
+    )
+    for idx, ticker in enumerate(universe):
+        try:
+            options_json = _call_with_timeout(
+                lambda t=ticker: fetch_options_data(t),
+                timeout_s=API_CALL_TIMEOUT_S,
+                step=f"carry_yf_options:{ticker}",
+            )
+            options_dict = json.loads(options_json)
+            if "error" in options_dict:
+                print(
+                    f"[score-book] [{ticker}] options error: "
+                    f"{options_dict.get('error')}"
+                )
+                continue
+            breaker.record_success(f"options:{ticker}")
+            pivot_data = _call_with_timeout(
+                lambda t=ticker: fetch_pivot_data(t),
+                timeout_s=API_CALL_TIMEOUT_S,
+                step=f"carry_yf_pivot:{ticker}",
+            )
+            atr_abs, atr_pct = fetch_atr(ticker, breaker)
+            news_string = ensure_news_context(ticker, breaker)
+            card = scoring_engine.score_ticker(
+                ticker,
+                options_dict,
+                pivot_data,
+                news_string,
+                macro_vector=macro_vector_local(ticker),
+                futures_pct=futures_pct,
+                atr_pct=atr_pct,
+                atr_abs=atr_abs,
+            )
+            print(
+                f"[score-book] [{ticker}] T={card.technical_score} "
+                f"S={card.sentiment_score:+g} = {card.total_score}/100"
+            )
+            scored[ticker] = {
+                "card": card,
+                "options_dict": options_dict,
+                "pivot_data": pivot_data if isinstance(pivot_data, dict) else {},
+                "atr_abs": atr_abs,
+            }
+        except MasterBotScanError as e:
+            print(f"[score-book] [{ticker}] isolated: {e.step}: {e.message}")
+        except Exception as e:
+            print(f"[score-book] [{ticker}] error: {e}")
+        if idx < len(universe) - 1 and inter_ticker_sleep:
+            import time as _time
+            _time.sleep(inter_ticker_sleep)
+    return scored
 
 
 def run_thirty_min_scan(
@@ -1059,33 +1173,64 @@ def run_thirty_min_scan(
                     )
                     contract = None
                 else:
-                    try:
-                        buy_payload = dict(contract)
-                        buy_payload.setdefault("ticker", ticker)
-                        virtual_broker.paper_buy(buy_payload, contract.get("entry_premium"))
-                    except Exception as be:
-                        print(f"[{ticker}] paper_buy warn: {be}")
-                    try:
-                        record_executed_trade(
-                            ticker,
-                            contract,
-                            scan_id=scan_id,
-                            card=card,
-                            pivot_data=pivot_data,
-                        )
-                    except Exception as pe:
-                        print(f"[{ticker}] persist warn: {pe}")
-                    result["trades"].append({
-                        "ticker": ticker,
-                        "direction": contract.get("direction"),
-                        "strike": contract.get("strike"),
-                        "expiration": contract.get("expiration"),
-                        "entry_premium": contract.get("entry_premium"),
-                        "stop_loss": contract.get("stop_loss"),
-                        "take_profit": contract.get("take_profit"),
-                        "gate_rank": getattr(gdec, "conviction_rank", None),
-                        "total_score": card.total_score,
-                    })
+                    buy_payload = dict(contract)
+                    buy_payload.setdefault("ticker", ticker)
+                    qty = virtual_broker.apply_entry_quantity(buy_payload)
+                    print(
+                        f"[EXECUTE] {ticker} qty={qty} "
+                        f"entry={buy_payload.get('entry_premium')} "
+                        f"SL={buy_payload.get('stop_loss')}"
+                    )
+                    buy_ok = False
+                    if qty < 1:
+                        print(f"[{ticker}] paper_buy blocked: qty=0 (buying power)")
+                    else:
+                        try:
+                            buy_res = virtual_broker.paper_buy(
+                                buy_payload,
+                                contract.get("entry_premium"),
+                                quantity=qty,
+                            )
+                            buy_ok = bool(buy_res.get("ok"))
+                            if not buy_ok:
+                                print(
+                                    f"[{ticker}] paper_buy blocked: "
+                                    f"{buy_res.get('error')}"
+                                )
+                        except Exception as be:
+                            print(f"[{ticker}] paper_buy warn: {be}")
+                    if not buy_ok:
+                        card.action_flag = "PASS"
+                        card.reasons.append("Broker: insufficient buying_power")
+                        contract = None
+                        try:
+                            gate.rollback_admit(ticker)
+                        except Exception:
+                            pass
+                    else:
+                        contract["quantity"] = qty
+                        try:
+                            record_executed_trade(
+                                ticker,
+                                contract,
+                                scan_id=scan_id,
+                                card=card,
+                                pivot_data=pivot_data,
+                            )
+                        except Exception as pe:
+                            print(f"[{ticker}] persist warn: {pe}")
+                        result["trades"].append({
+                            "ticker": ticker,
+                            "direction": contract.get("direction"),
+                            "strike": contract.get("strike"),
+                            "expiration": contract.get("expiration"),
+                            "entry_premium": contract.get("entry_premium"),
+                            "stop_loss": contract.get("stop_loss"),
+                            "take_profit": contract.get("take_profit"),
+                            "quantity": qty,
+                            "gate_rank": getattr(gdec, "conviction_rank", None),
+                            "total_score": card.total_score,
+                        })
 
         snap = _card_snapshot(card, atr_abs=atr_abs)
         prev = (baseline.get("tickers") or {}).get(ticker)
@@ -1291,6 +1436,13 @@ def run_exit_only_pass(
 
     result["open_before"] = len(open_trades)
     if not open_trades:
+        try:
+            import position_exits as _pex
+            now_c = _chicago_now()
+            if not _pex.carry_review_already_done(now_c.date()):
+                _pex.mark_carry_review_done(now_c.date())
+        except Exception:
+            pass
         print(f"[exit-pass] {clock} CDT — no open positions; skip mark fetches.")
         return result
 
@@ -1298,6 +1450,56 @@ def run_exit_only_pass(
         f"\n⏱️ EXIT-ONLY PASS {scan_id} | {clock} CDT | "
         f"{len(open_trades)} open position(s) | single-contract quotes"
     )
+
+    # Morning carry review on the 08:30 tick (full scan is deferred to 08:45).
+    # Score OPEN names only — do not Discord a 10-row no_liq_data table.
+    try:
+        import position_exits as _pex
+        now_c = _chicago_now()
+        if not _pex.carry_review_already_done(now_c.date()):
+            open_tickers = []
+            seen_t = set()
+            for t in open_trades:
+                tk = str((t or {}).get("ticker") or "").upper().strip()
+                if tk and tk not in seen_t:
+                    seen_t.add(tk)
+                    open_tickers.append(tk)
+            scored_carry = score_tickers_for_book(
+                open_tickers, breaker, inter_ticker_sleep=inter_ticker_sleep
+            )
+            print(
+                f"[exit-pass] CARRY REVIEW: {len(open_trades)} open "
+                f"vs today's pivot/score (no admits)"
+            )
+            carry_summary = _pex.run_morning_carry_review(
+                open_trades,
+                scored_carry,
+                scan_id=scan_id,
+                now_cdt=now_c,
+            )
+            result["carry_review"] = {
+                "ran": carry_summary.get("ran"),
+                "held": carry_summary.get("held"),
+                "closed": [
+                    {
+                        "ticker": c.get("ticker"),
+                        "reason": c.get("reason"),
+                        "exit_price": c.get("exit_price"),
+                        "pnl": c.get("pnl"),
+                    }
+                    for c in (carry_summary.get("closed") or [])
+                ],
+                "lines": carry_summary.get("lines"),
+            }
+            open_trades = load_active_trades()
+            result["open_before"] = len(open_trades)
+            if not open_trades:
+                print(
+                    f"[exit-pass] {clock} CDT — book flat after carry review."
+                )
+                return result
+    except Exception as carry_err:
+        print(f"[exit-pass] carry review warn: {carry_err}")
 
     # Key quotes by trade identity so multi-leg same ticker (if any) stays correct.
     # lookup in run_scan_exits is by ticker — one options_dict per ticker is enough

@@ -303,6 +303,7 @@ def record_executed_trade(ticker, contract, scan_id=None, card=None, pivot_data=
         "days_to_expiration": contract.get("days_to_expiration"),
         "implied_volatility": contract.get("implied_volatility"),
         "bid_ask_spread_pct": contract.get("bid_ask_spread_pct"),
+        "quantity": int(contract.get("quantity") or 1),
     }
 
     notes_parts = [f"scan_id={scan_id}"] if scan_id else []
@@ -360,6 +361,7 @@ def record_executed_trade(ticker, contract, scan_id=None, card=None, pivot_data=
         "entry_spot": entry_spot,
         "entry_calendar_dte": contract.get("calendar_dte"),
         "entry_dte": contract.get("days_to_expiration"),
+        "quantity": int(contract.get("quantity") or 1),
     }
 
     # Dual-write: active_trades.json + news_room.db active_trades_store
@@ -1217,33 +1219,67 @@ def run_portfolio_scan(
             # hands the open position to active_trades.json (atomic append).
             if card.action_flag == "EXECUTE" and contract and "error" not in contract:
                 try:
-                    # Virtual paper ledger: debit premium * 100 from buying power.
+                    # Virtual paper ledger: debit premium * 100 * qty from buying power.
                     # Does not alter scoring / AI / execution criteria.
                     entry_px = contract.get("entry_premium")
                     buy_payload = dict(contract)
                     buy_payload.setdefault("ticker", ticker)
-                    try:
-                        virtual_broker.paper_buy(buy_payload, entry_px)
-                    except Exception as broker_err:
-                        print(f"[CEO] WARNING: virtual paper_buy failed "
-                              f"for {ticker}: {broker_err}")
-                    record_executed_trade(
-                        ticker,
-                        contract,
-                        scan_id=scan_id,
-                        card=card,
-                        pivot_data=pivot_data,
+                    qty = virtual_broker.apply_entry_quantity(buy_payload)
+                    print(
+                        f"[EXECUTE] {ticker} qty={qty} entry={entry_px} "
+                        f"SL={buy_payload.get('stop_loss')}"
                     )
-                    ticker_summary["trade_executed"] = True
-                    result["trades"].append({
-                        "ticker": ticker,
-                        "direction": contract.get("direction"),
-                        "strike": contract.get("strike"),
-                        "expiration": contract.get("expiration"),
-                        "entry_premium": contract.get("entry_premium"),
-                        "total_score": card.total_score,
-                        "action_flag": card.action_flag,
-                    })
+                    buy_ok = False
+                    if qty < 1:
+                        print(
+                            f"[CEO] paper_buy blocked {ticker}: "
+                            f"qty=0 (buying power)"
+                        )
+                    else:
+                        try:
+                            buy_res = virtual_broker.paper_buy(
+                                buy_payload, entry_px, quantity=qty
+                            )
+                            buy_ok = bool(buy_res.get("ok"))
+                            if not buy_ok:
+                                print(
+                                    f"[CEO] paper_buy blocked {ticker}: "
+                                    f"{buy_res.get('error')}"
+                                )
+                        except Exception as broker_err:
+                            print(
+                                f"[CEO] WARNING: virtual paper_buy failed "
+                                f"for {ticker}: {broker_err}"
+                            )
+                    if not buy_ok:
+                        card.action_flag = "PASS"
+                        card.reasons.append("Broker: insufficient buying_power")
+                        ticker_summary["action_flag"] = "PASS"
+                        try:
+                            import signal_gate as _sg
+                            _sg.get_gate().rollback_admit(ticker)
+                        except Exception:
+                            pass
+                    else:
+                        contract["quantity"] = qty
+                        record_executed_trade(
+                            ticker,
+                            contract,
+                            scan_id=scan_id,
+                            card=card,
+                            pivot_data=pivot_data,
+                        )
+                        ticker_summary["trade_executed"] = True
+                        result["trades"].append({
+                            "ticker": ticker,
+                            "direction": contract.get("direction"),
+                            "strike": contract.get("strike"),
+                            "expiration": contract.get("expiration"),
+                            "entry_premium": contract.get("entry_premium"),
+                            "quantity": qty,
+                            "total_score": card.total_score,
+                            "action_flag": card.action_flag,
+                        })
                 except Exception as persist_err:
                     # Never let state I/O kill the portfolio scan
                     print(f"[CEO] WARNING: active_trades persistence failed "
@@ -1315,6 +1351,7 @@ def run_macro_loop():
         run_exit_only_pass,
         run_midday_macro_meeting,
         is_midday_macro_window,
+        is_full_scan_window,
         load_baseline,
         cdt_clock_str,
     )
@@ -1343,11 +1380,16 @@ def run_macro_loop():
     )
     if hasattr(config, "log_scoring_config"):
         config.log_scoring_config()
+    if hasattr(config, "log_risk_config"):
+        config.log_risk_config()
     print(
         f"[SessionCutoffs] EXIT_EOD_FLATTEN_CDT="
         f"{config.EXIT_EOD_FLATTEN_HOUR:02d}:{config.EXIT_EOD_FLATTEN_MINUTE:02d} "
         f"CARRY_MIN_DTE={config.CARRY_MIN_DTE} "
-        f"(EOD flattens only cal_dte < CARRY_MIN_DTE; multi-day may overnight)"
+        f"(EOD flattens only cal_dte < CARRY_MIN_DTE; multi-day may overnight) "
+        f"FIRST_FULL_SCAN_CDT="
+        f"{config.FIRST_FULL_SCAN_HOUR:02d}:{config.FIRST_FULL_SCAN_MINUTE:02d} "
+        f"(08:30 CDT is exit/carry only; chains empty at ET open)"
     )
     # Log-only path inventory (Stage 1). No writes, no restore.
     try:
@@ -1569,6 +1611,13 @@ def run_macro_loop():
                     last_full_scan_mono <= 0
                     or (now_mono - last_full_scan_mono) >= full_scan_interval
                 )
+                if need_full and not is_full_scan_window(now_cdt):
+                    print(
+                        "[System State] Pre-FIRST_FULL_SCAN_CDT — skip full "
+                        "score/admit (Yahoo chains empty at the open); "
+                        "exit/carry only."
+                    )
+                    need_full = False
                 if full_llm_intraday:
                     print("[System State] FULL_LLM_INTRADAY=true — heavy portfolio scan.")
                     run_portfolio_scan(

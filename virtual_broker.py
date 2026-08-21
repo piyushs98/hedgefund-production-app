@@ -156,11 +156,126 @@ def _contract_meta(contract: Any) -> dict[str, Any]:
     return contract
 
 
-def paper_buy(contract: Any, entry_price: float | int | None) -> dict[str, Any]:
+def resolve_quantity(contract: Any, quantity: int | None = None) -> int:
+    """Contracts on a paper fill. Explicit arg wins; else contract fields; else 1.
+
+    Explicit 0 is preserved so a buying-power size-down to nothing can block.
     """
-    Open a virtual long option: debit entry_price * 100 from buying_power.
+    if quantity is not None:
+        try:
+            q = int(quantity)
+            return q if q >= 0 else 1
+        except (TypeError, ValueError):
+            return 1
+    meta = _contract_meta(contract)
+    for key in ("quantity", "qty", "contracts"):
+        raw = meta.get(key)
+        if raw is None and isinstance(meta.get("option_contract"), dict):
+            raw = meta["option_contract"].get(key)
+        if raw is None:
+            continue
+        try:
+            q = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if q >= 0:
+            return q
+    return 1
+
+
+def size_position(
+    entry_price: float | int | None,
+    stop_loss: float | int | None,
+    *,
+    buying_power: float | None = None,
+) -> int:
+    """
+    Risk-based contract count.
+
+      1. qty = floor(account_risk / ((entry - SL) * 100)), min 1
+      2. soft cap: min(qty, MAX_CONTRACTS_PER_TRADE)
+      3. hard cap: min(qty, floor(buying_power / (entry * 100))) → may be 0
+
+    Buying power is applied last and is the hard constraint: the contract
+    cap never forces a fill the ledger cannot debit. paper_buy also
+    refuses the open if the debit still exceeds buying_power.
+    """
+    max_qty = max(1, int(getattr(config, "MAX_CONTRACTS_PER_TRADE", 10)))
+    try:
+        entry = float(entry_price)
+    except (TypeError, ValueError):
+        return 1
+    if entry <= 0:
+        return 1
+
+    account = float(getattr(config, "ACCOUNT_SIZE", 25000.0))
+    risk_pct = float(getattr(config, "RISK_PER_TRADE_PCT", 1.5))
+    account_risk = account * (risk_pct / 100.0)
+
+    sl = None
+    try:
+        if stop_loss is not None and stop_loss != "":
+            sl = float(stop_loss)
+    except (TypeError, ValueError):
+        sl = None
+
+    qty = 1
+    if sl is not None:
+        per_contract_risk = (entry - sl) * CONTRACT_MULTIPLIER
+        if per_contract_risk > 0 and account_risk > 0:
+            qty = int(account_risk // per_contract_risk)  # floor
+            if qty < 1:
+                qty = 1
+    qty = min(qty, max_qty)
+
+    if buying_power is not None:
+        try:
+            bp = float(buying_power)
+        except (TypeError, ValueError):
+            bp = None
+        else:
+            cost_one = entry * CONTRACT_MULTIPLIER
+            if cost_one > 0:
+                affordable = int(bp // cost_one)
+                qty = min(qty, max(0, affordable))
+
+    return max(0, int(qty))
+
+
+def apply_entry_quantity(
+    contract: dict[str, Any],
+    *,
+    buying_power: float | None = None,
+) -> int:
+    """Stamp contract['quantity'] from the risk formula. 0 = cannot afford."""
+    if not isinstance(contract, dict):
+        return 1
+    if buying_power is None:
+        try:
+            buying_power = float(get_portfolio().get("buying_power"))
+        except (TypeError, ValueError):
+            buying_power = None
+    qty = size_position(
+        contract.get("entry_premium")
+        if contract.get("entry_premium") is not None
+        else contract.get("entry_price"),
+        contract.get("stop_loss"),
+        buying_power=buying_power,
+    )
+    contract["quantity"] = qty
+    return qty
+
+
+def paper_buy(
+    contract: Any,
+    entry_price: float | int | None,
+    quantity: int | None = None,
+) -> dict[str, Any]:
+    """
+    Open a virtual long option: debit entry_price * 100 * qty from buying_power.
 
     Returns a result dict with ok/error and the updated ledger snapshot.
+    quantity defaults to contract['quantity'] or 1.
     """
     ensure_ledger()
     try:
@@ -171,7 +286,16 @@ def paper_buy(contract: Any, entry_price: float | int | None) -> dict[str, Any]:
     if premium <= 0:
         return {"ok": False, "error": f"entry_price must be > 0, got {premium}"}
 
-    cost = premium * CONTRACT_MULTIPLIER
+    qty = resolve_quantity(contract, quantity)
+    if qty < 1:
+        return {
+            "ok": False,
+            "error": "insufficient buying_power",
+            "quantity": 0,
+            "cost": 0.0,
+        }
+
+    cost = premium * CONTRACT_MULTIPLIER * qty
     now = datetime.now(timezone.utc).isoformat()
 
     # Stage 1: write_guard is additive only. Soft failures still return
@@ -196,6 +320,7 @@ def paper_buy(contract: Any, entry_price: float | int | None) -> dict[str, Any]:
                     "error": "insufficient buying_power",
                     "buying_power": buying_power,
                     "cost": cost,
+                    "quantity": qty,
                 }
 
             new_bp = buying_power - cost
@@ -224,6 +349,9 @@ def paper_buy(contract: Any, entry_price: float | int | None) -> dict[str, Any]:
         pass
 
     meta = _contract_meta(contract)
+    if isinstance(contract, dict):
+        contract["quantity"] = qty
+        meta = contract
     ticker = meta.get("ticker") or meta.get("symbol")
     direction = meta.get("direction") or "?"
 
@@ -232,7 +360,7 @@ def paper_buy(contract: Any, entry_price: float | int | None) -> dict[str, Any]:
     theoretical_slippage: float | None = None
     ask = _extract_ask(meta)
     if ask is not None:
-        theoretical_slippage = (premium - ask) * CONTRACT_MULTIPLIER
+        theoretical_slippage = (premium - ask) * CONTRACT_MULTIPLIER * qty
         fp = _entry_fingerprint(ticker, direction, premium)
         _pending_slippage[fp] = theoretical_slippage
         # Log to trade_history immediately (open marker); paper_sell writes the
@@ -271,12 +399,14 @@ def paper_buy(contract: Any, entry_price: float | int | None) -> dict[str, Any]:
     print(
         f"[VirtualBroker] paper_buy "
         f"{ticker or meta.get('direction', '?')} "
-        f"@ ${premium:.2f} → debit ${cost:.2f}; "
+        f"qty={qty} @ ${premium:.2f} → debit ${cost:.2f}; "
         f"buying_power ${buying_power:.2f} → ${new_bp:.2f}"
     )
     event: dict[str, Any] = {
         "type": "EXECUTE",
-        "message": f"BOUGHT: {ticker or '?'} {direction} @ ${premium}",
+        "message": (
+            f"BOUGHT: {ticker or '?'} {direction} qty={qty} @ ${premium}"
+        ),
     }
     if theoretical_slippage is not None:
         event["slippage"] = theoretical_slippage
@@ -285,6 +415,7 @@ def paper_buy(contract: Any, entry_price: float | int | None) -> dict[str, Any]:
         "ok": True,
         "cost": cost,
         "entry_price": premium,
+        "quantity": qty,
         "buying_power": new_bp,
         "total_realized_pnl": realized,
     }
@@ -299,14 +430,16 @@ def paper_sell(
     direction: str | None,
     entry_price: float | int | None,
     notes: str | None = None,
+    quantity: int | None = None,
 ) -> dict[str, Any]:
     """
     Close a virtual long option:
-      * credit exit_price * 100 back to buying_power
-      * realized PnL = (exit_price - entry_price) * 100
+      * credit exit_price * 100 * qty back to buying_power
+      * realized PnL = (exit_price - entry_price) * 100 * qty
       * append a row to trade_history
 
     notes: optional exit reason (e.g. EXIT:STOP_LOSS) for audit/analytics.
+    quantity defaults to contract['quantity'] or 1.
     """
     ensure_ledger()
     try:
@@ -318,8 +451,9 @@ def paper_sell(
             "error": f"invalid prices entry={entry_price!r} exit={exit_price!r}",
         }
 
-    pnl = (exit_ - entry) * CONTRACT_MULTIPLIER
-    capital_back = exit_ * CONTRACT_MULTIPLIER
+    qty = resolve_quantity(contract, quantity)
+    pnl = (exit_ - entry) * CONTRACT_MULTIPLIER * qty
+    capital_back = exit_ * CONTRACT_MULTIPLIER * qty
     now = datetime.now(timezone.utc).isoformat()
     meta = _contract_meta(contract)
 
@@ -355,7 +489,7 @@ def paper_sell(
             # Fallback: recompute from ask if the contract still carries it.
             ask = _extract_ask(meta)
             if ask is not None:
-                slippage = (entry - ask) * CONTRACT_MULTIPLIER
+                slippage = (entry - ask) * CONTRACT_MULTIPLIER * qty
 
         _ensure_slippage_column(conn)
         conn.execute(
@@ -391,13 +525,15 @@ def paper_sell(
 
     print(
         f"[VirtualBroker] paper_sell {ticker or '?'} {dir_str} "
-        f"entry=${entry:.2f} exit=${exit_:.2f} PnL=${pnl:.2f}; "
+        f"qty={qty} entry=${entry:.2f} exit=${exit_:.2f} PnL=${pnl:.2f}; "
         f"buying_power → ${new_bp:.2f}, realized → ${new_pnl:.2f}"
         + (f"; slippage=${slippage:.2f}" if slippage is not None else "")
     )
     close_event: dict[str, Any] = {
         "type": "CLOSE",
-        "message": f"SOLD: {ticker or '?'} {dir_str or '?'} @ ${exit_}",
+        "message": (
+            f"SOLD: {ticker or '?'} {dir_str or '?'} qty={qty} @ ${exit_}"
+        ),
     }
     if slippage is not None:
         close_event["slippage"] = slippage
@@ -408,6 +544,7 @@ def paper_sell(
         "capital_back": capital_back,
         "entry_price": entry,
         "exit_price": exit_,
+        "quantity": qty,
         "buying_power": new_bp,
         "total_realized_pnl": new_pnl,
     }

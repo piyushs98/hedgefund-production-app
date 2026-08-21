@@ -167,6 +167,26 @@ EXIT_TIME_STOP_MINUTES = _env_int("EXIT_TIME_STOP_MINUTES", 90)
 EXIT_TIME_STOP_PNL_ABS_PCT = _env_float("EXIT_TIME_STOP_PNL_ABS_PCT", 10.0)
 # Skip TIME_STOP when live (or last) underlying score is still this strong.
 TIME_STOP_SCORE_EXEMPT = _env_float("TIME_STOP_SCORE_EXEMPT", 80.0)
+# Close a high-conviction entry when the live score collapses, regardless of P&L.
+# Hysteresis: only if entry_score >= EXECUTE_THRESHOLD (70), so marginal
+# entries cannot be thesis-voided. Fires in carry review and every exit pass.
+THESIS_EXIT_SCORE = _env_float("THESIS_EXIT_SCORE", 55.0)
+# First full score/admit of the Chicago session. 08:30 CDT is the ET open;
+# Yahoo chains are empty then (no_liq_data on the whole universe). Carry
+# review + exits still run on the 08:30 tick via the exit-only path.
+FIRST_FULL_SCAN_HOUR, FIRST_FULL_SCAN_MINUTE = _env_hhmm(
+    "FIRST_FULL_SCAN_CDT", "08:45"
+)
+
+# ------------------------------------------------------------------
+# Risk-based position sizing (paper). Env-overridable; restart to apply.
+#   contracts = floor(ACCOUNT_SIZE * RISK_PER_TRADE_PCT/100 / ((entry-SL)*100))
+#   minimum 1, cap MAX_CONTRACTS_PER_TRADE. Buying power is a hard block
+#   in virtual_broker (may size down to what the ledger can debit).
+# ------------------------------------------------------------------
+ACCOUNT_SIZE = _env_float("ACCOUNT_SIZE", 25000.0)
+RISK_PER_TRADE_PCT = _env_float("RISK_PER_TRADE_PCT", 1.5)
+MAX_CONTRACTS_PER_TRADE = _env_int("MAX_CONTRACTS_PER_TRADE", 10)
 
 # ------------------------------------------------------------------
 # Stage 4 Part C — entry filters (strike_selector). Env-overridable.
@@ -211,6 +231,19 @@ def log_scoring_config() -> None:
         f"DEAD_ZONE_ATR={DEAD_ZONE_ATR} "
         f"score=T+S (no liq_mult) "
         f"(env-tunable; restart process to apply)"
+    )
+
+
+def log_risk_config() -> None:
+    """Boot log: thesis-void + risk sizing + first full-scan clock."""
+    print(
+        f"[Risk] ACCOUNT_SIZE={ACCOUNT_SIZE:g} "
+        f"RISK_PER_TRADE_PCT={RISK_PER_TRADE_PCT:g} "
+        f"MAX_CONTRACTS_PER_TRADE={MAX_CONTRACTS_PER_TRADE} "
+        f"THESIS_EXIT_SCORE={THESIS_EXIT_SCORE:g} "
+        f"(void if live<{THESIS_EXIT_SCORE:g} and entry_score>={EXECUTE_THRESHOLD}) "
+        f"FIRST_FULL_SCAN_CDT="
+        f"{FIRST_FULL_SCAN_HOUR:02d}:{FIRST_FULL_SCAN_MINUTE:02d}"
     )
 
 

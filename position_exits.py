@@ -10,6 +10,8 @@ Runs inside the 30-minute scan. No tracker daemon, no Gemini, no new process.
   B4  Persist a mark row every scan for every still-open (and pre-close) position
   B5  Breakeven lock / trailing giveback / time stop (uses peak_pnl_pct from B4)
   C-D 0DTE hard flatten at/after EXIT_ZERO_DTE_FLATTEN_CDT (default 13:00 CDT)
+  Thesis void: live score < THESIS_EXIT_SCORE (default 55) AND entry_score
+      >= EXECUTE_THRESHOLD (70) — carry review and every exit pass, P&L ignored
   Carry morning re-eval once/day before admits (score/pivot/mark + Discord)
 
 Every close: virtual_broker.paper_sell → tracker_agent.remove_active_trade
@@ -166,6 +168,8 @@ def evaluate_exit_reason_for_mark(
 
     EOD is selective: only cal_dte < CARRY_MIN_DTE is forced flat.
     Morning carry review typically sets include_time_stop=False.
+    THESIS_VOID fires after SL/TP (so a hit target still banks) and
+    before B5 path rules, using live_score or last_live_score.
     """
     entry = _entry_premium(trade)
     exit_px = mark
@@ -201,6 +205,10 @@ def evaluate_exit_reason_for_mark(
         return "STOP_LOSS", mark
     if _tp_breached(mark, tp):
         return "TAKE_PROFIT", mark
+
+    thesis = _thesis_void_reason(trade, live_score)
+    if thesis:
+        return thesis, mark
 
     pnl = _pnl_pct(entry, mark)
     # Path rules (optional time stop with score exempt)
@@ -278,6 +286,8 @@ def run_morning_carry_review(
         pnl = _pnl_pct(entry, mark)
 
         live_score = _f(getattr(card, "total_score", None)) if card is not None else None
+        if live_score is not None:
+            trade["last_live_score"] = live_score
         today_pivot = _f(pivot_data.get("pivot")) if isinstance(pivot_data, dict) else None
         entry_score = _f(trade.get("entry_score"))
         entry_pivot = _f(trade.get("entry_pivot"))
@@ -309,6 +319,7 @@ def run_morning_carry_review(
             now=now,
             include_time_stop=False,
             do_eod=False,
+            live_score=live_score,
         )
 
         # Format line
@@ -614,11 +625,13 @@ def close_open_position(
     entry = _entry_premium(trade)
     direction = _trade_direction(trade) or None
     ticker = trade.get("ticker") or "?"
+    qty = virtual_broker.resolve_quantity(trade)
     result: dict[str, Any] = {
         "ticker": ticker,
         "reason": reason,
         "exit_price": exit_price,
         "entry_price": entry,
+        "quantity": qty,
         "ok": False,
     }
     try:
@@ -628,6 +641,7 @@ def close_open_position(
             direction,
             entry,
             notes=f"EXIT:{reason}",
+            quantity=qty,
         )
         result["sell"] = sell
         result["ok"] = bool(sell.get("ok"))
@@ -653,9 +667,37 @@ def close_open_position(
 
     print(
         f"[Exits] CLOSED {ticker} reason={reason} "
-        f"exit=${exit_price:.4f} entry={entry} ok={result.get('ok')}"
+        f"exit=${exit_price:.4f} entry={entry} qty={qty} ok={result.get('ok')}"
     )
     return result
+
+
+def _thesis_void_reason(
+    trade: dict[str, Any],
+    live_score: float | None,
+) -> str | None:
+    """
+    Score-based invalidation: close when the live thesis is gone, P&L ignored.
+
+    Requires a high-conviction entry (entry_score >= EXECUTE_THRESHOLD)
+    so a 68 that drifts to 54 is not force-closed. Missing entry_score
+    is treated as unknown — do not fire.
+    """
+    score = live_score
+    if score is None:
+        score = _f(trade.get("last_live_score"))
+    if score is None:
+        return None
+    entry_score = _f(trade.get("entry_score"))
+    if entry_score is None:
+        return None
+    min_entry = float(getattr(config, "EXECUTE_THRESHOLD", 70.0))
+    exit_thr = float(getattr(config, "THESIS_EXIT_SCORE", 55.0))
+    if entry_score < min_entry:
+        return None
+    if score < exit_thr:
+        return "THESIS_VOID"
+    return None
 
 
 def _sl_breached(mark: float, stop_loss: float | None) -> bool:

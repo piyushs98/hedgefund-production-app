@@ -32,6 +32,12 @@ class TestGateDefaults(unittest.TestCase):
         self.assertEqual(config.MIN_EXTRINSIC_PCT, 10.0)
         self.assertEqual(config.MAX_CONTRACT_SPREAD_PCT, 8.0)
         self.assertEqual(config.GATE_POST_EXIT_COOLDOWN_MINUTES, 45)
+        self.assertEqual(config.THESIS_EXIT_SCORE, 55.0)
+        self.assertEqual(config.ACCOUNT_SIZE, 25000.0)
+        self.assertEqual(config.RISK_PER_TRADE_PCT, 1.5)
+        self.assertEqual(config.MAX_CONTRACTS_PER_TRADE, 10)
+        self.assertEqual(config.FIRST_FULL_SCAN_HOUR, 8)
+        self.assertEqual(config.FIRST_FULL_SCAN_MINUTE, 45)
 
 
 class TestMarkLookup(unittest.TestCase):
@@ -338,6 +344,149 @@ class TestExitRules(unittest.TestCase):
         self.assertTrue(any("MARK FAILED" in a for a in alerts))
         self.assertIn("marks: checked=1", summary.get("mark_summary_line", ""))
 
+    def test_thesis_void_closes_on_score_collapse(self):
+        """Live score < 55 with entry_score >= 70 closes regardless of P&L."""
+        trade = self._trade(expiration="2026-08-12")
+        trade["entry_score"] = 86.0
+        trade["entry_price"] = 5.90
+        trade["entry_premium"] = 5.90
+        trade["stop_loss"] = 4.72
+        trade["take_profit"] = 8.85
+        # Mark still well above SL (open +47%) — thesis is gone
+        scored = {
+            "IWM": {
+                "options_dict": self._options(8.60, 8.80),
+                "card": mock.Mock(total_score=12.0),
+            }
+        }
+        with mock.patch("position_exits.close_open_position") as close:
+            close.return_value = {"ticker": "IWM", "reason": "THESIS_VOID", "ok": True}
+            with mock.patch("position_exits.record_position_mark", return_value=True):
+                with mock.patch("tracker_agent.save_active_trade", return_value=True):
+                    with mock.patch(
+                        "tracker_agent.load_active_trades", return_value=[]
+                    ):
+                        position_exits.run_scan_exits(
+                            [trade],
+                            scored,
+                            session_date=date(2026, 8, 5),
+                            force_eod=False,
+                            now_cdt=datetime(2026, 8, 5, 8, 35, 0),
+                        )
+        self.assertEqual(close.call_args[0][2], "THESIS_VOID")
+        self.assertAlmostEqual(close.call_args[0][1], 8.70, places=2)
+
+    def test_thesis_void_skips_marginal_entry(self):
+        """Hysteresis: entry_score 65 must not thesis-void even at live 12."""
+        trade = self._trade(expiration="2026-08-12")
+        trade["entry_score"] = 65.0
+        scored = {
+            "IWM": {
+                "options_dict": self._options(1.50, 1.70),
+                "card": mock.Mock(total_score=12.0),
+            }
+        }
+        with mock.patch("position_exits.close_open_position") as close:
+            with mock.patch("position_exits.record_position_mark", return_value=True):
+                with mock.patch("tracker_agent.save_active_trade", return_value=True):
+                    with mock.patch(
+                        "tracker_agent.load_active_trades", return_value=[trade]
+                    ):
+                        position_exits.run_scan_exits(
+                            [trade],
+                            scored,
+                            session_date=date(2026, 8, 5),
+                            force_eod=False,
+                            now_cdt=datetime(2026, 8, 5, 11, 0, 0),
+                        )
+        close.assert_not_called()
+
+    def test_thesis_void_skips_when_live_still_above_floor(self):
+        trade = self._trade(expiration="2026-08-12")
+        trade["entry_score"] = 88.0
+        scored = {
+            "IWM": {
+                "options_dict": self._options(1.50, 1.70),
+                "card": mock.Mock(total_score=78.0),
+            }
+        }
+        with mock.patch("position_exits.close_open_position") as close:
+            with mock.patch("position_exits.record_position_mark", return_value=True):
+                with mock.patch("tracker_agent.save_active_trade", return_value=True):
+                    with mock.patch(
+                        "tracker_agent.load_active_trades", return_value=[trade]
+                    ):
+                        position_exits.run_scan_exits(
+                            [trade],
+                            scored,
+                            session_date=date(2026, 8, 5),
+                            force_eod=False,
+                            now_cdt=datetime(2026, 8, 5, 11, 0, 0),
+                        )
+        close.assert_not_called()
+
+    def test_take_profit_beats_thesis_void(self):
+        trade = self._trade(expiration="2026-08-12")
+        trade["entry_score"] = 88.0
+        trade["take_profit"] = 1.40
+        scored = {
+            "IWM": {
+                "options_dict": self._options(1.50, 1.70),
+                "card": mock.Mock(total_score=12.0),
+            }
+        }
+        with mock.patch("position_exits.close_open_position") as close:
+            close.return_value = {"ticker": "IWM", "reason": "TAKE_PROFIT", "ok": True}
+            with mock.patch("position_exits.record_position_mark", return_value=True):
+                with mock.patch("tracker_agent.save_active_trade", return_value=True):
+                    with mock.patch(
+                        "tracker_agent.load_active_trades", return_value=[]
+                    ):
+                        position_exits.run_scan_exits(
+                            [trade],
+                            scored,
+                            session_date=date(2026, 8, 5),
+                            force_eod=False,
+                            now_cdt=datetime(2026, 8, 5, 11, 0, 0),
+                        )
+        self.assertEqual(close.call_args[0][2], "TAKE_PROFIT")
+
+    def test_morning_carry_review_thesis_void(self):
+        trade = self._trade(expiration="2026-08-12")
+        trade["entry_score"] = 84.0
+        trade["entry_price"] = 2.37
+        trade["entry_premium"] = 2.37
+        trade["stop_loss"] = 1.90
+        trade["take_profit"] = 3.56
+        scored = {
+            "IWM": {
+                "options_dict": self._options(3.00, 3.20),
+                "card": mock.Mock(total_score=49.0),
+                "pivot_data": {"pivot": 301.5, "close": 302.0},
+            }
+        }
+        position_exits.reset_eod_flags_for_tests()
+        with mock.patch("position_exits.close_open_position") as close:
+            close.return_value = {
+                "ticker": "IWM",
+                "reason": "CARRY_THESIS_VOID",
+                "ok": True,
+            }
+            with mock.patch("position_exits.record_position_mark", return_value=True):
+                with mock.patch("tracker_agent.save_active_trade", return_value=True):
+                    with mock.patch("broadcaster.send_discord_alert", return_value=True):
+                        summary = position_exits.run_morning_carry_review(
+                            [trade],
+                            scored,
+                            session_date=date(2026, 8, 5),
+                            now_cdt=datetime(2026, 8, 5, 8, 35, 0),
+                            force=True,
+                        )
+        self.assertTrue(summary["ran"])
+        self.assertEqual(close.call_args[0][2], "CARRY_THESIS_VOID")
+        self.assertIn("CLOSE THESIS_VOID", summary["lines"][0])
+        self.assertIn("score 84->49", summary["lines"][0])
+
     def test_morning_carry_review_hold_line(self):
         trade = self._trade(expiration="2026-08-12")
         trade["entry_score"] = 78.0
@@ -395,6 +544,14 @@ class TestExitRules(unittest.TestCase):
         # (1.1 - 1.42) / 1.42 * 100
         self.assertAlmostEqual(row[3], round((1.1 - 1.42) / 1.42 * 100, 2))
 
+    def test_full_scan_window_starts_0845(self):
+        from midday_delta import is_full_scan_window
+
+        self.assertFalse(is_full_scan_window(datetime(2026, 8, 20, 8, 30, 0)))
+        self.assertFalse(is_full_scan_window(datetime(2026, 8, 20, 8, 44, 0)))
+        self.assertTrue(is_full_scan_window(datetime(2026, 8, 20, 8, 45, 0)))
+        self.assertTrue(is_full_scan_window(datetime(2026, 8, 20, 9, 15, 0)))
+
     def test_eod_window_boundary(self):
         # Naive datetimes are interpreted as America/Chicago wall time.
         dt_before = datetime(2026, 8, 5, 14, 44, 0)
@@ -403,6 +560,75 @@ class TestExitRules(unittest.TestCase):
             with mock.patch.object(config, "EXIT_EOD_FLATTEN_MINUTE", 45):
                 self.assertFalse(position_exits.is_eod_flatten_window(dt_before))
                 self.assertTrue(position_exits.is_eod_flatten_window(dt_at))
+
+
+class TestAug20ThesisReplay(unittest.TestCase):
+    """What Aug 20 carry would have done with THESIS_VOID armed."""
+
+    def _reason(self, trade, mark, live_score):
+        return position_exits.evaluate_exit_reason_for_mark(
+            trade,
+            mark,
+            sess=date(2026, 8, 20),
+            now=datetime(2026, 8, 20, 8, 30, 0),
+            include_time_stop=False,
+            do_eod=False,
+            live_score=live_score,
+        )
+
+    def test_tsla_would_void_at_carry_mark(self):
+        trade = {
+            "ticker": "TSLA",
+            "direction": "CALL",
+            "strike": 345.0,
+            "expiration": "2026-08-28",
+            "entry_price": 5.90,
+            "stop_loss": 4.72,
+            "take_profit": 8.85,
+            "entry_score": 86.0,
+        }
+        reason, px = self._reason(trade, 8.70, 12.0)
+        self.assertEqual(reason, "THESIS_VOID")
+        self.assertAlmostEqual(px, 8.70)
+        # vs later BREAKEVEN_LOCK at 5.50 (−$40)
+        void_pnl = (8.70 - 5.90) * 100
+        actual_pnl = (5.50 - 5.90) * 100
+        self.assertAlmostEqual(void_pnl, 280.0)
+        self.assertAlmostEqual(actual_pnl, -40.0)
+
+    def test_amzn_would_void_at_carry_mark(self):
+        trade = {
+            "ticker": "AMZN",
+            "direction": "CALL",
+            "strike": 265.0,
+            "expiration": "2026-08-28",
+            "entry_price": 2.37,
+            "stop_loss": 1.90,
+            "take_profit": 3.56,
+            "entry_score": 84.0,
+        }
+        reason, px = self._reason(trade, 3.10, 49.0)
+        self.assertEqual(reason, "THESIS_VOID")
+        self.assertAlmostEqual(px, 3.10)
+        void_pnl = (3.10 - 2.37) * 100
+        self.assertAlmostEqual(void_pnl, 73.0, places=0)
+
+    def test_aapl_would_not_void_score_survived(self):
+        trade = {
+            "ticker": "AAPL",
+            "direction": "CALL",
+            "strike": 320.0,
+            "expiration": "2026-08-28",
+            "entry_price": 0.95,
+            "stop_loss": 0.76,
+            "take_profit": 1.43,
+            "entry_score": 88.0,
+        }
+        # Score 78 is above 55 — TP still the correct close
+        reason, px = self._reason(trade, 1.45, 78.0)
+        self.assertEqual(reason, "TAKE_PROFIT")
+        self.assertAlmostEqual(px, 1.45)
+        self.assertNotEqual(reason, "THESIS_VOID")
 
 
 class TestCloseWiresGate(unittest.TestCase):
