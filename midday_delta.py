@@ -419,8 +419,10 @@ def deterministic_telemetry_bullet(row: dict) -> str:
             qty_s = str(int(c.get("quantity") or 1))
         except (TypeError, ValueError):
             qty_s = "1"
+        lim = c.get("bp_limited")
+        lim_bit = f" {lim}" if lim else ""
         rationale = (
-            f"Setup {_fmt_contract_cell(c)} qty={qty_s} "
+            f"Setup {_fmt_contract_cell(c)} qty={qty_s}{lim_bit} "
             f"entry {_fmt_money(c.get('entry_premium'))} "
             f"SL {_fmt_money(c.get('stop_loss'))} TP {_fmt_money(c.get('take_profit'))}"
             f"{ext_bit}."
@@ -473,6 +475,8 @@ def format_thirty_min_scan_discord(
                 qty_s = str(int(contract.get("quantity") or 1))
             except (TypeError, ValueError):
                 qty_s = "1"
+            if contract.get("bp_limited"):
+                qty_s = f"{qty_s} {contract['bp_limited']}"
             entry = _fmt_money(contract.get("entry_premium"))
             sl = _fmt_money(contract.get("stop_loss"))
             tp = _fmt_money(contract.get("take_profit"))
@@ -551,6 +555,7 @@ def deepseek_key_telemetry(
                     "changes": r.get("changes") or [],
                     "contract": _fmt_contract_cell(c) if c else None,
                     "qty": (c.get("quantity") if c else None) or (1 if c else None),
+                    "bp_limited": c.get("bp_limited") if c else None,
                     "entry": c.get("entry_premium") if c else None,
                     "sl": c.get("stop_loss") if c else None,
                     "tp": c.get("take_profit") if c else None,
@@ -1176,8 +1181,12 @@ def run_thirty_min_scan(
                     buy_payload = dict(contract)
                     buy_payload.setdefault("ticker", ticker)
                     qty = virtual_broker.apply_entry_quantity(buy_payload)
+                    contract["quantity"] = qty
+                    if buy_payload.get("bp_limited"):
+                        contract["bp_limited"] = buy_payload["bp_limited"]
                     print(
-                        f"[EXECUTE] {ticker} qty={qty} "
+                        f"[EXECUTE] {ticker} "
+                        f"{virtual_broker.format_execute_qty_bit(buy_payload, qty)} "
                         f"entry={buy_payload.get('entry_premium')} "
                         f"SL={buy_payload.get('stop_loss')}"
                     )

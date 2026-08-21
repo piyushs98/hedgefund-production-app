@@ -19,7 +19,24 @@ import config
 
 DB_PATH = config.NEWS_DB_PATH
 CONTRACT_MULTIPLIER = 100
-STARTING_BUYING_POWER = 100_000.0
+# Legacy hardcoded seed — used only to detect old DBs that still hold $100k
+# with $0 realized so we can rebase to ACCOUNT_SIZE on first boot.
+_LEGACY_LEDGER_SEED = 100_000.0
+
+
+def starting_buying_power() -> float:
+    """Ledger seed = ACCOUNT_SIZE unless STARTING_BUYING_POWER is set."""
+    return float(
+        getattr(
+            config,
+            "STARTING_BUYING_POWER",
+            getattr(config, "ACCOUNT_SIZE", 10000.0),
+        )
+    )
+
+
+# Back-compat alias; prefer starting_buying_power() so tests can patch config.
+STARTING_BUYING_POWER = starting_buying_power()
 
 # UI event bus for Server-Sent Events (dashboard only — does not affect trading).
 ui_event_queue: queue.Queue = queue.Queue()
@@ -27,6 +44,15 @@ ui_event_queue: queue.Queue = queue.Queue()
 # Buy-time slippage stashed until paper_sell writes trade_history (closed-trade log).
 # Keyed by a lightweight fingerprint so observability never alters fill math.
 _pending_slippage: dict[str, float | None] = {}
+
+# In-process session book (peak deployed / day realized). Discord at 14:45 is
+# the durable copy — the SQLite ledger does not survive a redeploy.
+_book: dict[str, Any] = {
+    "session_date": None,
+    "start_realized": 0.0,
+    "open_cost": 0.0,
+    "peak_deployed": 0.0,
+}
 
 
 def get_ui_event() -> dict[str, Any] | None:
@@ -77,10 +103,97 @@ def _ensure_slippage_column(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE trade_history ADD COLUMN slippage REAL")
 
 
+def reset_book_for_tests() -> None:
+    """Test helper — clear in-process peak-deployed session."""
+    _book["session_date"] = None
+    _book["start_realized"] = 0.0
+    _book["open_cost"] = 0.0
+    _book["peak_deployed"] = 0.0
+
+
+def _chicago_date_str() -> str:
+    try:
+        import pytz
+        return datetime.now(pytz.timezone("America/Chicago")).date().isoformat()
+    except Exception:
+        return datetime.now().date().isoformat()
+
+
+def ensure_session_book() -> None:
+    """Start-of-Chicago-day snapshot for peak deployed / day realized."""
+    day = _chicago_date_str()
+    if _book.get("session_date") == day:
+        return
+    port = get_portfolio()
+    open_cost = _deployed_from_open_trades()
+    _book["session_date"] = day
+    _book["start_realized"] = float(port.get("total_realized_pnl") or 0.0)
+    _book["open_cost"] = open_cost
+    _book["peak_deployed"] = open_cost
+
+
+def _deployed_from_open_trades() -> float:
+    try:
+        from tracker_agent import load_active_trades
+        trades = load_active_trades() or []
+    except Exception:
+        return float(_book.get("open_cost") or 0.0)
+    total = 0.0
+    for t in trades:
+        if not isinstance(t, dict):
+            continue
+        try:
+            entry = float(t.get("entry_price") or t.get("entry_premium") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if entry <= 0:
+            continue
+        qty = resolve_quantity(t)
+        total += entry * CONTRACT_MULTIPLIER * qty
+    return total
+
+
+def note_session_open(cost: float) -> None:
+    ensure_session_book()
+    _book["open_cost"] = float(_book.get("open_cost") or 0.0) + float(cost)
+    _book["peak_deployed"] = max(
+        float(_book.get("peak_deployed") or 0.0),
+        float(_book["open_cost"]),
+    )
+
+
+def note_session_close(entry_cost: float) -> None:
+    ensure_session_book()
+    _book["open_cost"] = max(
+        0.0, float(_book.get("open_cost") or 0.0) - float(entry_cost)
+    )
+
+
+def format_book_line() -> str:
+    """
+    BOOK: start 10,000 | peak deployed X | realized +/-Y | end Z
+    """
+    ensure_session_book()
+    port = get_portfolio()
+    start = starting_buying_power()
+    peak = float(_book.get("peak_deployed") or 0.0)
+    # Current open book is a floor on peak if we restarted mid-session
+    peak = max(peak, _deployed_from_open_trades())
+    realized = float(port.get("total_realized_pnl") or 0.0) - float(
+        _book.get("start_realized") or 0.0
+    )
+    end = float(port.get("buying_power") or 0.0)
+    return (
+        f"BOOK: start {start:,.0f} | peak deployed {peak:,.0f} | "
+        f"realized {realized:+,.0f} | end {end:,.0f}"
+    )
+
+
 def ensure_ledger() -> None:
     """
     Create portfolio_ledger + trade_history if missing.
-    Seed portfolio_ledger with $100,000 buying_power / $0 PnL when empty.
+    Seed portfolio_ledger with ACCOUNT_SIZE buying_power / $0 PnL when empty.
+    Rebases a legacy $100k / $0-PnL seed to ACCOUNT_SIZE.
     Migrates trade_history.slippage via ALTER TABLE when the column is absent.
     """
     with _connect() as conn:
@@ -116,16 +229,43 @@ def ensure_ledger() -> None:
         row = conn.execute(
             "SELECT COUNT(*) AS n FROM portfolio_ledger"
         ).fetchone()
+        seed = starting_buying_power()
+        now = datetime.now(timezone.utc).isoformat()
         if row is None or int(row["n"]) == 0:
-            now = datetime.now(timezone.utc).isoformat()
             conn.execute(
                 """
                 INSERT INTO portfolio_ledger
                     (id, buying_power, total_realized_pnl, updated_at)
                 VALUES (1, ?, 0.0, ?)
                 """,
-                (STARTING_BUYING_POWER, now),
+                (seed, now),
             )
+        else:
+            led = conn.execute(
+                "SELECT buying_power, total_realized_pnl FROM portfolio_ledger WHERE id = 1"
+            ).fetchone()
+            if led is not None:
+                bp = float(led["buying_power"])
+                realized = float(led["total_realized_pnl"])
+                # Empty legacy $100k seed from before ACCOUNT_SIZE was the ceiling.
+                if (
+                    abs(bp - _LEGACY_LEDGER_SEED) < 0.51
+                    and abs(realized) < 0.51
+                    and abs(seed - _LEGACY_LEDGER_SEED) > 0.51
+                ):
+                    conn.execute(
+                        """
+                        UPDATE portfolio_ledger
+                        SET buying_power = ?, updated_at = ?
+                        WHERE id = 1
+                        """,
+                        (seed, now),
+                    )
+                    print(
+                        f"[VirtualBroker] CRITICAL: rebased ledger seed "
+                        f"${_LEGACY_LEDGER_SEED:,.0f} → ${seed:,.0f} "
+                        f"(ACCOUNT_SIZE; $0 realized, empty book assumed)"
+                    )
         conn.commit()
 
 
@@ -141,7 +281,7 @@ def get_portfolio() -> dict[str, float]:
         ).fetchone()
     if not row:
         return {
-            "buying_power": STARTING_BUYING_POWER,
+            "buying_power": starting_buying_power(),
             "total_realized_pnl": 0.0,
         }
     return {
@@ -208,7 +348,7 @@ def size_position(
     if entry <= 0:
         return 1
 
-    account = float(getattr(config, "ACCOUNT_SIZE", 25000.0))
+    account = float(getattr(config, "ACCOUNT_SIZE", 10000.0))
     risk_pct = float(getattr(config, "RISK_PER_TRADE_PCT", 1.5))
     account_risk = account * (risk_pct / 100.0)
 
@@ -247,23 +387,46 @@ def apply_entry_quantity(
     *,
     buying_power: float | None = None,
 ) -> int:
-    """Stamp contract['quantity'] from the risk formula. 0 = cannot afford."""
+    """Stamp contract['quantity'] from the risk formula. 0 = cannot afford.
+
+    If buying power cannot fund the risk qty but can fund fewer contracts,
+    size down (do not reject) and stamp bp_limited='bp_limited(3->2)'.
+    """
     if not isinstance(contract, dict):
         return 1
+    entry = (
+        contract.get("entry_premium")
+        if contract.get("entry_premium") is not None
+        else contract.get("entry_price")
+    )
+    sl = contract.get("stop_loss")
+    desired = size_position(entry, sl, buying_power=None)
     if buying_power is None:
         try:
             buying_power = float(get_portfolio().get("buying_power"))
         except (TypeError, ValueError):
             buying_power = None
-    qty = size_position(
-        contract.get("entry_premium")
-        if contract.get("entry_premium") is not None
-        else contract.get("entry_price"),
-        contract.get("stop_loss"),
-        buying_power=buying_power,
-    )
+    qty = size_position(entry, sl, buying_power=buying_power)
     contract["quantity"] = qty
+    contract["qty_desired"] = desired
+    contract.pop("bp_limited", None)
+    if desired > 0 and qty != desired:
+        contract["bp_limited"] = f"bp_limited({desired}->{qty})"
     return qty
+
+
+def format_execute_qty_bit(contract: dict[str, Any] | None, qty: int | None = None) -> str:
+    """`qty=2 bp_limited(3->2)` fragment for the EXECUTE line."""
+    if isinstance(contract, dict):
+        if qty is None:
+            try:
+                qty = int(contract.get("quantity") or 0)
+            except (TypeError, ValueError):
+                qty = 0
+        lim = contract.get("bp_limited")
+        if lim:
+            return f"qty={qty} {lim}"
+    return f"qty={qty if qty is not None else 1}"
 
 
 def paper_buy(
@@ -396,6 +559,7 @@ def paper_buy(
         except Exception as slip_err:
             print(f"[VirtualBroker] WARNING: slippage DB log failed: {slip_err}")
 
+    note_session_open(cost)
     print(
         f"[VirtualBroker] paper_buy "
         f"{ticker or meta.get('direction', '?')} "
@@ -523,6 +687,7 @@ def paper_sell(
         )
         conn.commit()
 
+    note_session_close(entry * CONTRACT_MULTIPLIER * qty)
     print(
         f"[VirtualBroker] paper_sell {ticker or '?'} {dir_str} "
         f"qty={qty} entry=${entry:.2f} exit=${exit_:.2f} PnL=${pnl:.2f}; "

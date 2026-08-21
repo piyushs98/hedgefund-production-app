@@ -180,13 +180,23 @@ FIRST_FULL_SCAN_HOUR, FIRST_FULL_SCAN_MINUTE = _env_hhmm(
 
 # ------------------------------------------------------------------
 # Risk-based position sizing (paper). Env-overridable; restart to apply.
+#   ACCOUNT_SIZE is the single account ceiling: risk formula AND ledger seed.
+#   STARTING_BUYING_POWER defaults to the same value; if you override it and
+#   it disagrees, boot logs CRITICAL (silent drift is how a week gets lost).
 #   contracts = floor(ACCOUNT_SIZE * RISK_PER_TRADE_PCT/100 / ((entry-SL)*100))
-#   minimum 1, cap MAX_CONTRACTS_PER_TRADE. Buying power is a hard block
-#   in virtual_broker (may size down to what the ledger can debit).
+#   minimum 1, cap MAX_CONTRACTS_PER_TRADE. Buying power is the hard block
+#   (size down to what the ledger can debit; log bp_limited(n->m)).
 # ------------------------------------------------------------------
-ACCOUNT_SIZE = _env_float("ACCOUNT_SIZE", 25000.0)
+ACCOUNT_SIZE = _env_float("ACCOUNT_SIZE", 10000.0)
 RISK_PER_TRADE_PCT = _env_float("RISK_PER_TRADE_PCT", 1.5)
 MAX_CONTRACTS_PER_TRADE = _env_int("MAX_CONTRACTS_PER_TRADE", 10)
+# Ledger seed. Unset → ACCOUNT_SIZE. Set only if you intentionally want them
+# to differ (will CRITICAL at boot).
+STARTING_BUYING_POWER = (
+    _env_float("STARTING_BUYING_POWER", ACCOUNT_SIZE)
+    if os.environ.get("STARTING_BUYING_POWER", "").strip()
+    else ACCOUNT_SIZE
+)
 
 # ------------------------------------------------------------------
 # Stage 4 Part C — entry filters (strike_selector). Env-overridable.
@@ -235,9 +245,15 @@ def log_scoring_config() -> None:
 
 
 def log_risk_config() -> None:
-    """Boot log: thesis-void + risk sizing + first full-scan clock."""
+    """Boot log: thesis-void + risk sizing + first full-scan clock.
+
+    CRITICAL if the ledger seed disagrees with ACCOUNT_SIZE — that mismatch
+    is how the risk model sizes for $10k while the book funds 4× that.
+    """
+    seed = float(STARTING_BUYING_POWER)
     print(
         f"[Risk] ACCOUNT_SIZE={ACCOUNT_SIZE:g} "
+        f"ledger_seed={seed:g} "
         f"RISK_PER_TRADE_PCT={RISK_PER_TRADE_PCT:g} "
         f"MAX_CONTRACTS_PER_TRADE={MAX_CONTRACTS_PER_TRADE} "
         f"THESIS_EXIT_SCORE={THESIS_EXIT_SCORE:g} "
@@ -245,6 +261,19 @@ def log_risk_config() -> None:
         f"FIRST_FULL_SCAN_CDT="
         f"{FIRST_FULL_SCAN_HOUR:02d}:{FIRST_FULL_SCAN_MINUTE:02d}"
     )
+    if abs(seed - float(ACCOUNT_SIZE)) > 0.5:
+        msg = (
+            f"🚨 **CRITICAL: ACCOUNT_SIZE ${ACCOUNT_SIZE:,.0f} != "
+            f"ledger seed ${seed:,.0f}** — risk model and buying power "
+            f"disagree. Set STARTING_BUYING_POWER unset (or equal) so they "
+            f"are one ceiling."
+        )
+        print(f"[Risk] {msg}")
+        try:
+            import broadcaster
+            broadcaster.send_discord_alert(msg)
+        except Exception as e:
+            print(f"[Risk] CRITICAL Discord warn: {e}")
 
 
 def _init_weights_table():

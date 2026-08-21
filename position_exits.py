@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover
 # Once-per-process-day flags (Chicago session date).
 _eod_flatten_dates: set[str] = set()
 _carry_review_dates: set[str] = set()
+_eod_book_dates: set[str] = set()
 
 
 def _parse_entry_time(trade: dict[str, Any]) -> datetime | None:
@@ -113,9 +114,51 @@ def mark_eod_done(session_day: date | None = None) -> None:
 
 
 def reset_eod_flags_for_tests() -> None:
-    """Test helper — clear in-process EOD / carry-review day sets."""
+    """Test helper — clear in-process EOD / carry-review / BOOK day sets."""
     _eod_flatten_dates.clear()
     _carry_review_dates.clear()
+    _eod_book_dates.clear()
+    try:
+        virtual_broker.reset_book_for_tests()
+    except Exception:
+        pass
+
+
+def eod_book_already_done(session_day: date | None = None) -> bool:
+    day = session_day or _chicago_now().date()
+    return day.isoformat() in _eod_book_dates
+
+
+def mark_eod_book_done(session_day: date | None = None) -> None:
+    day = session_day or _chicago_now().date()
+    _eod_book_dates.add(day.isoformat())
+
+
+def maybe_emit_eod_book(now_cdt: datetime | None = None) -> str | None:
+    """
+    Once per Chicago session, at/after 14:45 flatten: Discord BOOK line.
+
+    BOOK: start 10,000 | peak deployed X | realized +/-Y | end Z
+    Fires even if the book is already flat (the number we care about).
+    """
+    now = _chicago_now(now_cdt)
+    if not is_eod_flatten_window(now):
+        return None
+    if eod_book_already_done(now.date()):
+        return None
+    try:
+        line = virtual_broker.format_book_line()
+    except Exception as e:
+        print(f"[Exits] BOOK line failed: {e}")
+        return None
+    mark_eod_book_done(now.date())
+    print(f"[Exits] {line}")
+    try:
+        import broadcaster
+        broadcaster.send_discord_alert(line)
+    except Exception as e:
+        print(f"[Exits] BOOK Discord warn: {e}")
+    return line
 
 
 def carry_review_already_done(session_day: date | None = None) -> bool:
@@ -834,6 +877,13 @@ def run_scan_exits(
     }
     if not open_trades:
         summary["open_after"] = 0
+        now_empty = _chicago_now(now_cdt)
+        if is_eod_flatten_window(now_empty) and not eod_already_done(now_empty.date()):
+            mark_eod_done(now_empty.date())
+            summary["eod_triggered"] = True
+        book_line = maybe_emit_eod_book(now_cdt)
+        if book_line:
+            summary["book_line"] = book_line
         return summary
 
     now = _chicago_now(now_cdt)
@@ -967,4 +1017,7 @@ def run_scan_exits(
     )
     print(mark_line)
     summary["mark_summary_line"] = mark_line
+    book_line = maybe_emit_eod_book(now)
+    if book_line:
+        summary["book_line"] = book_line
     return summary

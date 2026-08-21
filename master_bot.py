@@ -1225,8 +1225,13 @@ def run_portfolio_scan(
                     buy_payload = dict(contract)
                     buy_payload.setdefault("ticker", ticker)
                     qty = virtual_broker.apply_entry_quantity(buy_payload)
+                    contract["quantity"] = qty
+                    if buy_payload.get("bp_limited"):
+                        contract["bp_limited"] = buy_payload["bp_limited"]
                     print(
-                        f"[EXECUTE] {ticker} qty={qty} entry={entry_px} "
+                        f"[EXECUTE] {ticker} "
+                        f"{virtual_broker.format_execute_qty_bit(buy_payload, qty)} "
+                        f"entry={entry_px} "
                         f"SL={buy_payload.get('stop_loss')}"
                     )
                     buy_ok = False

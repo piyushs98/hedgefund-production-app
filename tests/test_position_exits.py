@@ -14,6 +14,7 @@ from unittest import mock
 
 import config
 import position_exits
+import virtual_broker
 
 
 class TestGateDefaults(unittest.TestCase):
@@ -33,7 +34,8 @@ class TestGateDefaults(unittest.TestCase):
         self.assertEqual(config.MAX_CONTRACT_SPREAD_PCT, 8.0)
         self.assertEqual(config.GATE_POST_EXIT_COOLDOWN_MINUTES, 45)
         self.assertEqual(config.THESIS_EXIT_SCORE, 55.0)
-        self.assertEqual(config.ACCOUNT_SIZE, 25000.0)
+        self.assertEqual(config.ACCOUNT_SIZE, 10000.0)
+        self.assertEqual(config.STARTING_BUYING_POWER, config.ACCOUNT_SIZE)
         self.assertEqual(config.RISK_PER_TRADE_PCT, 1.5)
         self.assertEqual(config.MAX_CONTRACTS_PER_TRADE, 10)
         self.assertEqual(config.FIRST_FULL_SCAN_HOUR, 8)
@@ -551,6 +553,33 @@ class TestExitRules(unittest.TestCase):
         self.assertFalse(is_full_scan_window(datetime(2026, 8, 20, 8, 44, 0)))
         self.assertTrue(is_full_scan_window(datetime(2026, 8, 20, 8, 45, 0)))
         self.assertTrue(is_full_scan_window(datetime(2026, 8, 20, 9, 15, 0)))
+
+    def test_eod_book_line_at_1445(self):
+        alerts = []
+        position_exits.reset_eod_flags_for_tests()
+        with mock.patch.object(virtual_broker, "DB_PATH", self.db):
+            with mock.patch.object(config, "NEWS_DB_PATH", self.db):
+                with mock.patch(
+                    "broadcaster.send_discord_alert",
+                    side_effect=lambda m: alerts.append(m) or True,
+                ):
+                    with mock.patch(
+                        "tracker_agent.load_active_trades", return_value=[]
+                    ):
+                        virtual_broker.ensure_ledger()
+                        line = position_exits.maybe_emit_eod_book(
+                            datetime(2026, 8, 20, 14, 45, 0)
+                        )
+                        again = position_exits.maybe_emit_eod_book(
+                            datetime(2026, 8, 20, 14, 50, 0)
+                        )
+        self.assertIsNotNone(line)
+        self.assertTrue(line.startswith("BOOK: start "))
+        self.assertIn("peak deployed", line)
+        self.assertIn("realized", line)
+        self.assertIn("end ", line)
+        self.assertIsNone(again)  # once per day
+        self.assertEqual(len(alerts), 1)
 
     def test_eod_window_boundary(self):
         # Naive datetimes are interpreted as America/Chicago wall time.
