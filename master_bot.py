@@ -1381,6 +1381,13 @@ def run_macro_loop():
         f"{'FULL LLM escape hatch' if full_llm_intraday else 'split cadence: EXIT every 15m, FULL score/admit every 30m'}"
     )
     config.assert_secrets(require_discord=False)
+    # Wipe stale book BEFORE preflight / gate / first scan / carry review.
+    # No-op if RESET_LEDGER_ON_BOOT is false or main.py already ran it.
+    try:
+        import virtual_broker
+        virtual_broker.reset_ledger_if_requested()
+    except Exception as reset_err:
+        print(f"[System] WARNING: ledger reset failed: {reset_err}")
     # Resolved Part C knobs (env at process start — restart to retune without code change)
     print(
         f"[EntryFilters] MIN_DTE={config.MIN_DTE} "

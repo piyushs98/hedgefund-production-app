@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -158,6 +159,103 @@ class TestPaperQty(unittest.TestCase):
         vb.ensure_ledger()
         snap = vb.get_portfolio()
         self.assertAlmostEqual(snap["buying_power"], 10000.0)
+
+
+class TestLedgerBootReset(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, "news.db")
+        self.json_path = os.path.join(self.tmp.name, "active_trades.json")
+        self.db_patch = mock.patch.object(vb, "DB_PATH", self.db)
+        self.cfg_patch = mock.patch.object(config, "NEWS_DB_PATH", self.db)
+        self.json_patch = mock.patch(
+            "tracker_agent.ACTIVE_TRADES_PATH", self.json_path
+        )
+        self.db_patch.start()
+        self.cfg_patch.start()
+        self.json_patch.start()
+        vb.reset_boot_flag_for_tests()
+        vb.reset_book_for_tests()
+        vb.ensure_ledger()
+
+    def tearDown(self):
+        vb.reset_boot_flag_for_tests()
+        self.json_patch.stop()
+        self.db_patch.stop()
+        self.cfg_patch.stop()
+        self.tmp.cleanup()
+
+    def _dirty_book(self):
+        with vb._connect() as conn:
+            conn.execute(
+                "UPDATE portfolio_ledger SET buying_power = 5000, "
+                "total_realized_pnl = -230 WHERE id = 1"
+            )
+            conn.execute(
+                """
+                INSERT INTO trade_history
+                    (closed_at, ticker, direction, strike, expiration,
+                     entry_price, exit_price, pnl, notes)
+                VALUES ('2026-08-20T12:00:00Z', 'TSLA', 'PUT', 335, '2026-08-28',
+                        6.10, 4.80, -130, 'EXIT:STOP_LOSS')
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS active_trades_store (
+                    trade_key TEXT PRIMARY KEY,
+                    payload TEXT,
+                    updated_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO active_trades_store (trade_key, payload, updated_at) "
+                "VALUES ('TSLA', '{\"ticker\":\"TSLA\"}', 'now')"
+            )
+            conn.commit()
+        with open(self.json_path, "w", encoding="utf-8") as fh:
+            fh.write('[{"ticker": "TSLA", "entry_price": 6.10, "quantity": 1}]')
+
+    def test_flag_false_does_not_wipe(self):
+        self._dirty_book()
+        with mock.patch.object(config, "RESET_LEDGER_ON_BOOT", False):
+            out = vb.reset_ledger_if_requested()
+        self.assertIsNone(out)
+        snap = vb.get_portfolio()
+        self.assertAlmostEqual(snap["buying_power"], 5000.0)
+        self.assertAlmostEqual(snap["total_realized_pnl"], -230.0)
+
+    def test_flag_true_wipes_and_reseeds(self):
+        self._dirty_book()
+        alerts = []
+        with mock.patch.object(config, "RESET_LEDGER_ON_BOOT", True):
+            with mock.patch(
+                "broadcaster.send_discord_alert",
+                side_effect=lambda m: alerts.append(m) or True,
+            ):
+                out = vb.reset_ledger_if_requested()
+        self.assertIsNotNone(out)
+        self.assertIn("ledger wiped, reseeded at $10,000, 0 open positions", out["line"])
+        self.assertIn("WARNING", out["warning"])
+        self.assertTrue(any("[reset] ledger wiped" in a for a in alerts))
+        self.assertTrue(any("WARNING" in a for a in alerts))
+        snap = vb.get_portfolio()
+        self.assertAlmostEqual(snap["buying_power"], 10000.0)
+        self.assertAlmostEqual(snap["total_realized_pnl"], 0.0)
+        with vb._connect() as conn:
+            n_hist = conn.execute("SELECT COUNT(*) FROM trade_history").fetchone()[0]
+            n_store = conn.execute(
+                "SELECT COUNT(*) FROM active_trades_store"
+            ).fetchone()[0]
+        self.assertEqual(int(n_hist), 0)
+        self.assertEqual(int(n_store), 0)
+        with open(self.json_path, encoding="utf-8") as fh:
+            self.assertEqual(json.loads(fh.read()), [])
+        # Second call in the same process must not wipe again
+        with mock.patch.object(config, "RESET_LEDGER_ON_BOOT", True):
+            again = vb.reset_ledger_if_requested()
+        self.assertIsNone(again)
 
 
 class TestRiskConfigMismatch(unittest.TestCase):

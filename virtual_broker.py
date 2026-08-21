@@ -44,6 +44,7 @@ ui_event_queue: queue.Queue = queue.Queue()
 # Buy-time slippage stashed until paper_sell writes trade_history (closed-trade log).
 # Keyed by a lightweight fingerprint so observability never alters fill math.
 _pending_slippage: dict[str, float | None] = {}
+_boot_reset_done: bool = False
 
 # In-process session book (peak deployed / day realized). Discord at 14:45 is
 # the durable copy — the SQLite ledger does not survive a redeploy.
@@ -267,6 +268,119 @@ def ensure_ledger() -> None:
                         f"(ACCOUNT_SIZE; $0 realized, empty book assumed)"
                     )
         conn.commit()
+
+
+def reset_boot_flag_for_tests() -> None:
+    """Test helper — allow reset_ledger_if_requested to fire again."""
+    global _boot_reset_done
+    _boot_reset_done = False
+
+
+def _clear_active_trades_json() -> str:
+    """Write empty [] to active_trades.json (atomic). Returns the path."""
+    try:
+        from tracker_agent import ACTIVE_TRADES_PATH
+        path = ACTIVE_TRADES_PATH
+    except Exception:
+        path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "active_trades.json")
+        )
+    path = os.path.abspath(str(path))
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("[]\n")
+    os.replace(tmp, path)
+    return path
+
+
+def reset_ledger_now() -> dict[str, Any]:
+    """
+    Wipe paper book and reseed at ACCOUNT_SIZE. Does not touch hedge_fund.db.
+
+    Truncates portfolio_ledger, trade_history, active_trades_store,
+    position_marks; clears active_trades.json; reseeds buying_power.
+    """
+    seed = starting_buying_power()
+    now = datetime.now(timezone.utc).isoformat()
+    wiped: list[str] = []
+    ensure_ledger()
+    with _connect() as conn:
+        names = {
+            str(r[0])
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        for table in (
+            "trade_history",
+            "active_trades_store",
+            "position_marks",
+            "portfolio_ledger",
+        ):
+            if table in names:
+                conn.execute(f"DELETE FROM {table}")
+                wiped.append(table)
+        conn.execute(
+            """
+            INSERT INTO portfolio_ledger
+                (id, buying_power, total_realized_pnl, updated_at)
+            VALUES (1, ?, 0.0, ?)
+            """,
+            (seed, now),
+        )
+        conn.commit()
+    json_path = _clear_active_trades_json()
+    reset_book_for_tests()
+    _pending_slippage.clear()
+    return {
+        "ok": True,
+        "seed": seed,
+        "wiped_tables": wiped,
+        "active_trades_json": json_path,
+    }
+
+
+def reset_ledger_if_requested() -> dict[str, Any] | None:
+    """
+    If RESET_LEDGER_ON_BOOT is true, wipe+reseed once per process.
+
+    Must be called at process start BEFORE preflight / carry / any book read.
+    Left true: fires on every boot (Render free-tier restarts included)
+    and logs WARNING so a forgotten flag is loud.
+    """
+    global _boot_reset_done
+    flag = bool(getattr(config, "RESET_LEDGER_ON_BOOT", False))
+    if not flag:
+        return None
+    if _boot_reset_done:
+        print(
+            "[reset] WARNING: RESET_LEDGER_ON_BOOT is true but this process "
+            "already wiped once — skipping duplicate."
+        )
+        return None
+    _boot_reset_done = True
+    result = reset_ledger_now()
+    seed = float(result.get("seed") or 0.0)
+    line = (
+        f"[reset] ledger wiped, reseeded at ${seed:,.0f}, 0 open positions"
+    )
+    warn = (
+        "[reset] WARNING: RESET_LEDGER_ON_BOOT is true — this fires on "
+        "every process start. Set false after you confirm this line."
+    )
+    print(line)
+    print(warn)
+    result["line"] = line
+    result["warning"] = warn
+    try:
+        import broadcaster
+        broadcaster.send_discord_alert(f"{line}\n{warn}")
+    except Exception as e:
+        print(f"[reset] Discord warn: {e}")
+    return result
 
 
 def get_portfolio() -> dict[str, float]:

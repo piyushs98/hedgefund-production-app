@@ -108,6 +108,13 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return bool(default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _env_hhmm(name: str, default: str) -> tuple:
     """Parse HH:MM env into (hour, minute). Falls back to default on bad input."""
     raw = os.environ.get(name)
@@ -202,6 +209,11 @@ STARTING_BUYING_POWER = (
     if os.environ.get("STARTING_BUYING_POWER", "").strip()
     else ACCOUNT_SIZE
 )
+# One-shot / every-boot wipe of the paper book. Default false.
+# When true: truncate ledger + active_trades_store, clear active_trades.json,
+# reseed buying_power=ACCOUNT_SIZE, realized=0. Fires at process start BEFORE
+# any scan/carry read. Free-tier restarts will wipe again until this is false.
+RESET_LEDGER_ON_BOOT = _env_bool("RESET_LEDGER_ON_BOOT", False)
 
 # ------------------------------------------------------------------
 # Stage 4 Part C — entry filters (strike_selector). Env-overridable.
@@ -277,7 +289,8 @@ def log_risk_config() -> None:
         f"THESIS_EXIT_SCORE={THESIS_EXIT_SCORE:g} "
         f"(void if live<{THESIS_EXIT_SCORE:g} and entry_score>={EXECUTE_THRESHOLD}) "
         f"FIRST_FULL_SCAN_CDT="
-        f"{FIRST_FULL_SCAN_HOUR:02d}:{FIRST_FULL_SCAN_MINUTE:02d}"
+        f"{FIRST_FULL_SCAN_HOUR:02d}:{FIRST_FULL_SCAN_MINUTE:02d} "
+        f"RESET_LEDGER_ON_BOOT={RESET_LEDGER_ON_BOOT}"
     )
     if abs(seed - float(ACCOUNT_SIZE)) > 0.5:
         msg = (

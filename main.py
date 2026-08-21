@@ -125,6 +125,14 @@ def prepare_process() -> None:
 
     print("\n=== MASTER BOT ONLY (main.py) — no dashboard, no tracker ===")
 
+    # Ledger reset MUST run before preflight (which reads the open book)
+    # and before Master Bot / carry review.
+    try:
+        import virtual_broker
+        virtual_broker.reset_ledger_if_requested()
+    except Exception as e:
+        print(f"[main] WARNING: ledger reset failed: {e}")
+
     # Log-only path inventory (Stage 1). Never writes or restores state.
     try:
         import state_preflight
