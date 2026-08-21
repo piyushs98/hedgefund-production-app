@@ -27,9 +27,15 @@ class TestSizePosition(unittest.TestCase):
             qty = vb.size_position(entry, sl)
             self.assertEqual(qty, expect, msg=f"entry={entry} sl={sl}")
 
-    def test_minimum_one_when_risk_exceeds_budget(self):
-        # $400 risk vs $150 budget → floor = 0 → min 1
-        self.assertEqual(vb.size_position(20.0, 16.0), 1)
+    def test_oversize_lot_is_rejected_not_floored(self):
+        # $400 1-lot risk vs $150 budget → 0, not qty 1
+        self.assertEqual(vb.size_position(20.0, 16.0), 0)
+
+    def test_breach_pct_allows_small_overshoot(self):
+        # $160 1-lot on $150 budget: default reject; 1.2 allows
+        self.assertEqual(vb.size_position(8.00, 6.40), 0)
+        with mock.patch.object(config, "MAX_RISK_BREACH_PCT", 1.2):
+            self.assertEqual(vb.size_position(8.00, 6.40), 1)
 
     def test_buying_power_caps_qty(self):
         # Desired 5 of IWM 1.35 ($135 each); BP $270 → 2

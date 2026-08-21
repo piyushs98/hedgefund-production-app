@@ -38,6 +38,8 @@ class TestGateDefaults(unittest.TestCase):
         self.assertEqual(config.STARTING_BUYING_POWER, config.ACCOUNT_SIZE)
         self.assertEqual(config.RISK_PER_TRADE_PCT, 1.5)
         self.assertEqual(config.MAX_CONTRACTS_PER_TRADE, 10)
+        self.assertEqual(config.MAX_RISK_BREACH_PCT, 1.0)
+        self.assertEqual(config.risk_per_trade_dollars(), 150.0)
         self.assertEqual(config.FIRST_FULL_SCAN_HOUR, 8)
         self.assertEqual(config.FIRST_FULL_SCAN_MINUTE, 45)
 

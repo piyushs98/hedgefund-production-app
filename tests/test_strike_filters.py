@@ -274,6 +274,87 @@ class TestEntryFilters(unittest.TestCase):
             out.get("reject_tag"),
         )
 
+    def test_risk_too_large_tag_on_rich_premium(self):
+        # mid 10.50 → SL 8.40 → 1-lot risk $210 > $150
+        ok, tag = ss._passes_entry_filters(
+            cal_dte=2, rm_atr=0.1, dens=1.0,
+            extrinsic=2.00, extrinsic_pct=20.0,
+            bid=10.40, ask=10.60, spread_pct=1.9,
+            entry=10.50,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(tag, "risk_too_large($210>$150 at qty1)")
+
+    def test_tsla_610_does_not_breach_150(self):
+        ok, tag = ss._passes_entry_filters(
+            cal_dte=2, rm_atr=0.1, dens=1.0,
+            extrinsic=1.00, extrinsic_pct=16.0,
+            bid=6.00, ask=6.20, spread_pct=3.3,
+            entry=6.10,
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(tag)
+
+    def test_risk_walks_to_cheaper_ranked_candidate(self):
+        """Top rank can be too rich; selector must try a cheaper row in-band."""
+        now = datetime(2026, 8, 5, 10, 32, tzinfo=ET)
+        options = {
+            "current_price": 302.10,
+            "chains": {
+                "2026-08-06": {
+                    "calls": [
+                        {
+                            # ranks first (tight + huge OI) but 1-lot risk $210
+                            "strike": 303.0,
+                            "bid": 10.40,
+                            "ask": 10.60,
+                            "openInterest": 100_000,
+                            "volume": 50_000,
+                            "impliedVolatility": 0.20,
+                        },
+                        {
+                            # cheaper, thinner — 1-lot risk ~$42, should be chosen
+                            "strike": 304.0,
+                            "bid": 2.06,
+                            "ask": 2.14,
+                            "openInterest": 10,
+                            "volume": 1,
+                            "impliedVolatility": 0.80,
+                        },
+                    ],
+                    "puts": [],
+                }
+            },
+        }
+        pivot = {"close": 302.10, "pivot": 300.0, "pct_change": 0.5}
+        with mock.patch.object(config, "MIN_DTE", 1):
+            with mock.patch.object(config, "REQUIRED_MOVE_ATR_K", 5.0):
+                with mock.patch.object(config, "EXIT_MAX_DECAY_DENSITY", 100.0):
+                    with mock.patch.object(config, "MAX_CONTRACT_SPREAD_PCT", 8.0):
+                        out = ss.select_optimal_contract(
+                            options, pivot, atr_abs=5.0, now=now, ticker="TEST"
+                        )
+        self.assertNotIn("error", out)
+        self.assertEqual(out["strike"], 304.0)
+        self.assertLessEqual(out["entry_premium"], 3.0)
+        self.assertGreaterEqual(out.get("rejected_better_ranks") or 0, 1)
+
+    def test_all_rich_rejects_ticker_with_risk_tag(self):
+        now = datetime(2026, 8, 5, 10, 32, tzinfo=ET)
+        od = self._chain("2026-08-06", 303.0, 10.40, 10.60)
+        pivot = {"close": 302.10, "pivot": 300.0, "pct_change": 0.5}
+        with mock.patch.object(config, "MIN_DTE", 1):
+            with mock.patch.object(config, "REQUIRED_MOVE_ATR_K", 5.0):
+                with mock.patch.object(config, "EXIT_MAX_DECAY_DENSITY", 100.0):
+                    out = ss.select_optimal_contract(
+                        od, pivot, atr_abs=5.0, now=now, ticker="XYZ"
+                    )
+        self.assertIn("error", out)
+        self.assertTrue(
+            str(out.get("reject_tag") or "").startswith("risk_too_large("),
+            out.get("reject_tag"),
+        )
+
     def test_zero_bids_in_band_are_no_liq_data(self):
         now = datetime(2026, 8, 5, 10, 32, tzinfo=ET)
         od = self._chain("2026-08-06", 303.0, 0.0, 0.0)

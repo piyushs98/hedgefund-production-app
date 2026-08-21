@@ -184,12 +184,17 @@ FIRST_FULL_SCAN_HOUR, FIRST_FULL_SCAN_MINUTE = _env_hhmm(
 #   STARTING_BUYING_POWER defaults to the same value; if you override it and
 #   it disagrees, boot logs CRITICAL (silent drift is how a week gets lost).
 #   contracts = floor(ACCOUNT_SIZE * RISK_PER_TRADE_PCT/100 / ((entry-SL)*100))
-#   minimum 1, cap MAX_CONTRACTS_PER_TRADE. Buying power is the hard block
-#   (size down to what the ledger can debit; log bp_limited(n->m)).
+#   1-lot risk > RISK_PER_TRADE_DOLLARS * MAX_RISK_BREACH_PCT → reject (walk
+#   to next candidate). Cap MAX_CONTRACTS_PER_TRADE. Buying power is the
+#   hard block (size down; log bp_limited(n->m)).
 # ------------------------------------------------------------------
 ACCOUNT_SIZE = _env_float("ACCOUNT_SIZE", 10000.0)
 RISK_PER_TRADE_PCT = _env_float("RISK_PER_TRADE_PCT", 1.5)
 MAX_CONTRACTS_PER_TRADE = _env_int("MAX_CONTRACTS_PER_TRADE", 10)
+# 1-lot stop risk may not exceed RISK_PER_TRADE_DOLLARS * this. Default 1.0
+# = no overshoot: a $200 lot on a $150 budget is rejected (walk to next
+# candidate), not floored to qty 1. Raise (e.g. 1.2) to allow a small breach.
+MAX_RISK_BREACH_PCT = _env_float("MAX_RISK_BREACH_PCT", 1.0)
 # Ledger seed. Unset → ACCOUNT_SIZE. Set only if you intentionally want them
 # to differ (will CRITICAL at boot).
 STARTING_BUYING_POWER = (
@@ -231,6 +236,16 @@ SENT_MAX = _env_float("SENT_MAX", 15.0)
 DEAD_ZONE_ATR = _env_float("DEAD_ZONE_ATR", 0.30)
 
 
+def risk_per_trade_dollars() -> float:
+    """ACCOUNT_SIZE * RISK_PER_TRADE_PCT / 100. The 1-lot risk ceiling."""
+    return float(ACCOUNT_SIZE) * float(RISK_PER_TRADE_PCT) / 100.0
+
+
+def max_one_lot_risk_dollars() -> float:
+    """Reject a contract when (entry-SL)*100 exceeds this (qty-1 floor is gone)."""
+    return risk_per_trade_dollars() * float(MAX_RISK_BREACH_PCT)
+
+
 def log_scoring_config() -> None:
     """Boot log: resolved scoring knobs next to [Gate] / [EntryFilters]."""
     print(
@@ -256,6 +271,9 @@ def log_risk_config() -> None:
         f"ledger_seed={seed:g} "
         f"RISK_PER_TRADE_PCT={RISK_PER_TRADE_PCT:g} "
         f"MAX_CONTRACTS_PER_TRADE={MAX_CONTRACTS_PER_TRADE} "
+        f"RISK_PER_TRADE_DOLLARS={risk_per_trade_dollars():.0f} "
+        f"MAX_RISK_BREACH_PCT={MAX_RISK_BREACH_PCT:g} "
+        f"(1-lot cap ${max_one_lot_risk_dollars():.0f}) "
         f"THESIS_EXIT_SCORE={THESIS_EXIT_SCORE:g} "
         f"(void if live<{THESIS_EXIT_SCORE:g} and entry_score>={EXECUTE_THRESHOLD}) "
         f"FIRST_FULL_SCAN_CDT="

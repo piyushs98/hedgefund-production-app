@@ -1160,7 +1160,7 @@ def run_thirty_min_scan(
                 print(f"[{ticker}] 🚧 Gate blocked → PASS ({gdec.reason})")
             elif gdec is not None and gdec.admit:
                 contract = strike_selector.select_optimal_contract(
-                    options_dict, pivot_data, atr_abs=atr_abs
+                    options_dict, pivot_data, atr_abs=atr_abs, ticker=ticker
                 )
                 if "error" in contract:
                     card.action_flag = "PASS"
@@ -1192,7 +1192,16 @@ def run_thirty_min_scan(
                     )
                     buy_ok = False
                     if qty < 1:
-                        print(f"[{ticker}] paper_buy blocked: qty=0 (buying power)")
+                        if int(buy_payload.get("qty_desired") or 0) <= 0:
+                            print(
+                                f"REJECT {ticker}:"
+                                f"{buy_payload.get('bp_limited') or 'risk_too_large at qty1'}"
+                            )
+                        else:
+                            print(
+                                f"[{ticker}] paper_buy blocked: qty=0 (buying power) "
+                                f"{buy_payload.get('bp_limited') or ''}".rstrip()
+                            )
                     else:
                         try:
                             buy_res = virtual_broker.paper_buy(

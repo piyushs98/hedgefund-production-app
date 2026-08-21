@@ -332,9 +332,11 @@ def size_position(
     """
     Risk-based contract count.
 
-      1. qty = floor(account_risk / ((entry - SL) * 100)), min 1
-      2. soft cap: min(qty, MAX_CONTRACTS_PER_TRADE)
-      3. hard cap: min(qty, floor(buying_power / (entry * 100))) → may be 0
+      1. if 1-lot risk > RISK_PER_TRADE_DOLLARS * MAX_RISK_BREACH_PCT → 0
+         (no min-1 floor that blows the budget; selector walks instead)
+      2. qty = floor(account_risk / ((entry - SL) * 100)), min 1 when 1-lot fits
+      3. soft cap: min(qty, MAX_CONTRACTS_PER_TRADE)
+      4. hard cap: min(qty, floor(buying_power / (entry * 100))) → may be 0
 
     Buying power is applied last and is the hard constraint: the contract
     cap never forces a fill the ledger cannot debit. paper_buy also
@@ -362,6 +364,11 @@ def size_position(
     qty = 1
     if sl is not None:
         per_contract_risk = (entry - sl) * CONTRACT_MULTIPLIER
+        breach = float(getattr(config, "MAX_RISK_BREACH_PCT", 1.0))
+        cap = account_risk * breach
+        if per_contract_risk > 0 and cap > 0 and per_contract_risk > cap:
+            # 1 lot already exceeds the risk budget — do not floor to qty 1.
+            return 0
         if per_contract_risk > 0 and account_risk > 0:
             qty = int(account_risk // per_contract_risk)  # floor
             if qty < 1:

@@ -16,8 +16,10 @@ contract algorithmically instead of leaving it to LLM prose:
        C-F  decay_density <= EXIT_MAX_DECAY_DENSITY (default 8 %/hr)
        spread  (ask-bid)/mid <= MAX_CONTRACT_SPREAD_PCT (default 8 %)
                on the candidate only; no two-sided quote → no_liq_data
+       risk    1-lot (entry-SL)*100 <= RISK_PER_TRADE_DOLLARS * MAX_RISK_BREACH_PCT
+               (no qty-1 floor that blows the budget)
      Error payloads include reject_tag for GATE line logging, e.g. decay(9.3>8.0)
-     or spread(12.4>8.0).
+     or spread(12.4>8.0) or risk_too_large($210>$150 at qty1).
 """
 
 from __future__ import annotations
@@ -219,6 +221,34 @@ def decay_density(extrinsic_pct: float | None, hours_rth_to_expiry: float) -> fl
     return float(extrinsic_pct) / float(hours_rth_to_expiry)
 
 
+def one_lot_stop_risk(entry: float) -> float:
+    """Dollar risk of 1 contract at the stored 20% stop: (entry - 0.80*entry)*100."""
+    sl = round(float(entry) * 0.80, 2)
+    return (float(entry) - sl) * 100.0
+
+
+def risk_too_large_tag(entry: float | None) -> str | None:
+    """Compact tag if 1-lot stop risk exceeds the allowed budget, else None."""
+    try:
+        prem = float(entry)
+    except (TypeError, ValueError):
+        return None
+    if prem <= 0:
+        return None
+    risk = one_lot_stop_risk(prem)
+    cap = float(
+        config.max_one_lot_risk_dollars()
+        if hasattr(config, "max_one_lot_risk_dollars")
+        else float(getattr(config, "ACCOUNT_SIZE", 10000.0))
+        * float(getattr(config, "RISK_PER_TRADE_PCT", 1.5))
+        / 100.0
+        * float(getattr(config, "MAX_RISK_BREACH_PCT", 1.0))
+    )
+    if risk > cap:
+        return f"risk_too_large(${risk:.0f}>${cap:.0f} at qty1)"
+    return None
+
+
 def _passes_entry_filters(
     *,
     cal_dte: int,
@@ -229,11 +259,13 @@ def _passes_entry_filters(
     bid: float | None = None,
     ask: float | None = None,
     spread_pct: float | None = None,
+    entry: float | None = None,
 ) -> tuple[bool, str | None]:
     """
     Return (ok, reject_tag). reject_tag is compact for GATE lines:
       min_dte(0) | rm_atr(0.61>0.50) | decay(9.3>8.0) | bad_quote(ext=…)
       | min_ext(1.5<10) | spread(12.4>8.0) | no_liq_data
+      | risk_too_large($210>$150 at qty1)
     """
     min_dte = int(getattr(config, "MIN_DTE", 1))
     k = float(getattr(config, "REQUIRED_MOVE_ATR_K", 0.5))
@@ -271,10 +303,15 @@ def _passes_entry_filters(
         return False, f"rm_atr({rm_atr:.2f}>{k:.2f})"
     if dens is not None and dens > max_dens:
         return False, f"decay({dens:.1f}>{max_dens:.1f})"
+    risk_tag = risk_too_large_tag(entry)
+    if risk_tag:
+        return False, risk_tag
     return True, None
 
 
-def select_optimal_contract(options_dict, pivot_data, atr_abs=None, now=None):
+def select_optimal_contract(
+    options_dict, pivot_data, atr_abs=None, now=None, ticker: str | None = None
+):
     """
     Returns a dict describing the chosen contract + rationale, or
     {"error": ..., "reject_tag": "min_dte(0)"} when nothing tradeable
@@ -405,6 +442,7 @@ def select_optimal_contract(options_dict, pivot_data, atr_abs=None, now=None):
             bid=cand.get("bid"),
             ask=cand.get("ask"),
             spread_pct=cand.get("spread_pct"),
+            entry=cand.get("mid"),
         )
         if not ok:
             tag = why or "filter"
@@ -412,6 +450,8 @@ def select_optimal_contract(options_dict, pivot_data, atr_abs=None, now=None):
             rejects.append(
                 f"{cand['expiration']} {cand['contract'].get('strike')}: {tag}"
             )
+            if tag.startswith("risk_too_large"):
+                print(f"REJECT {ticker or '?'}:{tag}")
             continue
         chosen = cand
         break
@@ -423,7 +463,7 @@ def select_optimal_contract(options_dict, pivot_data, atr_abs=None, now=None):
         return {
             "error": (
                 f"All {direction} candidates failed entry filters "
-                f"(MIN_DTE/required_move/decay_density/spread). "
+                f"(MIN_DTE/required_move/decay_density/spread/risk). "
                 f"Tried {len(ranked)}; e.g. {sample}"
             ),
             "reject_tag": primary,

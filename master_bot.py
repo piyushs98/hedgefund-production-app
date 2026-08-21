@@ -1137,7 +1137,7 @@ def run_portfolio_scan(
             contract = None
             if is_execute:
                 contract = strike_selector.select_optimal_contract(
-                    options_dict, pivot_data, atr_abs=atr_abs)
+                    options_dict, pivot_data, atr_abs=atr_abs, ticker=ticker)
                 if "error" in contract:
                     tag = contract.get("reject_tag") or "strike_fail"
                     print(
@@ -1236,10 +1236,17 @@ def run_portfolio_scan(
                     )
                     buy_ok = False
                     if qty < 1:
-                        print(
-                            f"[CEO] paper_buy blocked {ticker}: "
-                            f"qty=0 (buying power)"
-                        )
+                        if int(buy_payload.get("qty_desired") or 0) <= 0:
+                            print(
+                                f"REJECT {ticker}:"
+                                f"{buy_payload.get('bp_limited') or 'risk_too_large at qty1'}"
+                            )
+                        else:
+                            print(
+                                f"[CEO] paper_buy blocked {ticker}: "
+                                f"qty=0 (buying power) "
+                                f"{buy_payload.get('bp_limited') or ''}".rstrip()
+                            )
                     else:
                         try:
                             buy_res = virtual_broker.paper_buy(
@@ -1381,7 +1388,8 @@ def run_macro_loop():
         f"EXIT_MAX_DECAY_DENSITY={config.EXIT_MAX_DECAY_DENSITY}%/hr "
         f"MAX_CONTRACT_SPREAD_PCT={config.MAX_CONTRACT_SPREAD_PCT}% "
         f"MIN_EXTRINSIC_PCT={config.MIN_EXTRINSIC_PCT} "
-        f"MAX_EXPIRY_CALENDAR_DTE={config.MAX_EXPIRY_CALENDAR_DTE}"
+        f"MAX_EXPIRY_CALENDAR_DTE={config.MAX_EXPIRY_CALENDAR_DTE} "
+        f"MAX_RISK_BREACH_PCT={getattr(config, 'MAX_RISK_BREACH_PCT', 1.0)}"
     )
     if hasattr(config, "log_scoring_config"):
         config.log_scoring_config()

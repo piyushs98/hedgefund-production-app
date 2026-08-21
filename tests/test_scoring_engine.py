@@ -325,6 +325,10 @@ class TestGateDataReasons(unittest.TestCase):
         self.assertEqual(sg._compact_reason("spread_untradeable"), "spread_untradeable")
         self.assertEqual(sg._compact_reason("no_momentum_data"), "no_momentum_data")
         self.assertEqual(sg._compact_reason("dead_zone"), "dead_zone")
+        self.assertEqual(
+            sg._compact_reason("risk_too_large($210>$150 at qty1)"),
+            "risk_too_large",
+        )
         # liq-killed total no longer the only path — but below_thr still exists
         self.assertEqual(sg._compact_reason("score 0.0 below 70"), "below_thr")
 
