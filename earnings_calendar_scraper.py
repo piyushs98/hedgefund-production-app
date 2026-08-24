@@ -27,9 +27,19 @@ def scrape_earnings_calendar(tickers):
             if len(dates) > 0 and dates[0] is not None:
                 try:
                     dt = dates[0]
-                    earnings_str = f"Corporate Earnings Scheduled for {dt}"
+                    iso = None
+                    try:
+                        from earnings_blackout import parse_print_date
+                        parsed = parse_print_date(dt)
+                        if parsed is not None:
+                            iso = parsed.isoformat()
+                    except Exception:
+                        iso = None
+                    if iso is None:
+                        iso = str(dt)
+                    earnings_str = f"Corporate Earnings Scheduled for {iso}"
                     save_innovation_data(ticker, "EARNINGS", earnings_str)
-                    print(f"  -> Saved EARNINGS calendar data for {ticker}.")
+                    print(f"  -> Saved EARNINGS calendar data for {ticker} ({iso}).")
                 except Exception as date_err:
                     pass
         except Exception as e:

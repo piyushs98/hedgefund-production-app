@@ -1431,6 +1431,11 @@ def run_macro_loop():
         config.log_scoring_config()
     if hasattr(config, "log_risk_config"):
         config.log_risk_config()
+    try:
+        import earnings_blackout
+        earnings_blackout.log_config()
+    except Exception as earn_err:
+        print(f"[Earnings] config unavailable: {earn_err}")
     print(
         f"[SessionCutoffs] EXIT_EOD_FLATTEN_CDT="
         f"{config.EXIT_EOD_FLATTEN_HOUR:02d}:{config.EXIT_EOD_FLATTEN_MINUTE:02d} "

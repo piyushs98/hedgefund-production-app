@@ -234,6 +234,19 @@ MAX_CONTRACT_SPREAD_PCT = _env_float("MAX_CONTRACT_SPREAD_PCT", 8.0)
 MIN_PREMIUM = _env_float("MIN_PREMIUM", 1.00)
 
 # ------------------------------------------------------------------
+# Earnings blackout. Auto-loaded from earnings_calendar_scraper
+# (innovation_data EARNINGS rows). EARNINGS_BLACKOUT is a per-ticker
+# manual override: "NVDA:2026-08-26,AAPL:2026-09-01".
+# Window is inclusive on the ET session date: print − BEFORE .. print + AFTER.
+# EARNINGS_FLATTEN_SPANNING: close open lots whose expiry >= print once
+# the session is inside the window. False = block new entries only.
+# ------------------------------------------------------------------
+EARNINGS_BLACKOUT = os.environ.get("EARNINGS_BLACKOUT", "") or ""
+BLACKOUT_DAYS_BEFORE = _env_int("BLACKOUT_DAYS_BEFORE", 1)
+BLACKOUT_DAYS_AFTER = _env_int("BLACKOUT_DAYS_AFTER", 1)
+EARNINGS_FLATTEN_SPANNING = _env_bool("EARNINGS_FLATTEN_SPANNING", True)
+
+# ------------------------------------------------------------------
 # Calibrated scoring (scoring_engine). All env-tunable; restart to apply.
 #   Defaults: compromise A retuned 2026-08-10 for Mon/Fri two-sided test.
 #   PIVOT_SCALE=0.40 ATR, PIVOT_POWER=1.0, MOM_SCALE=0.45 %,
@@ -299,7 +312,9 @@ def log_risk_config() -> None:
         f"(void if live<{THESIS_EXIT_SCORE:g} and entry_score>={EXECUTE_THRESHOLD}) "
         f"FIRST_FULL_SCAN_CDT="
         f"{FIRST_FULL_SCAN_HOUR:02d}:{FIRST_FULL_SCAN_MINUTE:02d} "
-        f"RESET_LEDGER_ON_BOOT={RESET_LEDGER_ON_BOOT}"
+        f"RESET_LEDGER_ON_BOOT={RESET_LEDGER_ON_BOOT} "
+        f"EARNINGS_FLATTEN_SPANNING={EARNINGS_FLATTEN_SPANNING} "
+        f"BLACKOUT={BLACKOUT_DAYS_BEFORE}d/{BLACKOUT_DAYS_AFTER}d"
     )
     if abs(seed - float(ACCOUNT_SIZE)) > 0.5:
         msg = (

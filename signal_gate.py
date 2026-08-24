@@ -318,6 +318,15 @@ class SignalGate:
             direction = _norm_direction(obs.direction)
             block_reason = (obs.block_reason or "").strip().lower() or None
 
+            # Earnings blackout beats scorer tags so GATE shows earnings_blackout×N
+            # even when the ticker would also have been dead_zone / below_thr.
+            try:
+                import earnings_blackout
+                if earnings_blackout.is_blacked_out(ticker, now):
+                    block_reason = "earnings_blackout"
+            except Exception:
+                pass
+
             # Scorer hard blocks (dead zone, etc.) — distinct GATE reason, reset streak
             if block_reason:
                 use_score = min(score, self.cfg.threshold - 0.1)
@@ -418,6 +427,7 @@ def _compact_reason(reason: str) -> str:
         "spread_untradeable",
         "no_momentum_data",
         "dead_zone",
+        "earnings_blackout",
     ):
         return r
     if "no_liq_data" in r or "no liq" in r:
@@ -428,6 +438,8 @@ def _compact_reason(reason: str) -> str:
         return "no_momentum_data"
     if "dead_zone" in r or "dead zone" in r:
         return "dead_zone"
+    if "earnings_blackout" in r or "earnings blackout" in r:
+        return "earnings_blackout"
     if "same_scan" in r:
         return "same_scan"
     if "post_exit" in r:

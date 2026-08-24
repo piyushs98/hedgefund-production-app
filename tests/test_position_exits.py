@@ -47,6 +47,9 @@ class TestGateDefaults(unittest.TestCase):
         self.assertEqual(config.DRIFT_SCALE, 0.25)
         self.assertEqual(config.FIRST_FULL_SCAN_HOUR, 8)
         self.assertEqual(config.FIRST_FULL_SCAN_MINUTE, 45)
+        self.assertEqual(config.BLACKOUT_DAYS_BEFORE, 1)
+        self.assertEqual(config.BLACKOUT_DAYS_AFTER, 1)
+        self.assertTrue(config.EARNINGS_FLATTEN_SPANNING)
 
 
 class TestMarkLookup(unittest.TestCase):

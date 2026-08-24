@@ -12,6 +12,8 @@ Runs inside the 30-minute scan. No tracker daemon, no Gemini, no new process.
   C-D 0DTE hard flatten at/after EXIT_ZERO_DTE_FLATTEN_CDT (default 13:00 CDT)
   Thesis void: live score < THESIS_EXIT_SCORE (default 55) AND entry_score
       >= EXECUTE_THRESHOLD (70) — carry review and every exit pass, P&L ignored
+  Earnings flatten: open lot whose expiry spans a print, once the session
+      is inside the blackout window (EARNINGS_FLATTEN_SPANNING, default on)
   Carry morning re-eval once/day before admits (score/pivot/mark + Discord)
 
 Every close: virtual_broker.paper_sell → tracker_agent.remove_active_trade
@@ -238,6 +240,17 @@ def evaluate_exit_reason_for_mark(
         if exit_px is None and entry is not None:
             exit_px = entry
         return "EXPIRY_FLATTEN", exit_px
+
+    # Earnings: flatten lots whose expiry spans the print, once inside
+    # the blackout window. Off when EARNINGS_FLATTEN_SPANNING is false.
+    try:
+        import earnings_blackout
+        if earnings_blackout.should_flatten_trade(trade, sess):
+            if exit_px is None and entry is not None:
+                exit_px = entry
+            return "EARNINGS_FLATTEN", exit_px
+    except Exception:
+        pass
 
     if mark is None:
         return None, None

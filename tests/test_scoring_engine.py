@@ -333,6 +333,7 @@ class TestGateDataReasons(unittest.TestCase):
             sg._compact_reason("min_premium($0.67<1.00)"),
             "min_premium",
         )
+        self.assertEqual(sg._compact_reason("earnings_blackout"), "earnings_blackout")
         # liq-killed total no longer the only path — but below_thr still exists
         self.assertEqual(sg._compact_reason("score 0.0 below 70"), "below_thr")
 

@@ -197,6 +197,47 @@ def get_innovation_context(ticker, days=7):
         
     return "\n".join(data_list)
 
+
+def list_innovation_data(source_tag=None, days=90):
+    """
+    Raw innovation_data rows, newest first.
+
+    Returns list of (timestamp, ticker, source_tag, content).
+    Used by earnings_blackout to auto-load EARNINGS calendar rows.
+    """
+    init_db()
+    rows = []
+    time_offset = f"-{int(days)} days"
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+            cursor = conn.cursor()
+            if source_tag:
+                cursor.execute(
+                    """
+                    SELECT timestamp, ticker, source_tag, content
+                    FROM innovation_data
+                    WHERE source_tag = ?
+                      AND timestamp >= datetime('now', ?)
+                    ORDER BY timestamp DESC
+                    """,
+                    (str(source_tag).upper(), time_offset),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT timestamp, ticker, source_tag, content
+                    FROM innovation_data
+                    WHERE timestamp >= datetime('now', ?)
+                    ORDER BY timestamp DESC
+                    """,
+                    (time_offset,),
+                )
+            rows = cursor.fetchall()
+    except sqlite3.Error as e:
+        print(f"[Memory Master] SQLite error listing innovation data: {e}")
+    return rows
+
+
 def clear_expired_news():
     """
     Housekeeping function to delete all news articles older than 90 days.
