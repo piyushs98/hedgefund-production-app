@@ -293,7 +293,8 @@ def generate_morning_briefing(api_key=None):
 
     Scheduled by master_bot.run_macro_loop() during the 09:15–09:29 EST
     pre-market prep window (once per trading day). LLM failures fall back to a
-    live overnight-data briefing so the prep meeting never crashes the macro loop.
+    live overnight-data briefing so the prep meeting never crashes the macro
+    loop, and Discord CRITICAL the first dual-provider fail this session.
 
     Args:
         api_key: Unused (kept for call-site compatibility). Keys come from env
@@ -336,6 +337,10 @@ def generate_morning_briefing(api_key=None):
                 "[Chief of Staff] Falling back to live overnight-data briefing "
                 "(not the hardcoded template)."
             )
+            llm_chain.alert_llm_dual_fail(
+                "pre_market_cos",
+                RuntimeError("empty text after successful call"),
+            )
             briefing_text = _build_live_data_briefing(overnight_context)
         else:
             print(
@@ -348,6 +353,7 @@ def generate_morning_briefing(api_key=None):
             "[Chief of Staff] Generating live data-driven briefing from overnight "
             "DB (Fallback Mode label only if data also empty)."
         )
+        llm_chain.alert_llm_dual_fail("pre_market_cos", e)
         briefing_text = _build_live_data_briefing(overnight_context)
         # Only tag Fallback Mode when we truly have no overnight tape
         if (

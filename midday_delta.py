@@ -5,8 +5,9 @@ Architecture:
   * Pre-market (once/day, ~09:15 ET): Gemini CoS in pre_market_meeting.py
   * Every ~30 min (RTH): deterministic score + SINGLE Discord table payload
     (DeepSeek only for short KEY TELEMETRY bullets; no macro headers)
-  * Midday macro meeting: Gemini once/day STRICTLY 11:00 AM CDT window
-    (DeepSeek backup) — never mixed into 30-min scan messages
+  * Midday macro meeting: DeepSeek once/day STRICTLY 11:00 AM CDT window
+    (Gemini backup; Gemini reserved for the morning brief) — never mixed
+    into 30-min scan messages
 
 Scoring / strike selection remain deterministic. Stage 3 adds SignalGate
 between score/adversarial and strike/execution (rank-before-admit).
@@ -47,6 +48,14 @@ BASELINE_PATH = os.environ.get(
 SCORE_DELTA_MIN = float(os.environ.get("DELTA_SCORE_MIN", "5"))
 PCT_CHANGE_DELTA_MIN = float(os.environ.get("DELTA_PCT_MIN", "0.75"))
 LLM_TIMEOUT_S = int(os.environ.get("LLM_CALL_TIMEOUT_S", "20"))
+
+
+def _midday_llm_timeout_s() -> int:
+    """Midday meeting wall clock. Default 60; override MIDDAY_LLM_TIMEOUT_S."""
+    try:
+        return max(1, int(getattr(config, "MIDDAY_LLM_TIMEOUT_S", 60)))
+    except (TypeError, ValueError):
+        return 60
 
 # 11:00 AM CDT window (America/Chicago). 30-min cadence may land mid-window.
 MIDDAY_MACRO_START = time(11, 0)
@@ -612,13 +621,14 @@ def run_midday_macro_meeting(
     *,
     morning_excerpt: str = "",
     rows: list[dict] | None = None,
-    timeout_s: int = LLM_TIMEOUT_S,
+    timeout_s: int | None = None,
 ) -> str:
     """
-    Comprehensive Midday Macro & News Update — Gemini primary, DeepSeek backup.
+    Comprehensive Midday Macro & News Update — DeepSeek primary, Gemini backup.
 
-    Called ONLY from master_bot inside the 11:00 AM CDT window (once/day).
-    Never used as a prefix on 30-minute scan payloads.
+    Gemini is reserved for the pre-market brief. Timeout default 60s
+    (MIDDAY_LLM_TIMEOUT_S). Called ONLY from master_bot inside the 11:00 AM
+    CDT window (once/day). Never used as a prefix on 30-minute scan payloads.
     """
     brief = " ".join((morning_excerpt or "").split())[:500]
     table = []
@@ -646,14 +656,17 @@ Write a Discord post MAX 900 characters:
 - Optional: 2–4 ticker callouts if material
 - Forbidden: 30-MIN SCAN headers, CEO language, banned filler
 """
+    if timeout_s is None:
+        timeout_s = _midday_llm_timeout_s()
     print(
-        f"[midday] 📋 Midday MACRO meeting (Gemini primary → DeepSeek backup, "
-        f"model={llm_chain.GEMINI_MODEL}) — isolated 11:00 CDT slot only"
+        f"[midday] 📋 Midday MACRO meeting (DeepSeek primary → Gemini backup, "
+        f"model={llm_chain.DEEPSEEK_MODEL}, timeout={timeout_s}s) "
+        "— isolated 11:00 CDT slot only"
     )
     try:
         text = llm_chain.generate_text(
             prompt,
-            primary="gemini",
+            primary="deepseek",
             step="midday_macro_meeting",
             system=system,
             timeout_s=timeout_s,
@@ -669,12 +682,13 @@ Write a Discord post MAX 900 characters:
             text = f"**📊 MIDDAY MACRO & NEWS UPDATE (11:00 CDT)**\n{text}"
         return text
     except Exception as exc:
-        print(f"[midday] Macro meeting LLM failed ({exc}); short deterministic note.")
+        print(f"[midday] Macro meeting LLM failed ({exc}); deterministic fallback.")
+        llm_chain.alert_llm_dual_fail("midday_macro_meeting", exc)
         return (
             "**📊 MIDDAY MACRO & NEWS UPDATE (11:00 CDT)**\n"
             f"Morning brief on file ({len(brief)} chars). "
             f"Book rows: {len(rows or [])}. "
-            "LLM offline — see latest 30-MIN SCAN table for structure."
+            "Deterministic fallback — dual LLM fail (see CRITICAL)."
         )
 
 

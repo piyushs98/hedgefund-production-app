@@ -50,6 +50,7 @@ class TestGateDefaults(unittest.TestCase):
         self.assertEqual(config.BLACKOUT_DAYS_BEFORE, 1)
         self.assertEqual(config.BLACKOUT_DAYS_AFTER, 1)
         self.assertTrue(config.EARNINGS_FLATTEN_SPANNING)
+        self.assertEqual(config.MIDDAY_LLM_TIMEOUT_S, 60)
 
 
 class TestMarkLookup(unittest.TestCase):

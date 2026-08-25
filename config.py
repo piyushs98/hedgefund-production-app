@@ -36,8 +36,9 @@ HEDGE_DB_PATH = os.environ.get("HEDGE_DB_PATH", "data/hedge_fund.db")
 # fall back to a committed key.
 #
 # LLM policy (llm_chain.generate_text primary=...):
-#   * Meetings (pre-market CoS, midday delta meeting): primary="gemini"
-#     free-tier (GEMINI_API_KEY / gemini-flash-latest); DeepSeek backup.
+#   * Pre-market CoS: primary="gemini" (free-tier flash); DeepSeek backup.
+#   * Midday macro note: primary="deepseek"; Gemini backup. Gemini is
+#     reserved for the morning brief. Timeout: MIDDAY_LLM_TIMEOUT_S (60).
 #   * Trade scans (CEO/quant/CoS/managers/adversarial/trade notes):
 #     primary="deepseek" (DEEPSEEK_API_KEY); Gemini optional backup.
 #   * Override models via LLM_GEMINI_MODEL / LLM_DEEPSEEK_MODEL
@@ -246,6 +247,11 @@ BLACKOUT_DAYS_BEFORE = _env_int("BLACKOUT_DAYS_BEFORE", 1)
 BLACKOUT_DAYS_AFTER = _env_int("BLACKOUT_DAYS_AFTER", 1)
 EARNINGS_FLATTEN_SPANNING = _env_bool("EARNINGS_FLATTEN_SPANNING", True)
 
+# Midday macro meeting (11:00 CDT). DeepSeek primary; Gemini reserved for
+# pre-market. 20s was tight for free-tier Flash at US midday; the note is
+# not latency-sensitive. Pre-market keeps its own 90s default.
+MIDDAY_LLM_TIMEOUT_S = _env_int("MIDDAY_LLM_TIMEOUT_S", 60)
+
 # ------------------------------------------------------------------
 # Calibrated scoring (scoring_engine). All env-tunable; restart to apply.
 #   Defaults: compromise A retuned 2026-08-10 for Mon/Fri two-sided test.
@@ -314,7 +320,8 @@ def log_risk_config() -> None:
         f"{FIRST_FULL_SCAN_HOUR:02d}:{FIRST_FULL_SCAN_MINUTE:02d} "
         f"RESET_LEDGER_ON_BOOT={RESET_LEDGER_ON_BOOT} "
         f"EARNINGS_FLATTEN_SPANNING={EARNINGS_FLATTEN_SPANNING} "
-        f"BLACKOUT={BLACKOUT_DAYS_BEFORE}d/{BLACKOUT_DAYS_AFTER}d"
+        f"BLACKOUT={BLACKOUT_DAYS_BEFORE}d/{BLACKOUT_DAYS_AFTER}d "
+        f"MIDDAY_LLM_TIMEOUT_S={MIDDAY_LLM_TIMEOUT_S}"
     )
     if abs(seed - float(ACCOUNT_SIZE)) > 0.5:
         msg = (

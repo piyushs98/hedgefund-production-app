@@ -2,8 +2,9 @@
 llm_chain.py — Cost-aware dual-provider text generation.
 
 Routing policy (callers set ``primary``):
-  * Meetings (pre-market, midday synthesis): primary="gemini" (free tier),
-    DeepSeek backup on failure.
+  * Pre-market CoS: primary="gemini" (free tier), DeepSeek backup.
+  * Midday macro note: primary="deepseek", Gemini backup (Gemini reserved
+    for the morning brief).
   * Trade scans (CEO/quant/CoS/managers/adversarial): primary="deepseek",
     Gemini optional backup on failure.
 
@@ -19,6 +20,7 @@ Does not own trading logic. Never hangs indefinitely.
 from __future__ import annotations
 
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 import requests
@@ -284,8 +286,8 @@ def generate_text(
     Cost-aware dual-provider generation.
 
     Args:
-        primary: ``"gemini"`` (default) — meetings / free-tier first, DeepSeek backup.
-                 ``"deepseek"`` — trade scans first, Gemini backup.
+        primary: ``"gemini"`` — pre-market CoS / free-tier first, DeepSeek backup.
+                 ``"deepseek"`` — midday note and trade scans first, Gemini backup.
 
     Each leg is independently wall-clock bounded by ``timeout_s``.
     Total worst-case latency ≈ 2 * timeout_s.
@@ -343,12 +345,13 @@ def generate_text(
         print(
             f"[LLM FAILOVER] {second} key missing — cannot failover for {step}"
         )
+        missing = RuntimeError(f"{second} key missing")
         raise LLMChainError(
             f"{first} failed and {second} key missing: {first_err}",
             step=step,
             is_timeout=getattr(first_err, "is_timeout", False),
-            gemini_error=first_err if first == "gemini" else None,
-            deepseek_error=first_err if first == "deepseek" else None,
+            gemini_error=first_err if first == "gemini" else missing,
+            deepseek_error=first_err if first == "deepseek" else missing,
         ) from (first_err if isinstance(first_err, BaseException) else None)
 
     try:
@@ -393,3 +396,86 @@ def generate_text(
 
 # Worst-case wall clock when master_bot wraps a call that itself runs the chain.
 CHAIN_WALL_CLOCK_S = DEFAULT_TIMEOUT_S * 2
+
+# First dual-provider fail per process, keyed by step (pre_market_cos /
+# midday_macro_meeting). Session == process lifetime on Render.
+_dual_fail_alerted: set[str] = set()
+_TIMEOUT_RE = re.compile(r"timed out after\s+(\d+)", re.I)
+_HTTP_RE = re.compile(r"HTTP\s+(\d{3})", re.I)
+_HTTP_HINT = {
+    "401": "unauthorized",
+    "403": "forbidden",
+    "404": "not found",
+    "429": "quota",
+    "500": "server",
+    "502": "bad gateway",
+    "503": "unavailable",
+}
+
+
+def reset_dual_fail_alerts_for_tests() -> None:
+    _dual_fail_alerted.clear()
+
+
+def format_provider_err(err) -> str:
+    """Compact gemini=/deepseek= fragment for the Discord CRITICAL line."""
+    if err is None:
+        return "n/a"
+    if isinstance(err, LLMChainError):
+        if err.is_timeout:
+            m = _TIMEOUT_RE.search(err.message or "")
+            return f"timeout {m.group(1)}s" if m else "timeout"
+        text = err.message or str(err)
+    else:
+        text = str(err)
+    low = text.lower()
+    if "key missing" in low or "not set" in low:
+        return "key missing"
+    m = _HTTP_RE.search(text)
+    if m:
+        code = m.group(1)
+        hint = _HTTP_HINT.get(code, "")
+        return f"{code} {hint}".strip()
+    m = _TIMEOUT_RE.search(text)
+    if m:
+        return f"timeout {m.group(1)}s"
+    compact = " ".join(text.split())
+    if len(compact) > 80:
+        compact = compact[:77] + "..."
+    return compact or "error"
+
+
+def alert_llm_dual_fail(step: str, exc: BaseException | None) -> None:
+    """
+    First dual-provider failure for this step in the process → Discord CRITICAL.
+
+    Same shape as mark-fail / scan-discord-fail. Trading path is unaffected;
+    the meeting already swapped in a deterministic fallback.
+    """
+    key = (step or "llm").strip() or "llm"
+    if key in _dual_fail_alerted:
+        print(f"[LLM] dual-fail CRITICAL already sent this session for {key}")
+        return
+    _dual_fail_alerted.add(key)
+
+    gemini = deepseek = "n/a"
+    if isinstance(exc, LLMChainError):
+        gemini = format_provider_err(exc.gemini_error)
+        deepseek = format_provider_err(exc.deepseek_error)
+        if gemini == "n/a" and deepseek == "n/a":
+            gemini = format_provider_err(exc)
+    elif exc is not None:
+        gemini = format_provider_err(exc)
+
+    msg = (
+        f"🚨 **CRITICAL: LLM DUAL FAIL ({key})** "
+        f"gemini={gemini}, deepseek={deepseek}\n"
+        "Meeting used the deterministic fallback. Trading path is unaffected."
+    )
+    print(f"[LLM] {msg.replace(chr(10), ' | ')}")
+    try:
+        import broadcaster
+        delivered = broadcaster.send_discord_alert(msg)
+        print(f"[LLM] dual-fail CRITICAL delivered={delivered} step={key}")
+    except Exception as send_err:
+        print(f"[LLM] dual-fail CRITICAL send failed: {send_err}")

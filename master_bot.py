@@ -12,7 +12,8 @@ Key design notes:
   * scoring_engine.py grades pillars from raw numbers + dynamic weights.
   * CEO output uses a strict per-ticker Markdown schema; DeepSeek primary
     (Gemini backup) falls back to a deterministic numeric formatter.
-  * Meetings (pre-market / midday) use Gemini primary; trade scans use DeepSeek.
+  * Pre-market CoS uses Gemini primary; midday macro uses DeepSeek primary
+    (Gemini reserved for the morning brief). Trade scans use DeepSeek.
   * CircuitBreaker, telemetry, and strike_selector handle resilience,
     backtest logging, and contract selection on EXECUTE.
   * Secrets are env-only (config.assert_secrets crashes early).
@@ -1377,7 +1378,7 @@ def run_macro_loop():
       * Trading 09:30–16:00 ET — **30-min scans** (table Discord; DeepSeek
         KEY TELEMETRY only; no Midday Macro headers)
       * **11:00 AM CDT only (once/day)** — Midday Macro & News Update
-        (Gemini primary, DeepSeek backup), isolated from 30-min payloads
+        (DeepSeek primary, Gemini backup; Gemini reserved for pre-market)
       * FULL_LLM_INTRADAY=true — heavy portfolio scan escape hatch
 
     IMMORTAL daemon contract:
@@ -1638,7 +1639,7 @@ def run_macro_loop():
                 ):
                     print(
                         f"[System State] 📊 MIDDAY MACRO WINDOW "
-                        f"(CDT {cdt_clock_str(now_cdt)}) — Gemini once, isolated payload"
+                        f"(CDT {cdt_clock_str(now_cdt)}) — DeepSeek primary, isolated payload"
                     )
                     try:
                         bl = load_baseline()
