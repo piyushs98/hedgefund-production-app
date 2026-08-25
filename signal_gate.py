@@ -523,8 +523,13 @@ def get_gate() -> SignalGate:
     if _GATE is None:
         cfg = gate_config_from_env()
         _GATE = SignalGate(cfg)
+        try:
+            import fill_accounting as _fa
+            _ver = _fa.code_version()
+        except Exception:
+            _ver = "vn/a"
         print(
-            f"[Gate] init max_entries/ticker={cfg.max_entries_per_ticker} "
+            f"[Gate] {_ver} init max_entries/ticker={cfg.max_entries_per_ticker} "
             f"max_concurrent={cfg.max_concurrent} persist={cfg.persist_cycles} "
             f"flip_lock={cfg.flip_lock_minutes}m "
             f"entry_cd={cfg.reentry_cooldown_minutes}m "
@@ -545,8 +550,13 @@ def log_entry_filter_config() -> None:
     """Boot / init: print resolved Part C knobs (env-overridable at process start)."""
     try:
         import config as _cfg
+        try:
+            import fill_accounting as _fa
+            _ver = _fa.code_version()
+        except Exception:
+            _ver = "vn/a"
         print(
-            f"[EntryFilters] MIN_DTE={getattr(_cfg, 'MIN_DTE', 1)} "
+            f"[EntryFilters] {_ver} MIN_DTE={getattr(_cfg, 'MIN_DTE', 1)} "
             f"REQUIRED_MOVE_ATR_K={getattr(_cfg, 'REQUIRED_MOVE_ATR_K', 0.5)} "
             f"EXIT_MAX_DECAY_DENSITY={getattr(_cfg, 'EXIT_MAX_DECAY_DENSITY', 8.0)}%/hr "
             f"MAX_CONTRACT_SPREAD_PCT={getattr(_cfg, 'MAX_CONTRACT_SPREAD_PCT', 8.0)}% "

@@ -505,6 +505,10 @@ def select_optimal_contract(
         "days_to_expiration": round(chosen["dte_eff"], 3),
         "calendar_dte": chosen["cal_dte"],
         "entry_premium": entry,
+        "entry_mid": entry,
+        "bid": chosen["bid"],
+        "ask": chosen["ask"],
+        "entry_ask": chosen["ask"],
         # QUEUED next: ATR/delta stops — replace this flat 20%/50% of premium.
         "stop_loss": round(entry * 0.80, 2),
         "take_profit": round(entry * 1.50, 2),

@@ -887,6 +887,11 @@ def run_thirty_min_scan(
 
     universe = list(tickers) if tickers is not None else list(TICKERS)
     scan_id = f"scan-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    try:
+        import fill_accounting as _fa
+        _fa.note_scan()
+    except Exception:
+        pass
     result = {
         "scan_id": scan_id,
         "mode": "thirty_min_scan",
@@ -1325,6 +1330,12 @@ def run_thirty_min_scan(
             "gate_admit": None if gdec is None else gdec.admit,
         }
         rows_by_ticker[ticker] = row
+        if ticker == "SPY":
+            try:
+                import fill_accounting as _fa
+                _fa.note_spy(snap.get("spot"))
+            except Exception:
+                pass
         result["results"].append({
             "ticker": ticker,
             "action_flag": card.action_flag,
@@ -1609,6 +1620,12 @@ def run_exit_only_pass(
                 if "error" not in od:
                     options_dict = od
                     mode = "single_contract"
+                    if ticker == "SPY":
+                        try:
+                            import fill_accounting as _fa
+                            _fa.note_spy(od.get("current_price"))
+                        except Exception:
+                            pass
                 else:
                     print(
                         f"[exit-pass] [{ticker}] light quote failed: {od.get('error')} "

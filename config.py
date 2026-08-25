@@ -291,8 +291,13 @@ def max_one_lot_risk_dollars() -> float:
 
 def log_scoring_config() -> None:
     """Boot log: resolved scoring knobs next to [Gate] / [EntryFilters]."""
+    try:
+        import fill_accounting
+        ver = fill_accounting.code_version()
+    except Exception:
+        ver = "vn/a"
     print(
-        f"[Scoring] thr={EXECUTE_THRESHOLD} "
+        f"[Scoring] {ver} thr={EXECUTE_THRESHOLD} "
         f"PIVOT_SCALE={PIVOT_SCALE} PIVOT_POWER={PIVOT_POWER} "
         f"MOM_SCALE={MOM_SCALE} W_PIVOT={W_PIVOT} W_MOM={W_MOM} "
         f"W_DRIFT={W_DRIFT} DRIFT_SCALE={DRIFT_SCALE} "
@@ -310,8 +315,13 @@ def log_risk_config() -> None:
     is how the risk model sizes for $10k while the book funds 4× that.
     """
     seed = float(STARTING_BUYING_POWER)
+    try:
+        import fill_accounting
+        ver = fill_accounting.code_version()
+    except Exception:
+        ver = "vn/a"
     print(
-        f"[Risk] ACCOUNT_SIZE={ACCOUNT_SIZE:g} "
+        f"[Risk] {ver} ACCOUNT_SIZE={ACCOUNT_SIZE:g} "
         f"ledger_seed={seed:g} "
         f"RISK_PER_TRADE_PCT={RISK_PER_TRADE_PCT:g} "
         f"MAX_CONTRACTS_PER_TRADE={MAX_CONTRACTS_PER_TRADE} "

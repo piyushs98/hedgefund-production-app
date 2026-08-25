@@ -120,6 +120,13 @@ def send_discord_alert(message):
     try:
         if not message or not str(message).strip():
             return False
+        text = str(message)
+        if "CRITICAL" in text.upper():
+            try:
+                import fill_accounting
+                fill_accounting.note_critical()
+            except Exception:
+                pass
         if not WEBHOOK_URL:
             print(
                 "[Broadcaster] ERROR: DISCORD_WEBHOOK env var not set — "

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import config
+import fill_accounting
 
 DB_PATH = config.NEWS_DB_PATH
 CONTRACT_MULTIPLIER = 100
@@ -51,6 +52,7 @@ _boot_reset_done: bool = False
 _book: dict[str, Any] = {
     "session_date": None,
     "start_realized": 0.0,
+    "start_realized_fill": 0.0,
     "open_cost": 0.0,
     "peak_deployed": 0.0,
 }
@@ -96,20 +98,44 @@ def _connect() -> sqlite3.Connection:
 
 
 def _ensure_slippage_column(conn: sqlite3.Connection) -> None:
-    """Migrate trade_history to include slippage when upgrading an existing DB."""
+    """Migrate trade_history / ledger for slippage + fill-accounting columns."""
     cols = {
         str(r[1]) for r in conn.execute("PRAGMA table_info(trade_history)").fetchall()
     }
     if "slippage" not in cols:
         conn.execute("ALTER TABLE trade_history ADD COLUMN slippage REAL")
+    for name, decl in (
+        ("pnl_mid", "REAL"),
+        ("pnl_fill", "REAL"),
+        ("entry_mid", "REAL"),
+        ("entry_ask", "REAL"),
+        ("exit_mid", "REAL"),
+        ("exit_bid", "REAL"),
+        ("fill_est", "INTEGER"),
+    ):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE trade_history ADD COLUMN {name} {decl}")
+    led_cols = {
+        str(r[1]) for r in conn.execute("PRAGMA table_info(portfolio_ledger)").fetchall()
+    }
+    if "total_realized_pnl_fill" not in led_cols:
+        conn.execute(
+            "ALTER TABLE portfolio_ledger ADD COLUMN total_realized_pnl_fill REAL "
+            "NOT NULL DEFAULT 0.0"
+        )
 
 
 def reset_book_for_tests() -> None:
     """Test helper — clear in-process peak-deployed session."""
     _book["session_date"] = None
     _book["start_realized"] = 0.0
+    _book["start_realized_fill"] = 0.0
     _book["open_cost"] = 0.0
     _book["peak_deployed"] = 0.0
+    try:
+        fill_accounting.reset_session_for_tests()
+    except Exception:
+        pass
 
 
 def _chicago_date_str() -> str:
@@ -129,12 +155,13 @@ def ensure_session_book() -> None:
     open_cost = _deployed_from_open_trades()
     _book["session_date"] = day
     _book["start_realized"] = float(port.get("total_realized_pnl") or 0.0)
+    _book["start_realized_fill"] = float(port.get("total_realized_pnl_fill") or 0.0)
     _book["open_cost"] = open_cost
     _book["peak_deployed"] = open_cost
 
 
 def open_mark_value() -> float:
-    """Mark-to-market of open lots: last_mark (else entry) × 100 × qty."""
+    """Mark-to-market of open lots at BID (fallback last_mark / entry)."""
     try:
         from tracker_agent import load_active_trades
         trades = load_active_trades() or []
@@ -145,7 +172,9 @@ def open_mark_value() -> float:
         if not isinstance(t, dict):
             continue
         try:
-            mark = t.get("last_mark")
+            mark = t.get("last_bid")
+            if mark is None:
+                mark = t.get("last_mark")
             if mark is None:
                 mark = t.get("entry_price") or t.get("entry_premium")
             mark = float(mark)
@@ -156,6 +185,43 @@ def open_mark_value() -> float:
         qty = resolve_quantity(t)
         total += mark * CONTRACT_MULTIPLIER * qty
     return total
+
+
+def open_entry_ask_cost() -> float:
+    """Open lots priced at entry_ask (fallback entry mid) × 100 × qty."""
+    try:
+        from tracker_agent import load_active_trades
+        trades = load_active_trades() or []
+    except Exception:
+        return 0.0
+    total = 0.0
+    for t in trades:
+        if not isinstance(t, dict):
+            continue
+        try:
+            ask = t.get("entry_ask")
+            if ask is None:
+                ask = t.get("entry_price") or t.get("entry_premium")
+            ask = float(ask)
+        except (TypeError, ValueError):
+            continue
+        if ask <= 0:
+            continue
+        qty = resolve_quantity(t)
+        total += ask * CONTRACT_MULTIPLIER * qty
+    return total
+
+
+def fill_equity() -> float:
+    """
+    Fill-series account value: start + lifetime fill P&L + open (bid − ask) MTM.
+
+    This is the number SESSION/BOOK equity reports. Triggers still fire on mid.
+    """
+    port = get_portfolio()
+    start = starting_buying_power()
+    fill_realized = float(port.get("total_realized_pnl_fill") or 0.0)
+    return start + fill_realized + open_mark_value() - open_entry_ask_cost()
 
 
 def _deployed_from_open_trades() -> float:
@@ -199,19 +265,20 @@ def format_book_line() -> str:
     """
     BOOK: start 10,000 | peak deployed X | realized +/-Y | open value Y | equity Z
 
-    equity = buying_power (cash) + open mark value. That is account value.
+    realized and equity are the FILL series. Open value is BID, not mid.
+    Buying-power debit/credit for subsequent entries still uses mid, so
+    this line does not change who gets in.
     """
     ensure_session_book()
     port = get_portfolio()
     start = starting_buying_power()
     peak = float(_book.get("peak_deployed") or 0.0)
     peak = max(peak, _deployed_from_open_trades())
-    realized = float(port.get("total_realized_pnl") or 0.0) - float(
-        _book.get("start_realized") or 0.0
+    realized = float(port.get("total_realized_pnl_fill") or 0.0) - float(
+        _book.get("start_realized_fill") or 0.0
     )
-    bp = float(port.get("buying_power") or 0.0)
     open_val = open_mark_value()
-    equity = bp + open_val
+    equity = fill_equity()
     return (
         f"BOOK: start {start:,.0f} | peak deployed {peak:,.0f} | "
         f"realized {realized:+,.0f} | open value {open_val:,.0f} | "
@@ -233,7 +300,8 @@ def ensure_ledger() -> None:
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 buying_power REAL NOT NULL,
                 total_realized_pnl REAL NOT NULL,
-                updated_at TEXT
+                updated_at TEXT,
+                total_realized_pnl_fill REAL NOT NULL DEFAULT 0.0
             )
             """
         )
@@ -265,8 +333,9 @@ def ensure_ledger() -> None:
             conn.execute(
                 """
                 INSERT INTO portfolio_ledger
-                    (id, buying_power, total_realized_pnl, updated_at)
-                VALUES (1, ?, 0.0, ?)
+                    (id, buying_power, total_realized_pnl, updated_at,
+                     total_realized_pnl_fill)
+                VALUES (1, ?, 0.0, ?, 0.0)
                 """,
                 (seed, now),
             )
@@ -355,8 +424,9 @@ def reset_ledger_now() -> dict[str, Any]:
         conn.execute(
             """
             INSERT INTO portfolio_ledger
-                (id, buying_power, total_realized_pnl, updated_at)
-            VALUES (1, ?, 0.0, ?)
+                (id, buying_power, total_realized_pnl, updated_at,
+                 total_realized_pnl_fill)
+            VALUES (1, ?, 0.0, ?, 0.0)
             """,
             (seed, now),
         )
@@ -413,12 +483,12 @@ def reset_ledger_if_requested() -> dict[str, Any] | None:
 
 
 def get_portfolio() -> dict[str, float]:
-    """Return current buying_power and total_realized_pnl."""
+    """Return current buying_power and realized P&L (mid + fill)."""
     ensure_ledger()
     with _connect() as conn:
         row = conn.execute(
             """
-            SELECT buying_power, total_realized_pnl
+            SELECT buying_power, total_realized_pnl, total_realized_pnl_fill
             FROM portfolio_ledger WHERE id = 1
             """
         ).fetchone()
@@ -426,10 +496,16 @@ def get_portfolio() -> dict[str, float]:
         return {
             "buying_power": starting_buying_power(),
             "total_realized_pnl": 0.0,
+            "total_realized_pnl_fill": 0.0,
         }
+    try:
+        fill_realized = float(row["total_realized_pnl_fill"] or 0.0)
+    except (KeyError, TypeError, ValueError, IndexError):
+        fill_realized = 0.0
     return {
         "buying_power": float(row["buying_power"]),
         "total_realized_pnl": float(row["total_realized_pnl"]),
+        "total_realized_pnl_fill": fill_realized,
     }
 
 
@@ -668,10 +744,19 @@ def paper_buy(
     ticker = meta.get("ticker") or meta.get("symbol")
     direction = meta.get("direction") or "?"
 
+    # Selected-contract quotes. Debit stays on mid so sizing / later entries
+    # do not change. Fill series records the ask.
+    fill_stamp = fill_accounting.stamp_entry_quotes(
+        meta if isinstance(meta, dict) else None, premium
+    )
+    entry_ask = float(fill_stamp.get("entry_ask") or premium)
+
     # Paper vs. market: theoretical fill vs. displayed ask (observability only).
     # Does not change debit math — only records how far paper entry sat from ask.
     theoretical_slippage: float | None = None
     ask = _extract_ask(meta)
+    if ask is None:
+        ask = entry_ask if entry_ask != premium else None
     if ask is not None:
         theoretical_slippage = (premium - ask) * CONTRACT_MULTIPLIER * qty
         fp = _entry_fingerprint(ticker, direction, premium)
@@ -710,11 +795,17 @@ def paper_buy(
             print(f"[VirtualBroker] WARNING: slippage DB log failed: {slip_err}")
 
     note_session_open(cost)
+    try:
+        fill_accounting.note_entry()
+    except Exception:
+        pass
     print(
         f"[VirtualBroker] paper_buy "
         f"{ticker or meta.get('direction', '?')} "
         f"qty={qty} @ ${premium:.2f} → debit ${cost:.2f}; "
         f"buying_power ${buying_power:.2f} → ${new_bp:.2f}"
+        f" entry_ask=${entry_ask:.2f}"
+        f"{' fill=est' if fill_stamp.get('fill_est') else ''}"
     )
     event: dict[str, Any] = {
         "type": "EXECUTE",
@@ -729,6 +820,9 @@ def paper_buy(
         "ok": True,
         "cost": cost,
         "entry_price": premium,
+        "entry_mid": premium,
+        "entry_ask": entry_ask,
+        "fill_est": bool(fill_stamp.get("fill_est")),
         "quantity": qty,
         "buying_power": new_bp,
         "total_realized_pnl": realized,
@@ -745,15 +839,23 @@ def paper_sell(
     entry_price: float | int | None,
     notes: str | None = None,
     quantity: int | None = None,
+    exit_bid: float | int | None = None,
+    entry_ask: float | int | None = None,
+    fill_est: bool | None = None,
 ) -> dict[str, Any]:
     """
     Close a virtual long option:
-      * credit exit_price * 100 * qty back to buying_power
-      * realized PnL = (exit_price - entry_price) * 100 * qty
+      * credit exit_price (mid) * 100 * qty back to buying_power
+      * mid PnL = (exit_mid - entry_mid) * 100 * qty  (trigger series)
+      * fill PnL = (exit_bid - entry_ask) * 100 * qty (equity series)
       * append a row to trade_history
+
+    Buying-power credit stays on mid so subsequent entries/sizing do not
+    change. Equity / BOOK / SESSION track the fill series.
 
     notes: optional exit reason (e.g. EXIT:STOP_LOSS) for audit/analytics.
     quantity defaults to contract['quantity'] or 1.
+    Missing bid/ask fall back to mid and tag fill=est.
     """
     ensure_ledger()
     try:
@@ -766,10 +868,30 @@ def paper_sell(
         }
 
     qty = resolve_quantity(contract, quantity)
-    pnl = (exit_ - entry) * CONTRACT_MULTIPLIER * qty
+    meta = _contract_meta(contract)
+    ask_arg = entry_ask
+    if ask_arg is None:
+        ask_arg = fill_accounting.extract_ask(meta) if isinstance(meta, dict) else None
+        if ask_arg is None and isinstance(meta, dict):
+            ask_arg = meta.get("entry_ask")
+    bid_arg = exit_bid
+    if bid_arg is None:
+        bid_arg = fill_accounting.extract_bid(meta) if isinstance(meta, dict) else None
+    quotes = fill_accounting.resolve_fill_prices(
+        entry_mid=entry,
+        exit_mid=exit_,
+        entry_ask=ask_arg,
+        exit_bid=bid_arg,
+    )
+    if fill_est:
+        quotes["fill_est"] = True
+    pnl_mid = fill_accounting.pnl_dollars(exit_, entry, qty)
+    pnl_fill = fill_accounting.pnl_dollars(
+        quotes["exit_bid"], quotes["entry_ask"], qty
+    )
+    pnl = pnl_mid  # trigger/mid series; callers that read 'pnl' stay mid
     capital_back = exit_ * CONTRACT_MULTIPLIER * qty
     now = datetime.now(timezone.utc).isoformat()
-    meta = _contract_meta(contract)
 
     # Prefer explicit direction arg; fall back to contract fields
     dir_str = direction or meta.get("direction") or ""
@@ -788,13 +910,19 @@ def paper_sell(
 
     with _connect() as conn:
         row = conn.execute(
-            "SELECT buying_power, total_realized_pnl FROM portfolio_ledger WHERE id = 1"
+            "SELECT buying_power, total_realized_pnl, total_realized_pnl_fill "
+            "FROM portfolio_ledger WHERE id = 1"
         ).fetchone()
         if not row:
             return {"ok": False, "error": "portfolio_ledger missing after ensure"}
 
         new_bp = float(row["buying_power"]) + capital_back
-        new_pnl = float(row["total_realized_pnl"]) + pnl
+        new_pnl = float(row["total_realized_pnl"]) + pnl_mid
+        try:
+            old_fill = float(row["total_realized_pnl_fill"] or 0.0)
+        except (KeyError, TypeError, ValueError, IndexError):
+            old_fill = 0.0
+        new_pnl_fill = old_fill + pnl_fill
 
         # Attach buy-time theoretical slippage if we still have it cached.
         fp = _entry_fingerprint(ticker, dir_str, entry)
@@ -809,17 +937,20 @@ def paper_sell(
         conn.execute(
             """
             UPDATE portfolio_ledger
-            SET buying_power = ?, total_realized_pnl = ?, updated_at = ?
+            SET buying_power = ?, total_realized_pnl = ?,
+                total_realized_pnl_fill = ?, updated_at = ?
             WHERE id = 1
             """,
-            (new_bp, new_pnl, now),
+            (new_bp, new_pnl, new_pnl_fill, now),
         )
         conn.execute(
             """
             INSERT INTO trade_history
                 (closed_at, ticker, direction, strike, expiration,
-                 entry_price, exit_price, pnl, contract_json, notes, slippage)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 entry_price, exit_price, pnl, contract_json, notes, slippage,
+                 pnl_mid, pnl_fill, entry_mid, entry_ask, exit_mid, exit_bid,
+                 fill_est)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now,
@@ -829,19 +960,39 @@ def paper_sell(
                 str(expiration) if expiration else None,
                 entry,
                 exit_,
-                pnl,
+                pnl_mid,
                 json.dumps(meta, default=str) if meta else None,
                 notes,
                 slippage,
+                pnl_mid,
+                pnl_fill,
+                quotes["entry_mid"],
+                quotes["entry_ask"],
+                quotes["exit_mid"],
+                quotes["exit_bid"],
+                1 if quotes.get("fill_est") else 0,
             ),
         )
         conn.commit()
 
     note_session_close(entry * CONTRACT_MULTIPLIER * qty)
+    sl = None
+    if isinstance(meta, dict):
+        sl = meta.get("stop_loss")
+    planned = fill_accounting.planned_risk_dollars(entry, sl, qty)
+    try:
+        fill_accounting.note_close(
+            pnl_mid=pnl_mid, pnl_fill=pnl_fill, planned_risk=planned
+        )
+    except Exception:
+        pass
     print(
         f"[VirtualBroker] paper_sell {ticker or '?'} {dir_str} "
-        f"qty={qty} entry=${entry:.2f} exit=${exit_:.2f} PnL=${pnl:.2f}; "
-        f"buying_power → ${new_bp:.2f}, realized → ${new_pnl:.2f}"
+        f"qty={qty} entry=${entry:.2f} exit=${exit_:.2f} PnL=${pnl_mid:.2f}; "
+        f"pnl_fill=${pnl_fill:.2f}"
+        f"{' fill=est' if quotes.get('fill_est') else ''}; "
+        f"buying_power → ${new_bp:.2f}, realized_mid → ${new_pnl:.2f}, "
+        f"realized_fill → ${new_pnl_fill:.2f}"
         + (f"; slippage=${slippage:.2f}" if slippage is not None else "")
     )
     close_event: dict[str, Any] = {
@@ -855,13 +1006,21 @@ def paper_sell(
     ui_event_queue.put(close_event)
     result = {
         "ok": True,
-        "pnl": pnl,
+        "pnl": pnl_mid,
+        "pnl_mid": pnl_mid,
+        "pnl_fill": pnl_fill,
         "capital_back": capital_back,
         "entry_price": entry,
+        "entry_mid": quotes["entry_mid"],
+        "entry_ask": quotes["entry_ask"],
         "exit_price": exit_,
+        "exit_mid": quotes["exit_mid"],
+        "exit_bid": quotes["exit_bid"],
+        "fill_est": bool(quotes.get("fill_est")),
         "quantity": qty,
         "buying_power": new_bp,
         "total_realized_pnl": new_pnl,
+        "total_realized_pnl_fill": new_pnl_fill,
     }
     if slippage is not None:
         result["slippage"] = slippage

@@ -28,6 +28,7 @@ from datetime import date, datetime, time, timezone
 from typing import Any
 
 import config
+import fill_accounting
 import virtual_broker
 
 try:
@@ -138,10 +139,10 @@ def mark_eod_book_done(session_day: date | None = None) -> None:
 
 def maybe_emit_eod_book(now_cdt: datetime | None = None) -> str | None:
     """
-    Once per Chicago session, at/after 14:45 flatten: Discord BOOK line.
+    Once per Chicago session, at/after 14:45 flatten: Discord BOOK + SESSION.
 
-    BOOK: start 10,000 | peak deployed X | realized +/-Y | end Z
-    Fires even if the book is already flat (the number we care about).
+    BOOK equity and SESSION realized/equity are the FILL series.
+    Open value is BID. SESSION supplements BOOK; both fire.
     """
     now = _chicago_now(now_cdt)
     if not is_eod_flatten_window(now):
@@ -153,11 +154,26 @@ def maybe_emit_eod_book(now_cdt: datetime | None = None) -> str | None:
     except Exception as e:
         print(f"[Exits] BOOK line failed: {e}")
         return None
+    try:
+        peak = float(virtual_broker._book.get("peak_deployed") or 0.0)
+        peak = max(peak, virtual_broker._deployed_from_open_trades())
+        session_line = fill_accounting.format_session_line(
+            equity_fill=virtual_broker.fill_equity(),
+            peak_deployed=peak,
+            open_value=virtual_broker.open_mark_value(),
+            now=now,
+        )
+    except Exception as e:
+        print(f"[Exits] SESSION line failed: {e}")
+        session_line = None
     mark_eod_book_done(now.date())
     print(f"[Exits] {line}")
+    if session_line:
+        print(f"[Exits] {session_line}")
     try:
         import broadcaster
-        broadcaster.send_discord_alert(line)
+        payload = line if not session_line else f"{line}\n{session_line}"
+        broadcaster.send_discord_alert(payload)
     except Exception as e:
         print(f"[Exits] BOOK Discord warn: {e}")
     return line
@@ -360,7 +376,12 @@ def run_morning_carry_review(
                 prev_peak = _f(trade.get("peak_pnl_pct"))
                 if prev_peak is None or pnl > prev_peak:
                     trade["peak_pnl_pct"] = pnl
+                prev_trough = _f(trade.get("trough_pnl_pct"))
+                if prev_trough is None or pnl < prev_trough:
+                    trade["trough_pnl_pct"] = pnl
                 trade["last_mark"] = mark
+                trade["last_bid"] = mark_info.get("bid")
+                trade["last_ask"] = mark_info.get("ask")
                 trade["last_mark_at"] = datetime.now(timezone.utc).isoformat()
                 try:
                     from tracker_agent import save_active_trade
@@ -787,11 +808,30 @@ def close_open_position(
     direction = _trade_direction(trade) or None
     ticker = trade.get("ticker") or "?"
     qty = virtual_broker.resolve_quantity(trade)
+    # Trigger price is mid (exit_price). Fill uses last bid / entry ask.
+    # A stop still fires when mark <= SL; only the recorded fill changes.
+    entry_ask = _f(trade.get("entry_ask"))
+    if entry_ask is None:
+        entry_ask = fill_accounting.extract_ask(trade)
+    exit_bid = _f(trade.get("last_bid"))
+    if exit_bid is None:
+        exit_bid = fill_accounting.extract_bid(trade)
+    quotes = fill_accounting.resolve_fill_prices(
+        entry_mid=float(entry) if entry is not None else float(exit_price),
+        exit_mid=float(exit_price),
+        entry_ask=entry_ask,
+        exit_bid=exit_bid,
+    )
     result: dict[str, Any] = {
         "ticker": ticker,
         "reason": reason,
         "exit_price": exit_price,
         "entry_price": entry,
+        "entry_mid": quotes["entry_mid"],
+        "entry_ask": quotes["entry_ask"],
+        "exit_mid": quotes["exit_mid"],
+        "exit_bid": quotes["exit_bid"],
+        "fill_est": bool(quotes.get("fill_est")),
         "quantity": qty,
         "ok": False,
     }
@@ -803,11 +843,16 @@ def close_open_position(
             entry,
             notes=f"EXIT:{reason}",
             quantity=qty,
+            exit_bid=quotes["exit_bid"],
+            entry_ask=quotes["entry_ask"],
+            fill_est=bool(quotes.get("fill_est")),
         )
         result["sell"] = sell
         result["ok"] = bool(sell.get("ok"))
         if sell.get("pnl") is not None:
             result["pnl"] = sell["pnl"]
+        result["pnl_mid"] = sell.get("pnl_mid", sell.get("pnl"))
+        result["pnl_fill"] = sell.get("pnl_fill")
         if "STOP_LOSS" in str(reason):
             stats = stop_loss_slippage(trade, exit_price, sell.get("pnl"))
             if stats:
@@ -857,7 +902,41 @@ def close_open_position(
     print(
         f"[Exits] CLOSED {ticker} reason={reason} "
         f"exit=${exit_price:.4f} entry={entry} qty={qty} ok={result.get('ok')}"
+        f" pnl_mid={result.get('pnl_mid')} pnl_fill={result.get('pnl_fill')}"
+        f"{' fill=est' if result.get('fill_est') else ''}"
     )
+    try:
+        planned = result.get("planned_risk")
+        if planned is None:
+            planned = fill_accounting.planned_risk_dollars(
+                result.get("entry_mid") or entry,
+                trade.get("stop_loss"),
+                qty,
+            )
+            if planned is not None:
+                result["planned_risk"] = planned
+        trade_line = fill_accounting.format_trade_line(
+            trade,
+            reason=reason,
+            entry_mid=result.get("entry_mid") or entry,
+            entry_ask=result.get("entry_ask"),
+            exit_mid=result.get("exit_mid") or exit_price,
+            exit_bid=result.get("exit_bid"),
+            qty=qty,
+            pnl_mid=result.get("pnl_mid") if result.get("pnl_mid") is not None else result.get("pnl"),
+            pnl_fill=result.get("pnl_fill"),
+            planned_risk=planned,
+            fill_est=bool(result.get("fill_est")),
+        )
+        result["trade_line"] = trade_line
+        print(f"[Exits] {trade_line}")
+        try:
+            import broadcaster
+            broadcaster.send_discord_alert(trade_line)
+        except Exception as disc_err:
+            print(f"[Exits] TRADE Discord warn: {disc_err}")
+    except Exception as trade_err:
+        print(f"[Exits] TRADE line failed for {ticker}: {trade_err}")
     return result
 
 
@@ -1065,13 +1144,18 @@ def run_scan_exits(
                 trade, mark_info, live_score=live_score, scan_id=scan_id
             ):
                 summary["marks_recorded"] += 1
-            # Track peak for B5
+            # Track peak/trough for B5 + TRADE mfe/mae. last_bid is BOOK mark.
             pnl = _pnl_pct(entry, mark)
             if pnl is not None:
                 prev_peak = _f(trade.get("peak_pnl_pct"))
                 if prev_peak is None or pnl > prev_peak:
                     trade["peak_pnl_pct"] = pnl
+                prev_trough = _f(trade.get("trough_pnl_pct"))
+                if prev_trough is None or pnl < prev_trough:
+                    trade["trough_pnl_pct"] = pnl
                 trade["last_mark"] = mark
+                trade["last_bid"] = mark_info.get("bid")
+                trade["last_ask"] = mark_info.get("ask")
                 trade["last_mark_at"] = datetime.now(timezone.utc).isoformat()
             try:
                 from tracker_agent import save_active_trade

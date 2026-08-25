@@ -304,6 +304,8 @@ def record_executed_trade(ticker, contract, scan_id=None, card=None, pivot_data=
         "days_to_expiration": contract.get("days_to_expiration"),
         "implied_volatility": contract.get("implied_volatility"),
         "bid_ask_spread_pct": contract.get("bid_ask_spread_pct"),
+        "bid": contract.get("bid"),
+        "ask": contract.get("ask"),
         "quantity": int(contract.get("quantity") or 1),
     }
 
@@ -346,6 +348,10 @@ def record_executed_trade(ticker, contract, scan_id=None, card=None, pivot_data=
         "direction": contract.get("direction"),
         "entry_price": entry_price,
         "entry_premium": entry_price,
+        "entry_mid": contract.get("entry_mid") or entry_price,
+        "entry_ask": contract.get("entry_ask") or contract.get("ask"),
+        "bid": contract.get("bid"),
+        "ask": contract.get("ask"),
         "entry_timestamp": entry_time,
         "entry_time": entry_time,
         "strike": contract.get("strike"),
@@ -1423,8 +1429,13 @@ def run_macro_loop():
     except Exception as reset_err:
         print(f"[System] WARNING: ledger reset failed: {reset_err}")
     # Resolved Part C knobs (env at process start — restart to retune without code change)
+    try:
+        import fill_accounting as _fa
+        _boot_ver = _fa.code_version()
+    except Exception:
+        _boot_ver = "vn/a"
     print(
-        f"[EntryFilters] MIN_DTE={config.MIN_DTE} "
+        f"[EntryFilters] {_boot_ver} MIN_DTE={config.MIN_DTE} "
         f"REQUIRED_MOVE_ATR_K={config.REQUIRED_MOVE_ATR_K} "
         f"EXIT_MAX_DECAY_DENSITY={config.EXIT_MAX_DECAY_DENSITY}%/hr "
         f"MAX_CONTRACT_SPREAD_PCT={config.MAX_CONTRACT_SPREAD_PCT}% "
@@ -1503,8 +1514,13 @@ def run_macro_loop():
     try:
         hook = "set" if (config.DISCORD_WEBHOOK or broadcaster.WEBHOOK_URL) else "MISSING"
         boot_clock = cdt_clock_str(datetime.now(cdt_tz) if cdt_tz else datetime.now())
+        try:
+            import fill_accounting as _fa
+            boot_ver = _fa.code_version()
+        except Exception:
+            boot_ver = "vn/a"
         boot_msg = (
-            f"🟢 **BOT UP** {boot_clock} CDT | webhook={hook} | "
+            f"🟢 **BOT UP** {boot_ver} {boot_clock} CDT | webhook={hook} | "
             f"score=T+S | spread_cap={getattr(config, 'MAX_CONTRACT_SPREAD_PCT', 8)}%"
         )
         print(f"[System] {boot_msg}")
