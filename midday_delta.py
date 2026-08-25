@@ -163,8 +163,12 @@ def macro_vector_local(ticker: str) -> str:
         return "SUPPLY_CHAIN_BOTTLENECK: Detected supply-chain / tariff friction (local scan)."
     if "rate cut" in low or "subsidize" in low or "subsidy" in low:
         return "EXPANSIONARY_TAILWIND: Accommodative / subsidy signals (local scan)."
-    if "earnings scheduled" in low or "earnings" in low:
-        return "EARNINGS_IMMINENT: Earnings-related catalyst in hub (local scan)."
+    try:
+        import earnings_blackout
+        if earnings_blackout.is_earnings_imminent(ticker):
+            return "EARNINGS_IMMINENT: Print is inside the bounded earnings window."
+    except Exception as e:
+        print(f"[midday] earnings_imminent check failed {ticker}: {e}")
     return "Neutral macroeconomic backdrop. No critical tailwinds or bottlenecks detected."
 
 

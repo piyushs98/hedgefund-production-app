@@ -246,6 +246,10 @@ EARNINGS_BLACKOUT = os.environ.get("EARNINGS_BLACKOUT", "") or ""
 BLACKOUT_DAYS_BEFORE = _env_int("BLACKOUT_DAYS_BEFORE", 1)
 BLACKOUT_DAYS_AFTER = _env_int("BLACKOUT_DAYS_AFTER", 1)
 EARNINGS_FLATTEN_SPANNING = _env_bool("EARNINGS_FLATTEN_SPANNING", True)
+# Extra calendar days before blackout in which EARNINGS_IMMINENT may tag S.
+# Window = [print − (BEFORE + EXTRA), print + AFTER]. Default EXTRA=3
+# → NVDA 2026-08-26 tags Aug 22–27, not every remaining session this year.
+EARNINGS_IMMINENT_EXTRA_DAYS = _env_int("EARNINGS_IMMINENT_EXTRA_DAYS", 3)
 
 # Midday macro meeting (11:00 CDT). DeepSeek primary; Gemini reserved for
 # pre-market. 20s was tight for free-tier Flash at US midday; the note is

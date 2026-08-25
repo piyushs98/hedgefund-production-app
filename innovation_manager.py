@@ -29,8 +29,12 @@ def generate_macro_catalyst_vector_local(ticker, innovation_data=None):
         return "SUPPLY_CHAIN_BOTTLENECK: Detected critical hardware component delays from Shenzhen."
     if "rate cut" in low or "subsidize" in low or "subsidy" in low:
         return "EXPANSIONARY_TAILWIND: Federal Reserve signals accommodative policy."
-    if "earnings scheduled" in low or "earnings" in low:
-        return "EARNINGS_IMMINENT: Catalyst event pending shortly."
+    try:
+        import earnings_blackout
+        if earnings_blackout.is_earnings_imminent(ticker):
+            return "EARNINGS_IMMINENT: Print is inside the bounded earnings window."
+    except Exception:
+        pass
     return "Neutral macroeconomic backdrop. No critical tailwinds or bottlenecks detected."
 
 

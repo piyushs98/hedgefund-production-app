@@ -747,6 +747,11 @@ def run_night_harvest():
         scrape_china_macro(TICKERS)
         scrape_earnings_calendar(TICKERS)
         clear_expired_news()
+        try:
+            from news_memory import purge_synthetic_innovation_rows
+            purge_synthetic_innovation_rows()
+        except Exception as purge_err:
+            print(f"[System] synthetic innovation purge warn: {purge_err}")
     except Exception as err:
         print(f"❌ Scraper error in night harvest: {err}")
 
@@ -1437,6 +1442,11 @@ def run_macro_loop():
         earnings_blackout.log_config()
     except Exception as earn_err:
         print(f"[Earnings] config unavailable: {earn_err}")
+    try:
+        from news_memory import purge_synthetic_innovation_rows
+        purge_synthetic_innovation_rows()
+    except Exception as purge_err:
+        print(f"[System] synthetic innovation purge warn: {purge_err}")
     print(
         f"[SessionCutoffs] EXIT_EOD_FLATTEN_CDT="
         f"{config.EXIT_EOD_FLATTEN_HOUR:02d}:{config.EXIT_EOD_FLATTEN_MINUTE:02d} "

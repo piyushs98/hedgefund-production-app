@@ -238,6 +238,46 @@ def list_innovation_data(source_tag=None, days=90):
     return rows
 
 
+# Synthesized generators. Never delete EARNINGS (real Yahoo calendar).
+SYNTHETIC_INNOVATION_TAGS = ("CHINA_MACRO", "GOV_POLICY")
+
+
+def purge_synthetic_innovation_rows():
+    """
+    Delete leftover CHINA_MACRO / GOV_POLICY rows from innovation_data.
+
+    Those tags were written by random.choice generators, not fetches.
+    EARNINGS rows are not touched.
+    Returns (deleted_count, tags_removed).
+    """
+    init_db()
+    deleted = 0
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+            cursor = conn.cursor()
+            placeholders = ",".join("?" * len(SYNTHETIC_INNOVATION_TAGS))
+            cursor.execute(
+                f"SELECT source_tag, COUNT(*) FROM innovation_data "
+                f"WHERE source_tag IN ({placeholders}) GROUP BY source_tag",
+                SYNTHETIC_INNOVATION_TAGS,
+            )
+            by_tag = {str(t): int(n) for t, n in cursor.fetchall()}
+            cursor.execute(
+                f"DELETE FROM innovation_data WHERE source_tag IN ({placeholders})",
+                SYNTHETIC_INNOVATION_TAGS,
+            )
+            deleted = cursor.rowcount if cursor.rowcount is not None else 0
+            conn.commit()
+            print(
+                f"[Memory Master] purged synthetic innovation_data: "
+                f"deleted={deleted} by_tag={by_tag or '{}'} "
+                f"(kept EARNINGS)"
+            )
+    except sqlite3.Error as e:
+        print(f"[Memory Master] SQLite error purging synthetic innovation: {e}")
+    return deleted, SYNTHETIC_INNOVATION_TAGS
+
+
 def clear_expired_news():
     """
     Housekeeping function to delete all news articles older than 90 days.

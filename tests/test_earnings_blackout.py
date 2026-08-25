@@ -54,6 +54,16 @@ class TestParseAndWindow(unittest.TestCase):
         self.assertFalse(eb.is_blacked_out("NVDA", date(2026, 8, 28)))
         self.assertFalse(eb.is_blacked_out("AAPL", date(2026, 8, 26)))
 
+    def test_earnings_imminent_is_bounded_not_forever(self):
+        # BEFORE=1 EXTRA=3 AFTER=1 → Aug 22–27 for print Aug 26
+        self.assertFalse(eb.is_earnings_imminent("NVDA", date(2026, 8, 21)))
+        self.assertTrue(eb.is_earnings_imminent("NVDA", date(2026, 8, 22)))
+        self.assertTrue(eb.is_earnings_imminent("NVDA", date(2026, 8, 24)))
+        self.assertTrue(eb.is_earnings_imminent("NVDA", date(2026, 8, 26)))
+        self.assertTrue(eb.is_earnings_imminent("NVDA", date(2026, 8, 27)))
+        self.assertFalse(eb.is_earnings_imminent("NVDA", date(2026, 8, 28)))
+        self.assertFalse(eb.is_earnings_imminent("AAPL", date(2026, 8, 26)))
+
     def test_window_respects_before_after(self):
         with mock.patch.object(config, "BLACKOUT_DAYS_BEFORE", 2):
             with mock.patch.object(config, "BLACKOUT_DAYS_AFTER", 0):
@@ -323,6 +333,26 @@ class TestGovPolicyScraperDisabled(unittest.TestCase):
             scrape_gov_policy(["SPY", "AAPL", "NVDA"])
         save.assert_not_called()
 
+    def test_macro_vector_does_not_tag_unbounded_earnings_keyword(self):
+        import midday_delta
+        leftover = (
+            "- [t] [EARNINGS] Corporate Earnings Scheduled for 2026-11-18\n"
+        )
+        eb.reset_for_tests()
+        eb.set_calendar_for_tests(
+            {"NVDA": date(2026, 11, 18)},
+            {"NVDA": "scraper"},
+        )
+        with mock.patch.object(
+            midday_delta, "get_innovation_context", return_value=leftover
+        ):
+            # Aug 24 is months before the Nov print — no EARNINGS_IMMINENT
+            with mock.patch.object(
+                eb, "session_date_for", return_value=date(2026, 8, 24)
+            ):
+                vec = midday_delta.macro_vector_local("NVDA")
+        self.assertNotIn("EARNINGS_IMMINENT", vec)
+
     def test_macro_vector_ignores_leftover_gov_and_china(self):
         import midday_delta
         leftover = (
@@ -335,6 +365,43 @@ class TestGovPolicyScraperDisabled(unittest.TestCase):
             vec = midday_delta.macro_vector_local("AAPL")
         self.assertNotIn("EXPANSIONARY_TAILWIND", vec)
         self.assertNotIn("SUPPLY_CHAIN_BOTTLENECK", vec)
+
+
+class TestPurgeSyntheticInnovation(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, "news.db")
+        self.db_patch = mock.patch.object(news_memory, "DB_PATH", self.db)
+        self.cfg_patch = mock.patch.object(config, "NEWS_DB_PATH", self.db)
+        self.db_patch.start()
+        self.cfg_patch.start()
+        news_memory.init_db()
+
+    def tearDown(self):
+        self.db_patch.stop()
+        self.cfg_patch.stop()
+        self.tmp.cleanup()
+
+    def test_deletes_china_and_gov_keeps_earnings(self):
+        news_memory.save_innovation_data(
+            "NVDA", "CHINA_MACRO",
+            "Severe supply-chain bottlenecks detected at Shenzhen ports",
+        )
+        news_memory.save_innovation_data(
+            "AAPL", "GOV_POLICY",
+            "Federal Reserve signals potential rate cut in Q3",
+        )
+        news_memory.save_innovation_data(
+            "NVDA", "EARNINGS",
+            "Corporate Earnings Scheduled for 2026-08-26",
+        )
+        deleted, tags = news_memory.purge_synthetic_innovation_rows()
+        self.assertEqual(deleted, 2)
+        self.assertEqual(tags, ("CHINA_MACRO", "GOV_POLICY"))
+        rows = news_memory.list_innovation_data(days=365)
+        tags_left = {r[2] for r in rows}
+        self.assertEqual(tags_left, {"EARNINGS"})
+        self.assertEqual(rows[0][1], "NVDA")
 
 
 if __name__ == "__main__":

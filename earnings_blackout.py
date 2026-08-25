@@ -195,6 +195,31 @@ def is_blacked_out(
     return start <= sess <= end
 
 
+def earnings_imminent_window(print_on: date) -> tuple[date, date]:
+    """Score-tag window: a few extra days before blackout, same end as blackout."""
+    before = max(0, int(getattr(config, "BLACKOUT_DAYS_BEFORE", 1)))
+    after = max(0, int(getattr(config, "BLACKOUT_DAYS_AFTER", 1)))
+    extra = max(0, int(getattr(config, "EARNINGS_IMMINENT_EXTRA_DAYS", 3)))
+    return print_on - timedelta(days=before + extra), print_on + timedelta(days=after)
+
+
+def is_earnings_imminent(
+    ticker: str,
+    when: date | datetime | None = None,
+) -> bool:
+    """
+    True when S may take the EARNINGS_IMMINENT haircut/boost.
+
+    Not a keyword match on any stored print date — only around the print.
+    """
+    print_on = print_date_for(ticker)
+    if print_on is None:
+        return False
+    sess = session_date_for(when)
+    start, end = earnings_imminent_window(print_on)
+    return start <= sess <= end
+
+
 def should_flatten_trade(
     trade: dict[str, Any],
     sess: date | None = None,
@@ -235,6 +260,8 @@ def log_config() -> None:
         f"[Earnings] BLACKOUT_DAYS_BEFORE={before} "
         f"BLACKOUT_DAYS_AFTER={after} "
         f"EARNINGS_FLATTEN_SPANNING={flatten} "
+        f"EARNINGS_IMMINENT_EXTRA_DAYS="
+        f"{getattr(config, 'EARNINGS_IMMINENT_EXTRA_DAYS', 3)} "
         f"EARNINGS_BLACKOUT={env_raw}"
     )
     if not cal:
