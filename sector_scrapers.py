@@ -146,24 +146,39 @@ def fetch_overnight_futures():
                 if current_price and prev_close:
                     pct_change = ((current_price - prev_close) / prev_close) * 100.0
                     
-            # Fallback to history calculations
+            # History as last real source — never invent 0.00%.
             if pct_change is None:
                 hist = ticker.history(period="1d")
                 if not hist.empty:
                     current_price = hist["Close"].iloc[-1]
-                    prev_close = ticker.info.get("previousClose") or current_price
-                    pct_change = ((current_price - prev_close) / prev_close) * 100.0
-                    
-            pct_change = float(pct_change) if pct_change is not None else 0.0
-            current_price = float(current_price) if current_price is not None else 0.0
-            
-            # Format headline summary
+                    prev_close = ticker.info.get("previousClose")
+                    if current_price and prev_close:
+                        pct_change = ((current_price - prev_close) / prev_close) * 100.0
+
+            if pct_change is None or current_price is None:
+                print(
+                    f"[Employee] Futures Scraper: {name} ({symbol}) — "
+                    "no live % or price; writing nothing."
+                )
+                continue
+
+            pct_change = float(pct_change)
+            current_price = float(current_price)
+            if current_price <= 0:
+                print(
+                    f"[Employee] Futures Scraper: {name} ({symbol}) — "
+                    "non-positive price; writing nothing."
+                )
+                continue
+
             direction = "UP" if pct_change >= 0 else "DOWN"
-            title = f"{name} is trending {direction} by {pct_change:+.2f}% (Price: ${current_price:,.2f})"
-            publisher = "Yahoo Finance"
-            
-            # Save into the SQLite headlines table
-            saved = save_headline(symbol, "Macro", publisher, title, sentiment_score=pct_change)
+            title = (
+                f"{name} is trending {direction} by {pct_change:+.2f}% "
+                f"(Price: ${current_price:,.2f})"
+            )
+            saved = save_headline(
+                symbol, "Macro", "Yahoo Finance", title, sentiment_score=pct_change
+            )
             if saved:
                 count += 1
                 print(f"[Employee] Futures Scraper: Saved {name} pre-market headline.")

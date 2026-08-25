@@ -316,5 +316,26 @@ class TestChinaScraperDisabled(unittest.TestCase):
         save.assert_not_called()
 
 
+class TestGovPolicyScraperDisabled(unittest.TestCase):
+    def test_does_not_write_innovation_data(self):
+        from gov_policy_scraper import scrape_gov_policy
+        with mock.patch("news_memory.save_innovation_data") as save:
+            scrape_gov_policy(["SPY", "AAPL", "NVDA"])
+        save.assert_not_called()
+
+    def test_macro_vector_ignores_leftover_gov_and_china(self):
+        import midday_delta
+        leftover = (
+            "- [t] [GOV_POLICY] Federal Reserve signals potential rate cut in Q3\n"
+            "- [t] [CHINA_MACRO] Severe supply-chain bottlenecks detected at Shenzhen ports\n"
+        )
+        with mock.patch.object(
+            midday_delta, "get_innovation_context", return_value=leftover
+        ):
+            vec = midday_delta.macro_vector_local("AAPL")
+        self.assertNotIn("EXPANSIONARY_TAILWIND", vec)
+        self.assertNotIn("SUPPLY_CHAIN_BOTTLENECK", vec)
+
+
 if __name__ == "__main__":
     unittest.main()

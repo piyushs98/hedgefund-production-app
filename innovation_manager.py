@@ -19,6 +19,7 @@ def generate_macro_catalyst_vector_local(ticker, innovation_data=None):
     kept = [
         ln for ln in (innovation_data or "").splitlines()
         if "[CHINA_MACRO]" not in ln.upper()
+        and "[GOV_POLICY]" not in ln.upper()
     ]
     innovation_data = "\n".join(kept)
     if not innovation_data.strip():

@@ -148,11 +148,12 @@ def macro_vector_local(ticker: str) -> str:
     innovation_data = get_innovation_context(ticker, days=7) or ""
     if not innovation_data.strip():
         return "No specific macro or supply-chain catalysts identified for this ticker."
-    # CHINA_MACRO rows were synthesized (random Shenzhen/tariff lines).
-    # Ignore leftovers so they cannot keep tagging S after the scraper was disabled.
+    # CHINA_MACRO / GOV_POLICY rows were synthesized. Ignore leftovers so
+    # they cannot keep tagging S after those scrapers were disabled.
     kept = [
         ln for ln in innovation_data.splitlines()
         if "[CHINA_MACRO]" not in ln.upper()
+        and "[GOV_POLICY]" not in ln.upper()
     ]
     innovation_data = "\n".join(kept)
     if not innovation_data.strip():
