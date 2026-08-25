@@ -16,6 +16,13 @@ def generate_macro_catalyst_vector_local(ticker, innovation_data=None):
         innovation_data = get_innovation_context(ticker, days=7) or ""
     if not (innovation_data or "").strip():
         return "No specific macro or supply-chain catalysts identified for this ticker."
+    kept = [
+        ln for ln in (innovation_data or "").splitlines()
+        if "[CHINA_MACRO]" not in ln.upper()
+    ]
+    innovation_data = "\n".join(kept)
+    if not innovation_data.strip():
+        return "No specific macro or supply-chain catalysts identified for this ticker."
     low = innovation_data.lower()
     if "supply-chain bottlenecks" in low or "bottleneck" in low:
         return "SUPPLY_CHAIN_BOTTLENECK: Detected critical hardware component delays from Shenzhen."

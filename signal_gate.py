@@ -324,8 +324,15 @@ class SignalGate:
                 import earnings_blackout
                 if earnings_blackout.is_blacked_out(ticker, now):
                     block_reason = "earnings_blackout"
-            except Exception:
-                pass
+            except Exception as be:
+                # Fail closed: a lookup miss must not admit into an earnings gap.
+                block_reason = "blackout_check_failed"
+                print(f"REJECT {ticker}:blackout_check_failed ({be})")
+                try:
+                    import earnings_blackout as _eb
+                    _eb.alert_blackout_check_failed(ticker, be)
+                except Exception as alert_err:
+                    print(f"[Gate] blackout_check_failed CRITICAL send warn: {alert_err}")
 
             # Scorer hard blocks (dead zone, etc.) — distinct GATE reason, reset streak
             if block_reason:
@@ -428,6 +435,9 @@ def _compact_reason(reason: str) -> str:
         "no_momentum_data",
         "dead_zone",
         "earnings_blackout",
+        "blackout_check_failed",
+        "no_pivot_data",
+        "no_atr_data",
     ):
         return r
     if "no_liq_data" in r or "no liq" in r:
@@ -440,6 +450,12 @@ def _compact_reason(reason: str) -> str:
         return "dead_zone"
     if "earnings_blackout" in r or "earnings blackout" in r:
         return "earnings_blackout"
+    if "blackout_check_failed" in r:
+        return "blackout_check_failed"
+    if "no_pivot_data" in r:
+        return "no_pivot_data"
+    if "no_atr_data" in r:
+        return "no_atr_data"
     if "same_scan" in r:
         return "same_scan"
     if "post_exit" in r:

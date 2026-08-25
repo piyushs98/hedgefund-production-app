@@ -347,7 +347,20 @@ def score_technical(
             except (TypeError, ValueError):
                 atr = None
         if atr is None or atr <= 0:
-            atr = abs(close) * 0.012 if close else 1.0
+            # Do not invent 1.2% of spot. Caller must hard-PASS no_atr_data.
+            metrics.update({
+                "atr": None,
+                "atr_missing": True,
+                "pivot_sub": 0.0,
+                "mom_sub": None,
+                "drift_sub": None,
+                "vol_mult": None,
+                "tech_raw": 0.0,
+                "atr_distance": None,
+                "atr_distance_signed": None,
+            })
+            reasons.append("no_atr_data — refusing fabricated ATR")
+            return 0.0, metrics, reasons, None
 
     dist_signed = sign * (close - pivot) / atr if atr else 0.0
     dist_abs = abs(close - pivot) / atr if atr else 0.0
@@ -520,7 +533,10 @@ def score_sentiment(headlines_text, macro_vector="", futures_pct=None, direction
 
 # Scorer-level hard blocks (gate compact tags). Priority high → low.
 # Liquidity is no longer a score block — Part C rejects the chosen contract.
+# no_pivot_data / no_atr_data: missing market data — never invent a score.
 _BLOCK_PRIORITY = (
+    "no_pivot_data",
+    "no_atr_data",
     "no_momentum_data",
     "dead_zone",
 )
@@ -534,6 +550,67 @@ def _pick_block_reason(*candidates: str | None) -> str | None:
         if c:
             return c
     return None
+
+
+def _pivot_unusable(pivot_data) -> str | None:
+    """None if close/pivot are real positives. Else no_pivot_data."""
+    if not isinstance(pivot_data, dict):
+        return "no_pivot_data"
+    err = pivot_data.get("error")
+    if err:
+        return "no_pivot_data"
+    try:
+        close = float(pivot_data.get("close"))
+        pivot = float(pivot_data.get("pivot"))
+    except (TypeError, ValueError):
+        return "no_pivot_data"
+    if close != close or pivot != pivot:  # NaN
+        return "no_pivot_data"
+    if close <= 0 or pivot <= 0:
+        return "no_pivot_data"
+    return None
+
+
+def _atr_unusable(atr_abs, atr_pct) -> str | None:
+    """None if atr_abs or atr_pct is a positive number. Else no_atr_data."""
+    for raw in (atr_abs, atr_pct):
+        if raw is None or raw == "":
+            continue
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if v > 0 and v == v:
+            return None
+    return "no_atr_data"
+
+
+def data_fail_card(ticker, block_reason, options_dict=None, pivot_data=None):
+    """PASS card for missing market data. total_score=0 must not be used as live_score."""
+    tech_ceil = _cfg_float("TECH_CEIL", 85.0)
+    sent_max = _cfg_float("SENT_MAX", 15.0)
+    card = ScoreCard(
+        ticker=str(ticker),
+        weights={"liquidity": 0, "technical": tech_ceil, "sentiment": sent_max},
+    )
+    card.action_flag = "PASS"
+    card.block_reason = str(block_reason or "no_pivot_data")
+    card.total_score = 0.0
+    card.technical_score = 0.0
+    card.sentiment_score = 0.0
+    card.reasons = [f"PASS: {card.block_reason} — refusing fabricated market data"]
+    card.metrics = {
+        "subscores": {
+            "block_reason": card.block_reason,
+            "final": 0.0,
+            "T": 0.0,
+            "S": 0.0,
+        },
+        "liquidity": {},
+        "technical": {},
+        "sentiment": {},
+    }
+    return card
 
 
 # ------------------------------------------------------------------
@@ -557,6 +634,15 @@ def score_ticker(ticker, options_dict, pivot_data, headlines_text,
     """
     if weights is not None:
         pass  # explicit ignore
+
+    pivot_fail = _pivot_unusable(pivot_data)
+    if pivot_fail:
+        print(f"REJECT {ticker}:{pivot_fail}")
+        return data_fail_card(ticker, pivot_fail, options_dict, pivot_data)
+    atr_fail = _atr_unusable(atr_abs, atr_pct)
+    if atr_fail:
+        print(f"REJECT {ticker}:{atr_fail}")
+        return data_fail_card(ticker, atr_fail, options_dict, pivot_data)
 
     tech_ceil = _cfg_float("TECH_CEIL", 85.0)
     sent_max = _cfg_float("SENT_MAX", 15.0)

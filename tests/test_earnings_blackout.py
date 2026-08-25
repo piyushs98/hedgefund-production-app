@@ -166,6 +166,40 @@ class TestGateBlockReason(unittest.TestCase):
         self.assertTrue(decs[0].admit)
         self.assertNotIn("earnings_blackout", gate.format_scan_summary(decs))
 
+    def test_blackout_check_exception_blocks_fail_closed(self):
+        eb.reset_for_tests()
+        alerts = []
+        gate = sg.reset_gate_for_tests(
+            sg.GateConfig(threshold=70.0, persist_cycles=1, max_concurrent=10)
+        )
+        now = datetime(2026, 8, 25, 14, 30, tzinfo=timezone.utc)
+        with mock.patch.object(eb, "is_blacked_out", side_effect=RuntimeError("db locked")):
+            with mock.patch(
+                "broadcaster.send_discord_alert",
+                side_effect=lambda m: alerts.append(m) or True,
+            ):
+                decs = gate.process_scan(
+                    [
+                        sg.Observation("NVDA", 82.0, "P", "EXECUTE"),
+                        sg.Observation("AAPL", 81.0, "C", "EXECUTE"),
+                    ],
+                    now,
+                )
+                # Second scan: still blocked, no second CRITICAL
+                gate.process_scan(
+                    [sg.Observation("MSFT", 80.0, "C", "EXECUTE")],
+                    now,
+                )
+        by_t = {d.ticker: d for d in decs}
+        self.assertFalse(by_t["NVDA"].admit)
+        self.assertEqual(by_t["NVDA"].reason, "blackout_check_failed")
+        self.assertFalse(by_t["AAPL"].admit)
+        self.assertEqual(by_t["AAPL"].reason, "blackout_check_failed")
+        summary = gate.format_scan_summary(decs)
+        self.assertIn("blackout_check_failed×2", summary)
+        crits = [m for m in alerts if "BLACKOUT CHECK FAILED" in m]
+        self.assertEqual(len(crits), 1)
+
     def test_blackout_beats_dead_zone_label(self):
         gate = sg.reset_gate_for_tests(
             sg.GateConfig(threshold=70.0, persist_cycles=1, max_concurrent=10)
@@ -272,6 +306,14 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertEqual(config.BLACKOUT_DAYS_BEFORE, 1)
         self.assertEqual(config.BLACKOUT_DAYS_AFTER, 1)
         self.assertTrue(config.EARNINGS_FLATTEN_SPANNING)
+
+
+class TestChinaScraperDisabled(unittest.TestCase):
+    def test_does_not_write_innovation_data(self):
+        from china_macro_scraper import scrape_china_macro
+        with mock.patch("news_memory.save_innovation_data") as save:
+            scrape_china_macro(["AAPL", "NVDA", "TSLA"])
+        save.assert_not_called()
 
 
 if __name__ == "__main__":

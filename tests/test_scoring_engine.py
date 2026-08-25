@@ -294,6 +294,37 @@ class TestDataFailures(unittest.TestCase):
         )
         self.assertEqual(card.block_reason, "no_momentum_data")
 
+    def test_missing_atr_is_no_atr_data_not_invented(self):
+        pivot_data = {
+            "close": 200.0,
+            "pivot": 198.0,
+            "r1": 202.0,
+            "s1": 194.0,
+            "pct_change": 1.0,
+        }
+        card = se.score_ticker(
+            "NVDA",
+            _tight_chain(200.0),
+            pivot_data,
+            headlines_text="",
+        )
+        self.assertEqual(card.action_flag, "PASS")
+        self.assertEqual(card.block_reason, "no_atr_data")
+        self.assertEqual(card.total_score, 0.0)
+
+    def test_pivot_error_dict_is_no_pivot_data(self):
+        card = se.score_ticker(
+            "AAPL",
+            _tight_chain(100.0),
+            {"error": "no_pivot_data", "close": None, "pivot": None},
+            headlines_text="",
+            atr_pct=2.0,
+            atr_abs=2.0,
+        )
+        self.assertEqual(card.action_flag, "PASS")
+        self.assertEqual(card.block_reason, "no_pivot_data")
+        self.assertEqual(card.total_score, 0.0)
+
 
 class TestDeadZone(unittest.TestCase):
     def test_dead_zone_hard_pass_below_threshold_atr(self):
@@ -334,6 +365,11 @@ class TestGateDataReasons(unittest.TestCase):
             "min_premium",
         )
         self.assertEqual(sg._compact_reason("earnings_blackout"), "earnings_blackout")
+        self.assertEqual(sg._compact_reason("no_pivot_data"), "no_pivot_data")
+        self.assertEqual(sg._compact_reason("no_atr_data"), "no_atr_data")
+        self.assertEqual(
+            sg._compact_reason("blackout_check_failed"), "blackout_check_failed"
+        )
         # liq-killed total no longer the only path — but below_thr still exists
         self.assertEqual(sg._compact_reason("score 0.0 below 70"), "below_thr")
 

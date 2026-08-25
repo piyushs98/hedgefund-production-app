@@ -36,13 +36,16 @@ _DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 _calendar: dict[str, date] | None = None
 # ticker -> "env" | "scraper"
 _sources: dict[str, str] = {}
+# First blackout-check exception this process → Discord CRITICAL.
+_blackout_check_alerted: bool = False
 
 
 def reset_for_tests() -> None:
     """Drop the in-process calendar so the next load sees patched env/DB."""
-    global _calendar, _sources
+    global _calendar, _sources, _blackout_check_alerted
     _calendar = None
     _sources = {}
+    _blackout_check_alerted = False
 
 
 def set_calendar_for_tests(
@@ -245,3 +248,29 @@ def log_config() -> None:
             f"[Earnings]   {ticker} print={print_on.isoformat()} "
             f"({src}) blackout={start.isoformat()}..{end.isoformat()}"
         )
+
+
+def alert_blackout_check_failed(ticker: str, err: BaseException) -> None:
+    """
+    Fail-closed lookup: ticker already blocked at the gate.
+    Discord CRITICAL once per process so a thrown calendar cannot admit
+    silently into a print.
+    """
+    global _blackout_check_alerted
+    print(f"[Earnings] blackout check failed ticker={ticker}: {err}")
+    if _blackout_check_alerted:
+        return
+    _blackout_check_alerted = True
+    msg = (
+        f"🚨 **CRITICAL: BLACKOUT CHECK FAILED** `{ticker}` — "
+        f"{type(err).__name__}: {err}. "
+        "Ticker blocked (fail closed). Would rather miss a trade than "
+        "admit into an earnings gap on a lookup error."
+    )
+    print(f"[Earnings] {msg}")
+    try:
+        import broadcaster
+        delivered = broadcaster.send_discord_alert(msg)
+        print(f"[Earnings] blackout-check CRITICAL delivered={delivered}")
+    except Exception as send_err:
+        print(f"[Earnings] blackout-check CRITICAL send failed: {send_err}")

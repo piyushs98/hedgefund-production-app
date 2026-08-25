@@ -341,7 +341,7 @@ def run_morning_carry_review(
         mark = _f(mark_info.get("mark"))
         pnl = _pnl_pct(entry, mark)
 
-        live_score = _f(getattr(card, "total_score", None)) if card is not None else None
+        live_score = _live_score_from_card(card)
         if live_score is not None:
             trade["last_live_score"] = live_score
         today_pivot = _f(pivot_data.get("pivot")) if isinstance(pivot_data, dict) else None
@@ -451,6 +451,19 @@ def _f(val: Any) -> float | None:
         return out
     except (TypeError, ValueError):
         return None
+
+
+_DATA_FAIL_BLOCKS = frozenset({"no_pivot_data", "no_atr_data"})
+
+
+def _live_score_from_card(card: Any) -> float | None:
+    """Skip 0.0 costume scores from missing pivot/ATR — do not thesis-void."""
+    if card is None:
+        return None
+    br = getattr(card, "block_reason", None)
+    if br in _DATA_FAIL_BLOCKS:
+        return None
+    return _f(getattr(card, "total_score", None))
 
 
 def _entry_premium(trade: dict[str, Any]) -> float | None:
@@ -1035,9 +1048,7 @@ def run_scan_exits(
         ctx = scored_by_ticker.get(ticker) or scored_by_ticker.get(ticker.upper()) or {}
         options_dict = ctx.get("options_dict")
         card = ctx.get("card")
-        live_score = None
-        if card is not None:
-            live_score = _f(getattr(card, "total_score", None))
+        live_score = _live_score_from_card(card)
 
         mark_info = lookup_option_mark(trade, options_dict)
         entry = _entry_premium(trade)

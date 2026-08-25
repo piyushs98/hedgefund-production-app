@@ -33,15 +33,25 @@ def scrape_earnings_calendar(tickers):
                         parsed = parse_print_date(dt)
                         if parsed is not None:
                             iso = parsed.isoformat()
-                    except Exception:
-                        iso = None
+                    except Exception as parse_err:
+                        print(
+                            f"[Earnings] parse failed ticker={ticker} "
+                            f"raw={dt!r}: {parse_err}"
+                        )
                     if iso is None:
-                        iso = str(dt)
-                    earnings_str = f"Corporate Earnings Scheduled for {iso}"
-                    save_innovation_data(ticker, "EARNINGS", earnings_str)
-                    print(f"  -> Saved EARNINGS calendar data for {ticker} ({iso}).")
+                        print(
+                            f"[Earnings] parse failed ticker={ticker} "
+                            f"raw={dt!r}: no YYYY-MM-DD — not writing"
+                        )
+                    else:
+                        earnings_str = f"Corporate Earnings Scheduled for {iso}"
+                        save_innovation_data(ticker, "EARNINGS", earnings_str)
+                        print(f"  -> Saved EARNINGS calendar data for {ticker} ({iso}).")
                 except Exception as date_err:
-                    pass
+                    print(
+                        f"[Earnings] parse failed ticker={ticker} "
+                        f"raw={dates[0]!r}: {date_err}"
+                    )
         except Exception as e:
             print(f"  -> Failed to fetch earnings calendar for {ticker}: {e}")
         if i < len(work_tickers) - 1:

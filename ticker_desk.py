@@ -56,14 +56,13 @@ def _bar_date(ts):
 
 def _levels_from_ohlc(high, low, close):
     """Standard floor pivots from a single completed session's OHLC."""
-    if (high + low + close) > 0:
-        pivot = (high + low + close) / 3.0
-    else:
-        pivot = 100.0
-    r1 = (2 * pivot) - low if pivot > 0 else 101.0
-    s1 = (2 * pivot) - high if pivot > 0 else 99.0
-    r2 = pivot + (high - low) if pivot > 0 else 102.0
-    s2 = pivot - (high - low) if pivot > 0 else 98.0
+    if (high + low + close) <= 0:
+        raise ValueError("OHLC all non-positive — refusing fabricated pivot")
+    pivot = (high + low + close) / 3.0
+    r1 = (2 * pivot) - low
+    s1 = (2 * pivot) - high
+    r2 = pivot + (high - low)
+    s2 = pivot - (high - low)
     return {
         "pivot": round(pivot, 2),
         "r1": round(r1, 2),
@@ -138,27 +137,16 @@ def fetch_pivot_data(ticker):
 
         live_from_today = False
         if hist.empty:
-            info = stock.info or {}
-            live_close = (
-                info.get("regularMarketPrice")
-                or info.get("previousClose")
-                or 100.0
-            )
-            prev = info.get("previousClose") or live_close
-            # No daily bars: weak fallback for levels only (not ideal, rare)
-            high = float(prev) * 1.01
-            low = float(prev) * 0.99
-            basis_close = float(prev)
-            basis_date = None
-            basis = {"high": high, "low": low, "close": basis_close, "basis_date": basis_date}
-            live_close = float(live_close)
-            # info.regularMarketPrice may be live, but without a today bar we
-            # cannot trust pct vs basis as a measured day-change for scoring.
-            live_from_today = info.get("regularMarketPrice") is not None
-        else:
-            basis, live_close, live_from_today = _select_completed_session(hist, today)
-            high, low, basis_close = basis["high"], basis["low"], basis["close"]
-            basis_date = basis["basis_date"]
+            print(f"REJECT {ticker_key}:no_pivot_data (empty daily history)")
+            return {
+                "error": "no_pivot_data",
+                "error_detail": "empty daily history",
+                "close": None,
+                "pivot": None,
+            }
+        basis, live_close, live_from_today = _select_completed_session(hist, today)
+        high, low, basis_close = basis["high"], basis["low"], basis["close"]
+        basis_date = basis["basis_date"]
 
         computed = _levels_from_ohlc(high, low, basis_close)
 
@@ -227,19 +215,12 @@ def fetch_pivot_data(ticker):
             "live_from_today": bool(live_from_today),
         }
     except Exception as e:
-        print(f"❌ [Specialist Desk] Error fetching pivot data for {ticker}: {e}")
-        # Default placeholder safe return (not cached — avoid freezing garbage)
-        # pct_change=None so scorer flags no_momentum_data, not silent mom=0.
+        print(f"REJECT {ticker_key}:no_pivot_data ({e})")
         return {
-            "close": 100.0,
-            "pivot": 100.0,
-            "r1": 101.0,
-            "s1": 99.0,
-            "r2": 102.0,
-            "s2": 98.0,
-            "pct_change": None,
-            "basis_close": None,
-            "live_from_today": False,
+            "error": "no_pivot_data",
+            "error_detail": str(e),
+            "close": None,
+            "pivot": None,
         }
 
 

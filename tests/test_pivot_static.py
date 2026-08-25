@@ -107,6 +107,27 @@ class TestStaticPivots(unittest.TestCase):
         # Live close may refresh
         self.assertEqual(p2["close"], 150.0)
 
+    def test_empty_history_is_error_not_spot_100(self):
+        session = date(2026, 8, 4)
+        empty = pd.DataFrame()
+        with mock.patch.object(ticker_desk, "_session_date_et", return_value=session):
+            with mock.patch("ticker_desk.yf.Ticker") as mock_ticker:
+                inst = mock_ticker.return_value
+                inst.history.return_value = empty
+                out = ticker_desk.fetch_pivot_data("NVDA")
+        self.assertEqual(out.get("error"), "no_pivot_data")
+        self.assertIsNone(out.get("pivot"))
+        self.assertIsNone(out.get("close"))
+        self.assertNotEqual(out.get("pivot"), 100.0)
+
+    def test_fetch_exception_is_error_not_spot_100(self):
+        session = date(2026, 8, 4)
+        with mock.patch.object(ticker_desk, "_session_date_et", return_value=session):
+            with mock.patch("ticker_desk.yf.Ticker", side_effect=RuntimeError("yahoo down")):
+                out = ticker_desk.fetch_pivot_data("AAPL")
+        self.assertEqual(out.get("error"), "no_pivot_data")
+        self.assertIsNone(out.get("close"))
+
 
 class TestSignalGateRanking(unittest.TestCase):
     def test_rank_before_admit_highest_score_wins(self):

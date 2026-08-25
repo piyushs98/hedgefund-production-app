@@ -148,6 +148,15 @@ def macro_vector_local(ticker: str) -> str:
     innovation_data = get_innovation_context(ticker, days=7) or ""
     if not innovation_data.strip():
         return "No specific macro or supply-chain catalysts identified for this ticker."
+    # CHINA_MACRO rows were synthesized (random Shenzhen/tariff lines).
+    # Ignore leftovers so they cannot keep tagging S after the scraper was disabled.
+    kept = [
+        ln for ln in innovation_data.splitlines()
+        if "[CHINA_MACRO]" not in ln.upper()
+    ]
+    innovation_data = "\n".join(kept)
+    if not innovation_data.strip():
+        return "No specific macro or supply-chain catalysts identified for this ticker."
     low = innovation_data.lower()
     if "supply-chain bottlenecks" in low or "bottleneck" in low or "tariff" in low:
         return "SUPPLY_CHAIN_BOTTLENECK: Detected supply-chain / tariff friction (local scan)."
@@ -998,6 +1007,24 @@ def run_thirty_min_scan(
             print(f"[{ticker}] isolated: {e.step}: {e.message}")
             row["error"] = f"{e.step}: {e.message}"
             row["action_flag"] = "PASS"
+            step = str(e.step or "")
+            br = None
+            if "pivot" in step:
+                br = "no_pivot_data"
+            elif "atr" in step:
+                br = "no_atr_data"
+            if br:
+                print(f"REJECT {ticker}:{br}")
+                card = scoring_engine.data_fail_card(ticker, br)
+                row["block_reason"] = br
+                scored[ticker] = {
+                    "card": card,
+                    "adv": None,
+                    "options_dict": {},
+                    "pivot_data": {"error": br},
+                    "atr_abs": None,
+                    "direction": None,
+                }
             rows_by_ticker[ticker] = row
             result["results"].append(row)
         except Exception as e:
