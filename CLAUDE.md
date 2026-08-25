@@ -2,7 +2,8 @@
 
 ## This repo is FROZEN
 
-Frozen 2026-08-24 for a 30-session measurement period. See `FREEZE.md`.
+Frozen 2026-08-24 at `741584e` for a 30-session measurement period.
+See `FREEZE.md`.
 
 Do not suggest, plan, or implement improvements to scoring, gating,
 sizing, stops, exits, universe, cadence, LLM routing, or config/env

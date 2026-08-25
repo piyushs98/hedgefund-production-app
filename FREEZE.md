@@ -1,12 +1,13 @@
 # Measurement freeze
 
-Frozen at COMMIT_PLACEHOLDER on 2026-08-24.
+Frozen at 741584e2ba22e13724de8bf920106e099065c63f (`741584e`) on 2026-08-24.
 Measurement period: 30 sessions.
 
-This freeze starts after the fill-accounting / TRADE / SESSION record
-change. Nothing in that change altered entry, sizing, stops, exits, or
-scoring. Equity and the SESSION line are the fill series (buy ask / sell
-bid). Triggers still fire on mid.
+That commit is the fill-accounting / TRADE / SESSION record change.
+Nothing in it altered entry, sizing, stops, exits, or scoring. Equity
+and the SESSION line are the fill series (buy ask / sell bid). Triggers
+still fire on mid. Every TRADE and SESSION line and the boot log carry
+`v` + the first 7 of HEAD so a later change is visible in Discord.
 
 No changes permitted except:
 
