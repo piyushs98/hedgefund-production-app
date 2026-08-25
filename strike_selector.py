@@ -413,6 +413,7 @@ def select_optimal_contract(
                     "bid": bid,
                     "ask": ask,
                     "mid": round(mid, 2),
+                    "mid_raw": mid,
                     "intrinsic": intrinsic,
                     "extrinsic": extrinsic,
                     "extrinsic_pct": extrinsic_pct,
@@ -505,7 +506,10 @@ def select_optimal_contract(
         "days_to_expiration": round(chosen["dte_eff"], 3),
         "calendar_dte": chosen["cal_dte"],
         "entry_premium": entry,
-        "entry_mid": entry,
+        # Trading debit/SL/TP stay on round(mid, 2). TRADE records the
+        # unrounded midpoint so recovered (ask-bid)/mid is not blurred
+        # on $1–$2.50 contracts.
+        "entry_mid": chosen.get("mid_raw", entry),
         "bid": chosen["bid"],
         "ask": chosen["ask"],
         "entry_ask": chosen["ask"],

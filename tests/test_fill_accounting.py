@@ -200,10 +200,12 @@ class TestTradeAndSessionLines(unittest.TestCase):
             equity_fill=10041.0,
             peak_deployed=2778.0,
             open_value=1100.0,
+            bp=9476.0,
             now=datetime(2026, 8, 25, 14, 45, 0),
         )
         parts = line.split("|")
         self.assertEqual(len(parts), fa.SESSION_FIELD_COUNT)
+        self.assertEqual(fa.SESSION_FIELD_COUNT, 18)
         self.assertEqual(parts[0], "SESSION")
         self.assertTrue(parts[1].startswith("v"))
         self.assertEqual(parts[3], "scans 2")
@@ -219,6 +221,19 @@ class TestTradeAndSessionLines(unittest.TestCase):
         self.assertEqual(parts[14], "spy_close 764.20")
         self.assertEqual(parts[15], "spy_range_pct 0.43")
         self.assertEqual(parts[16], "criticals 1")
+        self.assertEqual(parts[17], "bp 9476")
+
+    def test_session_bp_n_a_when_missing_keeps_arity(self):
+        line = fa.format_session_line(
+            equity_fill=10000.0,
+            peak_deployed=0.0,
+            open_value=0.0,
+            now=datetime(2026, 8, 25, 14, 45, 0),
+        )
+        parts = line.split("|")
+        self.assertEqual(len(parts), 18)
+        self.assertEqual(parts[16], "criticals 0")
+        self.assertEqual(parts[17], "bp n/a")
 
 
 class TestLedgerFillSeries(unittest.TestCase):
@@ -376,6 +391,54 @@ class TestVersionStamp(unittest.TestCase):
         ver = fa.code_version()
         self.assertTrue(ver.startswith("v"))
         self.assertGreaterEqual(len(ver), 2)
+
+
+class TestQuotePrecision(unittest.TestCase):
+    """Two-cent mid rounding blurs 6–8% on $1–$2.50; TRADE keeps raw mid."""
+
+    def test_rounded_mid_blurs_six_eight_band_on_cheap_name(self):
+        bid, ask = 1.00, 1.07
+        raw_mid = (bid + ask) / 2.0  # 1.035
+        rounded = round(raw_mid, 2)  # 1.04
+        true_pct = (ask - bid) / raw_mid * 100.0
+        recovered_rounded = 2.0 * (ask - rounded) / rounded * 100.0
+        self.assertAlmostEqual(true_pct, 6.76, places=1)
+        self.assertAlmostEqual(recovered_rounded, 5.77, places=1)
+        # ~1pp: a true 6.8% print reads as 5.8% — below the 6% line.
+
+    def test_trade_line_keeps_unrounded_mid(self):
+        line = fa.format_trade_line(
+            {"ticker": "AAPL", "direction": "CALL", "strike": 230,
+             "expiration": "2026-08-28"},
+            reason="TAKE_PROFIT",
+            entry_mid=1.035,
+            entry_ask=1.07,
+            exit_mid=1.50,
+            exit_bid=1.46,
+            qty=1,
+            pnl_mid=46.0,
+            pnl_fill=39.0,
+            planned_risk=21.0,
+        )
+        parts = line.split("|")
+        self.assertEqual(parts[9], "entry_mid 1.035")
+        self.assertEqual(parts[10], "entry_ask 1.07")
+        mid = float(parts[9].split()[1])
+        ask = float(parts[10].split()[1])
+        recovered = 2.0 * (ask - mid) / mid * 100.0
+        self.assertAlmostEqual(recovered, 6.76, places=1)
+
+    def test_stamp_does_not_overwrite_raw_mid_with_rounded_premium(self):
+        contract = {
+            "ticker": "AAPL",
+            "entry_mid": 1.035,
+            "ask": 1.07,
+        }
+        out = fa.stamp_entry_quotes(contract, 1.04)
+        self.assertAlmostEqual(out["entry_mid"], 1.035)
+        self.assertAlmostEqual(out["entry_ask"], 1.07)
+        self.assertAlmostEqual(contract["entry_mid"], 1.035)
+        self.assertFalse(out["fill_est"])
 
 
 class TestStrikeSelectorStampsAsk(unittest.TestCase):

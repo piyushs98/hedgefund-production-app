@@ -130,10 +130,17 @@ def stamp_entry_quotes(contract: dict[str, Any] | None, entry_mid: float) -> dic
     Record selected-contract entry_mid / entry_ask on the trade dict.
 
     Does not change the debit. Missing ask → entry_ask = mid, fill=est.
+    A more-precise entry_mid already on the contract (unrounded
+    (bid+ask)/2) is kept; the trading premium may be round(mid, 2).
     """
+    recorded_mid = float(entry_mid)
+    if isinstance(contract, dict):
+        existing = _f(contract.get("entry_mid"))
+        if existing is not None and existing > 0:
+            recorded_mid = existing
     out: dict[str, Any] = {
-        "entry_mid": float(entry_mid),
-        "entry_ask": float(entry_mid),
+        "entry_mid": recorded_mid,
+        "entry_ask": recorded_mid,
         "fill_est": True,
     }
     if not isinstance(contract, dict):
@@ -141,14 +148,14 @@ def stamp_entry_quotes(contract: dict[str, Any] | None, entry_mid: float) -> dic
     ask = extract_ask(contract)
     if ask is None:
         ask = _f(contract.get("ask"))
-    contract["entry_mid"] = float(entry_mid)
+    contract["entry_mid"] = recorded_mid
     if ask is not None and ask > 0:
         contract["entry_ask"] = float(ask)
         contract["fill_est"] = False
         out["entry_ask"] = float(ask)
         out["fill_est"] = False
     else:
-        contract["entry_ask"] = float(entry_mid)
+        contract["entry_ask"] = recorded_mid
         contract["fill_est"] = True
     return out
 
@@ -305,11 +312,19 @@ def _session_date_str(raw: Any = None) -> str:
 
 
 def _fmt_px(label: str, val: Any, *, est: bool = False) -> str:
+    """Up to 4 decimals so unrounded mid/ask survive Discord (min 2)."""
     n = _f(val)
     if n is None:
         body = f"{label} {_NA}"
     else:
-        body = f"{label} {n:.2f}"
+        s = f"{n:.4f}".rstrip("0")
+        if "." not in s:
+            s += ".00"
+        elif s.endswith("."):
+            s += "00"
+        elif len(s.split(".", 1)[1]) < 2:
+            s += "0"
+        body = f"{label} {s}"
     if est:
         body += " fill=est"
     return body
@@ -547,10 +562,12 @@ def format_session_line(
     equity_fill: float | None,
     peak_deployed: float | None,
     open_value: float | None,
+    bp: float | None = None,
     now: datetime | None = None,
 ) -> str:
     """
-    One pipe-delimited SESSION line at 14:45. 17 fields, fixed order.
+    One pipe-delimited SESSION line at 14:45. 18 fields, fixed order.
+    Columns 1–17 unchanged; bp is trailing column 18 (mid-cash buying power).
     """
     snap = session_snapshot()
     planned = _f(snap.get("planned_risk_closed"))
@@ -586,9 +603,10 @@ def format_session_line(
         _fmt_float("spy_close", spy_close, 2, signed=False),
         _fmt_float("spy_range_pct", spy_range, 2, signed=False),
         _fmt_int("criticals", snap.get("criticals"), signed=False),
+        _fmt_int("bp", bp, signed=False),
     ]
     return "|".join(fields)
 
 
 TRADE_FIELD_COUNT = 26
-SESSION_FIELD_COUNT = 17
+SESSION_FIELD_COUNT = 18

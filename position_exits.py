@@ -157,10 +157,12 @@ def maybe_emit_eod_book(now_cdt: datetime | None = None) -> str | None:
     try:
         peak = float(virtual_broker._book.get("peak_deployed") or 0.0)
         peak = max(peak, virtual_broker._deployed_from_open_trades())
+        port = virtual_broker.get_portfolio()
         session_line = fill_accounting.format_session_line(
             equity_fill=virtual_broker.fill_equity(),
             peak_deployed=peak,
             open_value=virtual_broker.open_mark_value(),
+            bp=port.get("buying_power"),
             now=now,
         )
     except Exception as e:
@@ -816,8 +818,13 @@ def close_open_position(
     exit_bid = _f(trade.get("last_bid"))
     if exit_bid is None:
         exit_bid = fill_accounting.extract_bid(trade)
+    # TRADE records unrounded (bid+ask)/2 when present; debit/SL stay on
+    # rounded entry_premium so sizing and stops do not change.
+    record_mid = _f(trade.get("entry_mid"))
+    if record_mid is None:
+        record_mid = float(entry) if entry is not None else float(exit_price)
     quotes = fill_accounting.resolve_fill_prices(
-        entry_mid=float(entry) if entry is not None else float(exit_price),
+        entry_mid=record_mid,
         exit_mid=float(exit_price),
         entry_ask=entry_ask,
         exit_bid=exit_bid,
@@ -827,7 +834,7 @@ def close_open_position(
         "reason": reason,
         "exit_price": exit_price,
         "entry_price": entry,
-        "entry_mid": quotes["entry_mid"],
+        "entry_mid": record_mid,
         "entry_ask": quotes["entry_ask"],
         "exit_mid": quotes["exit_mid"],
         "exit_bid": quotes["exit_bid"],

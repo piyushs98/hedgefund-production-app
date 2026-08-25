@@ -25,7 +25,7 @@ is the durable store. Reconstruct from TRADE and SESSION lines.
 
 | Date | Reason |
 |---|---|
-| _(none)_ | |
+| 2026-08-24 | Before first counted session: SESSION trailing `bp` (col 18); TRADE prints unrounded entry_mid/ask so recovered spread on $1–$2.50 names is not blurred by round(mid, 2). Trading debit/SL/TP still use rounded premium. `MAX_CONTRACT_SPREAD_PCT` still 8.0. |
 
 ## Post-measurement candidates (do not implement during the freeze)
 
