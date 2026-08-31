@@ -367,10 +367,12 @@ class TestExitRules(unittest.TestCase):
         trade["stop_loss"] = 4.72
         trade["take_profit"] = 8.85
         # Mark still well above SL (open +47%) — thesis is gone
+        # Second consecutive clean print (first already armed).
+        trade["thesis_below_streak"] = 1
         scored = {
             "IWM": {
                 "options_dict": self._options(8.60, 8.80),
-                "card": mock.Mock(total_score=12.0),
+                "card": mock.Mock(total_score=12.0, block_reason=None, metrics={}),
             }
         }
         with mock.patch("position_exits.close_open_position") as close:
@@ -389,6 +391,64 @@ class TestExitRules(unittest.TestCase):
                         )
         self.assertEqual(close.call_args[0][2], "THESIS_VOID")
         self.assertAlmostEqual(close.call_args[0][1], 8.70, places=2)
+
+    def test_first_clean_below_does_not_void(self):
+        trade = self._trade(expiration="2026-08-12")
+        trade["entry_score"] = 86.0
+        scored = {
+            "IWM": {
+                "options_dict": self._options(1.50, 1.70),
+                "card": mock.Mock(total_score=12.0, block_reason=None, metrics={}),
+            }
+        }
+        with mock.patch("position_exits.close_open_position") as close:
+            with mock.patch("position_exits.record_position_mark", return_value=True):
+                with mock.patch("tracker_agent.save_active_trade", return_value=True):
+                    with mock.patch(
+                        "tracker_agent.load_active_trades", return_value=[trade]
+                    ):
+                        summary = position_exits.run_scan_exits(
+                            [trade],
+                            scored,
+                            session_date=date(2026, 8, 5),
+                            force_eod=False,
+                            now_cdt=datetime(2026, 8, 5, 8, 35, 0),
+                        )
+        close.assert_not_called()
+        self.assertTrue(any("THESIS_ARM" in s for s in summary.get("thesis_skipped", [])))
+        self.assertEqual(trade.get("thesis_below_streak"), 1)
+
+    def test_thesis_skip_on_no_liq_data(self):
+        trade = self._trade(expiration="2026-08-12")
+        trade["entry_score"] = 86.0
+        trade["thesis_below_streak"] = 1
+        dirty = mock.Mock(
+            total_score=12.0,
+            block_reason="no_liq_data",
+            metrics={"subscores": {"liq_status": "no_liq_data", "usable": 0}},
+        )
+        scored = {
+            "IWM": {
+                "options_dict": self._options(1.50, 1.70),
+                "card": dirty,
+            }
+        }
+        with mock.patch("position_exits.close_open_position") as close:
+            with mock.patch("tracker_agent.save_active_trade", return_value=True):
+                with mock.patch(
+                    "tracker_agent.load_active_trades", return_value=[trade]
+                ):
+                    with mock.patch("broadcaster.send_discord_alert", return_value=True):
+                        summary = position_exits.run_scan_exits(
+                            [trade],
+                            scored,
+                            session_date=date(2026, 8, 5),
+                            force_eod=False,
+                            now_cdt=datetime(2026, 8, 5, 8, 35, 0),
+                        )
+        close.assert_not_called()
+        self.assertTrue(any("THESIS_SKIP" in s for s in summary.get("thesis_skipped", [])))
+        self.assertEqual(trade.get("thesis_below_streak"), 0)
 
     def test_thesis_void_skips_marginal_entry(self):
         """Hysteresis: entry_score 65 must not thesis-void even at live 12."""
@@ -446,7 +506,7 @@ class TestExitRules(unittest.TestCase):
         scored = {
             "IWM": {
                 "options_dict": self._options(1.50, 1.70),
-                "card": mock.Mock(total_score=12.0),
+                "card": mock.Mock(total_score=12.0, block_reason=None, metrics={}),
             }
         }
         with mock.patch("position_exits.close_open_position") as close:
@@ -472,10 +532,11 @@ class TestExitRules(unittest.TestCase):
         trade["entry_premium"] = 2.37
         trade["stop_loss"] = 1.90
         trade["take_profit"] = 3.56
+        trade["thesis_below_streak"] = 1
         scored = {
             "IWM": {
                 "options_dict": self._options(3.00, 3.20),
-                "card": mock.Mock(total_score=49.0),
+                "card": mock.Mock(total_score=49.0, block_reason=None, metrics={}),
                 "pivot_data": {"pivot": 301.5, "close": 302.0},
             }
         }
@@ -618,7 +679,42 @@ class TestAug20ThesisReplay(unittest.TestCase):
             live_score=live_score,
         )
 
-    def test_tsla_would_void_at_carry_mark(self):
+    def test_tsla_dirty_open_print_is_not_voided(self):
+        """Aug 20 08:30 TSLA 86→12 sat on no_liq_data. Must HOLD."""
+        trade = {
+            "ticker": "TSLA",
+            "direction": "CALL",
+            "strike": 345.0,
+            "expiration": "2026-08-28",
+            "entry_price": 5.90,
+            "stop_loss": 4.72,
+            "take_profit": 8.85,
+            "entry_score": 86.0,
+        }
+        dirty = mock.Mock(
+            total_score=12.0,
+            block_reason="dead_zone",
+            metrics={
+                "subscores": {"liq_status": "no_liq_data", "usable": 0},
+                "liquidity": {"liq_status": "no_liq_data", "usable_spread_quotes": 0},
+                "technical": {"pivot": 345.0, "close": 340.0, "pct_change": -2.0},
+            },
+        )
+        reason, px = position_exits.evaluate_exit_reason_for_mark(
+            trade,
+            8.70,
+            sess=date(2026, 8, 20),
+            now=datetime(2026, 8, 20, 8, 30, 0),
+            include_time_stop=False,
+            do_eod=False,
+            live_score=12.0,
+            card=dirty,
+        )
+        self.assertIsNone(reason)
+        self.assertIn("THESIS_SKIP", trade.get("_thesis_skip_log") or "")
+        self.assertEqual(trade.get("thesis_below_streak"), 0)
+
+    def test_tsla_two_clean_prints_void(self):
         trade = {
             "ticker": "TSLA",
             "direction": "CALL",
@@ -630,15 +726,17 @@ class TestAug20ThesisReplay(unittest.TestCase):
             "entry_score": 86.0,
         }
         reason, px = self._reason(trade, 8.70, 12.0)
+        self.assertIsNone(reason)
+        self.assertEqual(trade.get("thesis_below_streak"), 1)
+        reason, px = self._reason(trade, 8.70, 12.0)
         self.assertEqual(reason, "THESIS_VOID")
         self.assertAlmostEqual(px, 8.70)
-        # vs later BREAKEVEN_LOCK at 5.50 (−$40)
         void_pnl = (8.70 - 5.90) * 100
         actual_pnl = (5.50 - 5.90) * 100
         self.assertAlmostEqual(void_pnl, 280.0)
         self.assertAlmostEqual(actual_pnl, -40.0)
 
-    def test_amzn_would_void_at_carry_mark(self):
+    def test_amzn_two_clean_prints_void(self):
         trade = {
             "ticker": "AMZN",
             "direction": "CALL",
@@ -649,6 +747,8 @@ class TestAug20ThesisReplay(unittest.TestCase):
             "take_profit": 3.56,
             "entry_score": 84.0,
         }
+        reason, px = self._reason(trade, 3.10, 49.0)
+        self.assertIsNone(reason)
         reason, px = self._reason(trade, 3.10, 49.0)
         self.assertEqual(reason, "THESIS_VOID")
         self.assertAlmostEqual(px, 3.10)

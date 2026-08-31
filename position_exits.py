@@ -225,6 +225,8 @@ def evaluate_exit_reason_for_mark(
     include_time_stop: bool = True,
     do_eod: bool = False,
     live_score: float | None = None,
+    card: Any = None,
+    options_dict: dict[str, Any] | None = None,
 ) -> tuple[str | None, float | None]:
     """
     Shared exit decision for scan exits and morning carry review.
@@ -232,7 +234,8 @@ def evaluate_exit_reason_for_mark(
     EOD is selective: only cal_dte < CARRY_MIN_DTE is forced flat.
     Morning carry review typically sets include_time_stop=False.
     THESIS_VOID fires after SL/TP (so a hit target still banks) and
-    before B5 path rules, using live_score or last_live_score.
+    before B5 path rules. It requires a clean score and two consecutive
+    clean prints below THESIS_EXIT_SCORE. SL/TP/expiry always run.
     """
     entry = _entry_premium(trade)
     exit_px = mark
@@ -280,7 +283,9 @@ def evaluate_exit_reason_for_mark(
     if _tp_breached(mark, tp):
         return "TAKE_PROFIT", mark
 
-    thesis = _thesis_void_reason(trade, live_score)
+    thesis = _thesis_void_reason(
+        trade, live_score, card=card, options_dict=options_dict
+    )
     if thesis:
         return thesis, mark
 
@@ -399,6 +404,8 @@ def run_morning_carry_review(
             include_time_stop=False,
             do_eod=False,
             live_score=live_score,
+            card=card,
+            options_dict=options_dict,
         )
         if reason is None and mark is None:
             u_reason, u_px = underlying_exit_reason(trade, mark_info.get("spot"))
@@ -435,6 +442,16 @@ def run_morning_carry_review(
             )
         )
 
+        thesis_skip = trade.pop("_thesis_skip_log", None)
+        if thesis_skip:
+            print(f"[CarryReview] {thesis_skip}")
+            summary.setdefault("thesis_skipped", []).append(thesis_skip)
+            try:
+                from tracker_agent import save_active_trade
+                save_active_trade(trade)
+            except Exception:
+                pass
+
         if reason and exit_px is not None:
             closed = close_open_position(trade, float(exit_px), f"CARRY_{reason}")
             summary["closed"].append(closed)
@@ -444,6 +461,8 @@ def run_morning_carry_review(
             action = "HOLD"
             if mark is None:
                 action = "HOLD (no mark)"
+            if thesis_skip:
+                action = thesis_skip.split(" — ")[0] if "THESIS_" in thesis_skip else action
 
         line = (
             f"CARRY {label} | entry {e_s} -> {m_s} ({pnl_s}) | "
@@ -624,6 +643,12 @@ def _should_escalate(prev_alerted: int, streak: int) -> bool:
 
 
 _DATA_FAIL_BLOCKS = frozenset({"no_pivot_data", "no_atr_data"})
+_THESIS_DIRTY = frozenset({
+    "no_liq_data",
+    "no_momentum_data",
+    "no_pivot_data",
+    "no_atr_data",
+})
 
 
 def _live_score_from_card(card: Any) -> float | None:
@@ -631,9 +656,70 @@ def _live_score_from_card(card: Any) -> float | None:
     if card is None:
         return None
     br = getattr(card, "block_reason", None)
-    if br in _DATA_FAIL_BLOCKS:
+    if isinstance(br, str) and br in _DATA_FAIL_BLOCKS:
         return None
     return _f(getattr(card, "total_score", None))
+
+
+def score_is_clean_for_thesis(
+    card: Any,
+    options_dict: dict[str, Any] | None = None,
+) -> tuple[bool, str | None]:
+    """
+    True only when pivot, ATR, pct_change, and a usable chain are present.
+
+    Dirty: no_liq_data, no_momentum_data, no_pivot_data, no_atr_data, usable=0.
+    dead_zone is a real measurement and is not dirty.
+    """
+    if card is None:
+        return False, "no_score"
+    br = getattr(card, "block_reason", None)
+    if isinstance(br, str) and br in _THESIS_DIRTY:
+        return False, br
+    if isinstance(options_dict, dict) and "error" in options_dict:
+        return False, "no_liq_data"
+    metrics = getattr(card, "metrics", None)
+    sub: dict[str, Any] = {}
+    liq: dict[str, Any] = {}
+    tech: dict[str, Any] = {}
+    if isinstance(metrics, dict):
+        sub = metrics.get("subscores") or {}
+        liq = metrics.get("liquidity") or {}
+        tech = metrics.get("technical") or {}
+        if not isinstance(sub, dict):
+            sub = {}
+        if not isinstance(liq, dict):
+            liq = {}
+        if not isinstance(tech, dict):
+            tech = {}
+    liq_status = sub.get("liq_status") or liq.get("liq_status")
+    if liq_status == "no_liq_data":
+        return False, "no_liq_data"
+    usable = sub.get("usable")
+    if usable is None:
+        usable = liq.get("usable_spread_quotes")
+    if usable is not None:
+        try:
+            if int(usable) <= 0:
+                return False, "usable=0"
+        except (TypeError, ValueError):
+            pass
+    mom_status = sub.get("mom_status") or tech.get("mom_status")
+    if mom_status == "no_momentum_data":
+        return False, "no_momentum_data"
+    if tech.get("atr_missing") is True or (
+        isinstance(metrics, dict) and tech.get("atr") is None and tech.get("atr_abs") is None
+        and "atr_distance" not in tech and "atr_distance" not in sub
+    ):
+        # Only dirty when technical metrics exist and ATR is explicitly missing.
+        if isinstance(metrics, dict) and tech.get("atr_missing") is True:
+            return False, "no_atr_data"
+    if isinstance(metrics, dict) and tech:
+        if tech.get("pivot") is None and tech.get("close") is None:
+            return False, "no_pivot_data"
+        if tech.get("pct_change") is None and mom_status == "no_momentum_data":
+            return False, "no_momentum_data"
+    return True, None
 
 
 def _entry_premium(trade: dict[str, Any]) -> float | None:
@@ -1111,17 +1197,36 @@ def close_open_position(
 def _thesis_void_reason(
     trade: dict[str, Any],
     live_score: float | None,
+    card: Any = None,
+    options_dict: dict[str, Any] | None = None,
 ) -> str | None:
     """
     Score-based invalidation: close when the live thesis is gone, P&L ignored.
 
-    Requires a high-conviction entry (entry_score >= EXECUTE_THRESHOLD)
-    so a 68 that drifts to 54 is not force-closed. Missing entry_score
-    is treated as unknown — do not fire.
+    Requires a high-conviction entry (entry_score >= EXECUTE_THRESHOLD).
+    Requires a CLEAN score this pass (pivot, ATR, pct_change, usable chain).
+    Requires TWO consecutive clean prints below THESIS_EXIT_SCORE.
+    Exit-only passes have no card — do not void on a stale last_live_score
+    and do not break the streak.
     """
+    ticker = str(trade.get("ticker") or "?").upper()
+    if card is None and live_score is None:
+        return None
+    if card is None:
+        # Score was supplied without a card (unit tests / legacy). Treat as
+        # one reading but still require the two-print counter.
+        clean, dirty_why = True, None
+    else:
+        clean, dirty_why = score_is_clean_for_thesis(card, options_dict)
+    if not clean:
+        trade["thesis_below_streak"] = 0
+        trade["_thesis_skip_log"] = (
+            f"THESIS_SKIP {ticker} ({dirty_why or 'dirty'}) — not evaluated"
+        )
+        return None
     score = live_score
     if score is None:
-        score = _f(trade.get("last_live_score"))
+        score = _live_score_from_card(card)
     if score is None:
         return None
     entry_score = _f(trade.get("entry_score"))
@@ -1132,7 +1237,18 @@ def _thesis_void_reason(
     if entry_score < min_entry:
         return None
     if score < exit_thr:
+        try:
+            streak = int(trade.get("thesis_below_streak") or 0) + 1
+        except (TypeError, ValueError):
+            streak = 1
+        trade["thesis_below_streak"] = streak
+        if streak < 2:
+            trade["_thesis_skip_log"] = (
+                f"THESIS_ARM {ticker} score={score:.0f} (1/2) — waiting for confirmation"
+            )
+            return None
         return "THESIS_VOID"
+    trade["thesis_below_streak"] = 0
     return None
 
 
@@ -1292,6 +1408,7 @@ def run_scan_exits(
         "skipped_no_mark": [],
         "mark_fail_alerts": [],
         "time_stop_skipped": [],
+        "thesis_skipped": [],
         "eod_triggered": False,
         "open_before": len(open_trades),
         "open_after": None,
@@ -1430,6 +1547,8 @@ def run_scan_exits(
             include_time_stop=True,
             do_eod=do_eod,
             live_score=live_score,
+            card=card,
+            options_dict=options_dict,
         )
         if reason is None and mark is None:
             u_reason, u_px = underlying_exit_reason(trade, mark_info.get("spot"))
@@ -1442,6 +1561,16 @@ def run_scan_exits(
         if skip_log:
             summary["time_stop_skipped"].append(skip_log)
             print(f"[Exits] {skip_log}")
+        thesis_skip = trade.pop("_thesis_skip_log", None)
+        if thesis_skip:
+            summary.setdefault("thesis_skipped", []).append(thesis_skip)
+            print(f"[Exits] {thesis_skip}")
+        if thesis_skip or "thesis_below_streak" in trade:
+            try:
+                from tracker_agent import save_active_trade
+                save_active_trade(trade)
+            except Exception:
+                pass
 
         if reason is None:
             continue
