@@ -101,6 +101,49 @@ def fetch_options_data(ticker_symbol):
     return json.dumps(options_dict, indent=2)
 
 
+def fetch_spot(ticker_symbol: str) -> float | None:
+    """
+    Underlying last only — history / fast_info, never option_chain.
+
+    Yahoo's chart endpoint often keeps working while v7/finance/options
+    is throttled. Used for UNDERLYING_STOP when the chain is dark.
+    """
+    ticker_symbol = str(ticker_symbol or "").upper().strip()
+    if not ticker_symbol:
+        return None
+    stock = yf.Ticker(ticker_symbol, session=SESSION)
+    try:
+        hist = stock.history(period="1d")
+        if hist is not None and not hist.empty and "Close" in hist.columns:
+            px = float(hist["Close"].iloc[-1])
+            if px == px and px > 0:
+                return round(px, 2)
+    except Exception:
+        pass
+    try:
+        fi = getattr(stock, "fast_info", None)
+        if fi is not None:
+            raw = fi.get("lastPrice") if hasattr(fi, "get") else fi["lastPrice"]
+            px = float(raw)
+            if px == px and px > 0:
+                return round(px, 2)
+    except Exception:
+        pass
+    return None
+
+
+def _spot_or_na(stock) -> float | str:
+    try:
+        current_price = round(stock.history(period="1d")["Close"].iloc[-1], 2)
+        return current_price
+    except Exception:
+        try:
+            fi = getattr(stock, "fast_info", None)
+            return round(float(fi["lastPrice"]), 2) if fi else "N/A"
+        except Exception:
+            return "N/A"
+
+
 def fetch_contract_quote(
     ticker_symbol: str,
     expiration: str,
@@ -131,39 +174,34 @@ def fetch_contract_quote(
         f"[quote] {ticker_symbol} {side[:-1]} {strike_f:g} exp={exp} (single-expiry)"
     )
     stock = yf.Ticker(ticker_symbol, session=SESSION)
+    current_price = _spot_or_na(stock)
 
-    try:
-        current_price = round(stock.history(period="1d")["Close"].iloc[-1], 2)
-    except Exception:
-        try:
-            fi = getattr(stock, "fast_info", None)
-            current_price = round(float(fi["lastPrice"]), 2) if fi else "N/A"
-        except Exception:
-            current_price = "N/A"
+    def _err(msg: str) -> str:
+        body = {"error": msg, "ticker": ticker_symbol, "current_price": current_price}
+        return json.dumps(body)
 
     # Resolve expiry string to a listed date (Yahoo sometimes uses exact YYYY-MM-DD)
-    listed = list(stock.options or [])
+    try:
+        listed = list(stock.options or [])
+    except Exception as e:
+        return _err(f"options list failed: {e}")
     if exp not in listed:
         # nearest listed match by prefix / equality on date
         matches = [e for e in listed if str(e)[:10] == exp]
         if not matches:
-            return json.dumps(
-                {
-                    "error": (
-                        f"expiration {exp} not in Yahoo options list for {ticker_symbol}"
-                    )
-                }
+            return _err(
+                f"expiration {exp} not in Yahoo options list for {ticker_symbol}"
             )
         exp = matches[0]
 
     try:
         chain = stock.option_chain(exp)
     except Exception as e:
-        return json.dumps({"error": f"option_chain({exp}) failed: {e}"})
+        return _err(f"option_chain({exp}) failed: {e}")
 
     df = chain.puts if side == "puts" else chain.calls
     if df is None or getattr(df, "empty", True):
-        return json.dumps({"error": f"empty {side} chain for {ticker_symbol} {exp}"})
+        return _err(f"empty {side} chain for {ticker_symbol} {exp}")
 
     columns_to_keep = [
         "strike",
@@ -177,7 +215,7 @@ def fetch_contract_quote(
     ]
     present = [c for c in columns_to_keep if c in df.columns]
     if not present or "strike" not in present:
-        return json.dumps({"error": "chain missing strike columns"})
+        return _err("chain missing strike columns")
 
     rows = df[present].fillna(0).to_dict(orient="records")
     best = None
@@ -192,13 +230,7 @@ def fetch_contract_quote(
             best_dist = dist
             best = r
     if best is None:
-        return json.dumps(
-            {
-                "error": (
-                    f"strike {strike_f} not found on {ticker_symbol} {exp} {side}"
-                )
-            }
-        )
+        return _err(f"strike {strike_f} not found on {ticker_symbol} {exp} {side}")
 
     options_dict = {
         "ticker": ticker_symbol,

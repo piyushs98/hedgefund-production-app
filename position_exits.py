@@ -400,6 +400,10 @@ def run_morning_carry_review(
             do_eod=False,
             live_score=live_score,
         )
+        if reason is None and mark is None:
+            u_reason, u_px = underlying_exit_reason(trade, mark_info.get("spot"))
+            if u_reason and u_px is not None:
+                reason, exit_px = u_reason, u_px
 
         # Format line
         label = _fmt_contract_label(trade)
@@ -476,6 +480,149 @@ def _f(val: Any) -> float | None:
         return None
 
 
+def _trade_delta(trade: dict[str, Any]) -> tuple[float | None, bool]:
+    """Return (|delta|, estimated). Missing → 0.50 estimated."""
+    raw = trade.get("delta")
+    if raw is None and isinstance(trade.get("option_contract"), dict):
+        raw = trade["option_contract"].get("delta")
+    if raw is None:
+        raw = trade.get("underlying_delta")
+    d = _f(raw)
+    if d is None or abs(d) < 1e-6:
+        return 0.50, True
+    return abs(d), bool(trade.get("underlying_delta_est"))
+
+
+def _stop_entry_spot(trade: dict[str, Any]) -> float | None:
+    for key in ("stop_entry_spot", "spot"):
+        v = _f(trade.get(key))
+        if v is not None and v > 0:
+            return v
+    oc = trade.get("option_contract")
+    if isinstance(oc, dict):
+        v = _f(oc.get("spot"))
+        if v is not None and v > 0:
+            return v
+    v = _f(trade.get("entry_spot"))
+    if v is not None and v > 0:
+        return v
+    return None
+
+
+def ensure_underlying_levels(trade: dict[str, Any]) -> dict[str, Any]:
+    """
+    stop_spot / target_spot from entry underlying and |delta|.
+
+    calls: stop_spot = entry_spot - (entry_mid - SL) / |delta|
+    puts:  stop_spot = entry_spot + (entry_mid - SL) / |delta|
+    TP is the symmetric target_spot. Missing delta → 0.50, tagged estimated.
+    Does not change SL/TP premium levels used when a mark exists.
+    """
+    if not isinstance(trade, dict):
+        return {}
+    if _f(trade.get("stop_spot")) is not None and _f(trade.get("target_spot")) is not None:
+        return {
+            "stop_spot": _f(trade.get("stop_spot")),
+            "target_spot": _f(trade.get("target_spot")),
+            "stop_entry_spot": _stop_entry_spot(trade),
+            "underlying_delta": _trade_delta(trade)[0],
+            "underlying_delta_est": bool(trade.get("underlying_delta_est")),
+        }
+    entry = _entry_premium(trade)
+    sl = _f(trade.get("stop_loss"))
+    tp = _f(trade.get("take_profit") or trade.get("target_price"))
+    spot0 = _stop_entry_spot(trade)
+    abs_d, est = _trade_delta(trade)
+    is_put = "PUT" in _trade_direction(trade)
+    stop_spot = None
+    target_spot = None
+    if spot0 is not None and entry is not None and abs_d > 1e-6:
+        if sl is not None:
+            risk = entry - sl
+            if is_put:
+                stop_spot = spot0 + risk / abs_d
+            else:
+                stop_spot = spot0 - risk / abs_d
+        if tp is not None:
+            reward = tp - entry
+            if is_put:
+                target_spot = spot0 - reward / abs_d
+            else:
+                target_spot = spot0 + reward / abs_d
+    if stop_spot is not None:
+        trade["stop_spot"] = round(stop_spot, 4)
+    if target_spot is not None:
+        trade["target_spot"] = round(target_spot, 4)
+    if spot0 is not None:
+        trade["stop_entry_spot"] = spot0
+    trade["underlying_delta"] = abs_d
+    trade["underlying_delta_est"] = est
+    return {
+        "stop_spot": stop_spot,
+        "target_spot": target_spot,
+        "stop_entry_spot": spot0,
+        "underlying_delta": abs_d,
+        "underlying_delta_est": est,
+    }
+
+
+def estimate_premium_from_spot(trade: dict[str, Any], spot: float) -> float | None:
+    """Linear delta estimate. At exact stop_spot this equals SL."""
+    entry = _entry_premium(trade)
+    spot0 = _stop_entry_spot(trade)
+    if entry is None or spot0 is None:
+        return None
+    abs_d, _est = _trade_delta(trade)
+    signed = -abs_d if "PUT" in _trade_direction(trade) else abs_d
+    est = entry + (float(spot) - spot0) * signed
+    return max(0.01, round(est, 4))
+
+
+def underlying_exit_reason(
+    trade: dict[str, Any],
+    spot: float | None,
+) -> tuple[str | None, float | None]:
+    """
+    When the option mark is missing, fire SL/TP off the underlying.
+
+    Returns (UNDERLYING_STOP|UNDERLYING_TAKE_PROFIT, estimated_premium) or (None, None).
+    """
+    px = _f(spot)
+    if px is None or px <= 0:
+        return None, None
+    levels = ensure_underlying_levels(trade)
+    stop_spot = _f(levels.get("stop_spot"))
+    target_spot = _f(levels.get("target_spot"))
+    is_put = "PUT" in _trade_direction(trade)
+    prem = estimate_premium_from_spot(trade, px)
+    if prem is None:
+        prem = _f(trade.get("stop_loss")) or _entry_premium(trade)
+    if stop_spot is not None:
+        if is_put and px >= stop_spot:
+            return "UNDERLYING_STOP", prem
+        if (not is_put) and px <= stop_spot:
+            return "UNDERLYING_STOP", prem
+    if target_spot is not None:
+        if is_put and px <= target_spot:
+            return "UNDERLYING_TAKE_PROFIT", prem
+        if (not is_put) and px >= target_spot:
+            return "UNDERLYING_TAKE_PROFIT", prem
+    return None, None
+
+
+def _should_escalate(prev_alerted: int, streak: int) -> bool:
+    """First alert, then only when streak doubles or hits a multiple of 10."""
+    if streak <= 0:
+        return False
+    if prev_alerted <= 0:
+        return True
+    if streak >= prev_alerted * 2:
+        return True
+    if streak % 10 == 0 and streak > prev_alerted:
+        return True
+    return False
+
+
 _DATA_FAIL_BLOCKS = frozenset({"no_pivot_data", "no_atr_data"})
 
 
@@ -542,11 +689,12 @@ def lookup_option_mark(
         "spot": None,
         "found": False,
     }
-    if not isinstance(options_dict, dict) or "error" in options_dict:
+    if not isinstance(options_dict, dict):
         return out
-
     spot = _f(options_dict.get("current_price"))
     out["spot"] = spot
+    if "error" in options_dict:
+        return out
 
     exp = _trade_expiration(trade)
     strike = _trade_strike(trade)
@@ -770,6 +918,16 @@ def format_closed_discord_line(closed: dict[str, Any]) -> str:
         px_s = f"${float(px):g}" if px is not None else "?"
     except (TypeError, ValueError):
         px_s = str(px)
+    if str(reason).startswith("UNDERLYING_"):
+        try:
+            px_s = f"~{float(px):.2f}" if px is not None else "?"
+        except (TypeError, ValueError):
+            px_s = str(px)
+        spot = closed.get("spot")
+        lvl_name = "stop_spot" if "STOP" in str(reason) else "target_spot"
+        lvl = closed.get(lvl_name)
+        extra = f"est, mark unavailable, spot {spot} vs {lvl_name} {lvl}"
+        return f"**{ticker}** {reason} @ {px_s} ({extra})"
     line = f"**{ticker}** {reason} @ {px_s}"
     pnl = closed.get("pnl")
     if pnl is not None:
@@ -818,6 +976,9 @@ def close_open_position(
     exit_bid = _f(trade.get("last_bid"))
     if exit_bid is None:
         exit_bid = fill_accounting.extract_bid(trade)
+    # Underlying fallback is an estimated premium, not a bid.
+    if "UNDERLYING_" in str(reason):
+        exit_bid = None
     # TRADE records unrounded (bid+ask)/2 when present; debit/SL stay on
     # rounded entry_premium so sizing and stops do not change.
     record_mid = _f(trade.get("entry_mid"))
@@ -1052,19 +1213,27 @@ def _mark_fail_threshold() -> int:
 
 
 def _alert_mark_failure(trade: dict[str, Any], streak: int, *, all_failed: bool = False) -> None:
-    """Discord CRITICAL when marks fail and stops cannot be checked."""
+    """Discord CRITICAL when marks fail. First per position, then doubles / every 10."""
+    prev = 0
+    try:
+        prev = int(trade.get("mark_fail_alert_at") or 0)
+    except (TypeError, ValueError):
+        prev = 0
+    if not _should_escalate(prev, streak):
+        return
+    trade["mark_fail_alert_at"] = streak
     label = _fmt_contract_label(trade)
     if all_failed:
         msg = (
             f"🚨 **CRITICAL: MARK FAILED (all open)**\n"
             f"`{label}` and other open positions: **0 marks obtained** this pass.\n"
-            f"Stops / TP / trail are **not being checked**. Investigate Yahoo/options."
+            f"Underlying fallback stop applies if spot is live. "
+            f"Consecutive mark failures: {streak}."
         )
     else:
         msg = (
             f"🚨 **CRITICAL: MARK FAILED {label} x{streak}**\n"
-            f"Stop not being checked for this position "
-            f"({streak} consecutive mark failures)."
+            f"Option mark missing. Underlying stop used if spot is available."
         )
     print(f"[Exits] {msg.replace(chr(10), ' | ')}")
     try:
@@ -1072,6 +1241,26 @@ def _alert_mark_failure(trade: dict[str, Any], streak: int, *, all_failed: bool 
         broadcaster.send_discord_alert(msg)
     except Exception as e:
         print(f"[Exits] mark-fail Discord warn: {e}")
+
+
+def _alert_unprotected(trade: dict[str, Any], minutes: float) -> None:
+    if trade.get("unprotected_alerted"):
+        return
+    trade["unprotected_alerted"] = True
+    label = _fmt_contract_label(trade)
+    msg = (
+        f"🚨 **CRITICAL: UNPROTECTED {label}**\n"
+        f"No option mark and no underlying spot for {minutes:.0f} minutes "
+        f"(MARK_BLACKOUT_MINUTES="
+        f"{int(getattr(config, 'MARK_BLACKOUT_MINUTES', 45))}). "
+        f"Stop is not being checked. Manual action may be required."
+    )
+    print(f"[Exits] {msg.replace(chr(10), ' | ')}")
+    try:
+        import broadcaster
+        broadcaster.send_discord_alert(msg)
+    except Exception as e:
+        print(f"[Exits] UNPROTECTED Discord warn: {e}")
 
 
 def run_scan_exits(
@@ -1145,6 +1334,10 @@ def run_scan_exits(
         if mark is not None:
             summary["marks_ok"] += 1
             trade["mark_fail_streak"] = 0
+            trade["mark_fail_alert_at"] = 0
+            trade.pop("unmarked_since", None)
+            trade.pop("spot_dark_since", None)
+            trade.pop("unprotected_alerted", None)
             if live_score is not None:
                 trade["last_live_score"] = live_score
             if record_position_mark(
@@ -1178,6 +1371,24 @@ def run_scan_exits(
                 streak = 1
             trade["mark_fail_streak"] = streak
             trade["last_mark_fail_at"] = datetime.now(timezone.utc).isoformat()
+            if not trade.get("unmarked_since"):
+                trade["unmarked_since"] = datetime.now(timezone.utc).isoformat()
+            spot = _f(mark_info.get("spot"))
+            if spot is None:
+                try:
+                    from data_engineer import fetch_spot as _fetch_spot
+                    spot = _fetch_spot(ticker)
+                    if spot is not None:
+                        mark_info["spot"] = spot
+                except Exception:
+                    pass
+            if spot is not None:
+                trade["last_spot"] = spot
+                trade["last_spot_at"] = datetime.now(timezone.utc).isoformat()
+                trade.pop("spot_dark_since", None)
+            else:
+                if not trade.get("spot_dark_since"):
+                    trade["spot_dark_since"] = datetime.now(timezone.utc).isoformat()
             try:
                 from tracker_agent import save_active_trade
                 save_active_trade(trade)
@@ -1187,6 +1398,26 @@ def run_scan_exits(
                 label = _fmt_contract_label(trade)
                 summary["mark_fail_alerts"].append(f"{label} x{streak}")
                 _alert_mark_failure(trade, streak, all_failed=False)
+            if spot is None:
+                try:
+                    since = _parse_entry_time(
+                        {"entry_timestamp": trade.get("spot_dark_since")
+                         or trade.get("unmarked_since")}
+                    )
+                    if since is not None:
+                        mins = (
+                            datetime.now(timezone.utc) - since.astimezone(timezone.utc)
+                        ).total_seconds() / 60.0
+                        blackout = float(getattr(config, "MARK_BLACKOUT_MINUTES", 45))
+                        if mins >= blackout:
+                            _alert_unprotected(trade, mins)
+                            try:
+                                from tracker_agent import save_active_trade
+                                save_active_trade(trade)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
         # B1 selective EOD (cal_dte < CARRY_MIN_DTE only), C-D 0DTE, B2–B5
         # TIME_STOP uses live_score or last_live_score; exempt if >= TIME_STOP_SCORE_EXEMPT
@@ -1200,6 +1431,13 @@ def run_scan_exits(
             do_eod=do_eod,
             live_score=live_score,
         )
+        if reason is None and mark is None:
+            u_reason, u_px = underlying_exit_reason(trade, mark_info.get("spot"))
+            if u_reason and u_px is not None:
+                reason, exit_px = u_reason, u_px
+                trade["_underlying_spot"] = mark_info.get("spot")
+                trade["_underlying_stop_spot"] = trade.get("stop_spot")
+                trade["_underlying_target_spot"] = trade.get("target_spot")
         skip_log = trade.pop("_time_stop_skip_log", None)
         if skip_log:
             summary["time_stop_skipped"].append(skip_log)
@@ -1213,6 +1451,20 @@ def run_scan_exits(
             continue
 
         closed = close_open_position(trade, float(exit_px), reason)
+        if str(reason).startswith("UNDERLYING_"):
+            closed["fill_est"] = True
+            closed["spot"] = trade.get("_underlying_spot") or mark_info.get("spot")
+            closed["stop_spot"] = trade.get("stop_spot")
+            closed["target_spot"] = trade.get("target_spot")
+            spot_s = closed.get("spot")
+            lvl = closed.get("stop_spot") if "STOP" in str(reason) else closed.get("target_spot")
+            line = (
+                f"{ticker} {reason} @ ~{float(exit_px):.2f} "
+                f"(est, mark unavailable, spot {spot_s} vs "
+                f"{'stop_spot' if 'STOP' in str(reason) else 'target_spot'} {lvl})"
+            )
+            print(f"[Exits] {line}")
+            closed["underlying_line"] = line
         summary["closed"].append(closed)
 
     if do_eod:

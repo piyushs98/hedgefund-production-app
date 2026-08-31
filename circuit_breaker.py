@@ -34,6 +34,8 @@ class CircuitBreaker:
         self.cooldown_seconds = cooldown_seconds
         self.db_path = db_path or config.HEDGE_DB_PATH
         self._init_table()
+        # Alert throttle: first OPEN, then doubles / every 10th failure.
+        self._alert_watermark = 0
 
     def _init_table(self):
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
@@ -91,17 +93,29 @@ class CircuitBreaker:
         print(f"🔌 [Circuit Breaker] Failure {failures}/{self.failure_threshold} from '{source}'.")
         if failures >= self.failure_threshold and s["state"] != "OPEN":
             self._write(failures=failures, state="OPEN", opened_at=time.time(), source=source)
+            prev = int(self._alert_watermark or 0)
+            escalate = prev <= 0 or failures >= prev * 2 or (
+                failures % 10 == 0 and failures > prev
+            )
             msg = (
                 f"🛑 **[KILL-SWITCH ENGAGED]** Circuit breaker OPEN after {failures} consecutive "
                 f"data-extraction failures (last: `{source}`). Portfolio scans suspended for "
-                f"{self.cooldown_seconds // 60} minutes; a single probe will test recovery afterwards."
+                f"{self.cooldown_seconds // 60} minutes; a single probe will test recovery afterwards. "
+                f"Exit-only still checks underlying stops via spot."
             )
             print(msg)
-            if broadcaster:
-                try:
-                    broadcaster.send_discord_alert(msg)
-                except Exception as e:
-                    print(f"[Circuit Breaker] Alert broadcast failed: {e}")
+            if escalate:
+                self._alert_watermark = failures
+                if broadcaster:
+                    try:
+                        broadcaster.send_discord_alert(msg)
+                    except Exception as e:
+                        print(f"[Circuit Breaker] Alert broadcast failed: {e}")
+            else:
+                print(
+                    f"[Circuit Breaker] OPEN re-trip suppressed "
+                    f"(failures={failures}, last_alert={prev})"
+                )
         else:
             self._write(failures=failures, source=source)
 
@@ -110,6 +124,7 @@ class CircuitBreaker:
         if s["state"] == "HALF_OPEN":
             print(f"✅ [Circuit Breaker] Probe via '{source}' succeeded — breaker CLOSED.")
             self._write(failures=0, state="CLOSED", opened_at=0.0)
+            self._alert_watermark = 0
             if broadcaster:
                 try:
                     broadcaster.send_discord_alert(

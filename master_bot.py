@@ -369,7 +369,19 @@ def record_executed_trade(ticker, contract, scan_id=None, card=None, pivot_data=
         "entry_calendar_dte": contract.get("calendar_dte"),
         "entry_dte": contract.get("days_to_expiration"),
         "quantity": int(contract.get("quantity") or 1),
+        "delta": contract.get("delta"),
+        "spot": contract.get("spot"),
     }
+    if contract.get("delta") is not None:
+        option_contract["delta"] = contract.get("delta")
+    if contract.get("spot") is not None:
+        trade_payload["stop_entry_spot"] = contract.get("spot")
+        option_contract["spot"] = contract.get("spot")
+    try:
+        import position_exits as _pex
+        _pex.ensure_underlying_levels(trade_payload)
+    except Exception as _und_err:
+        print(f"[CEO] underlying stop_spot stamp warn {ticker}: {_und_err}")
 
     # Dual-write: active_trades.json + news_room.db active_trades_store
     ok = save_active_trade(trade_payload, path=ACTIVE_TRADES_PATH)

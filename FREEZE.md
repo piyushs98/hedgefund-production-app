@@ -26,6 +26,7 @@ is the durable store. Reconstruct from TRADE and SESSION lines.
 | Date | Reason |
 |---|---|
 | 2026-08-24 | Before first counted session: SESSION trailing `bp` (col 18); TRADE prints unrounded entry_mid/ask so recovered spread on $1–$2.50 names is not blurred by round(mid, 2). Trading debit/SL/TP still use rounded premium. `MAX_CONTRACT_SPREAD_PCT` still 8.0. |
+| 2026-08-30 | Freeze exception: Aug 28 option-mark outage left two carried lots unmarked 08:55–13:01 (NVDA −4.58R vs −1.04R stop; MSFT TP luck). Underlying-based fallback stop/TP (`UNDERLYING_STOP`, fill=est) when chain is dark but spot is live; UNPROTECTED CRITICAL after MARK_BLACKOUT_MINUTES (45) with no mark and no spot; mark/kill-switch CRITICAL spam throttled (first, then double / every 10th). Exit-only no longer fans out full chains on a quote failure. Aug 28 discarded; count restarts on the next clean session. Scoring, sizing, premium SL/TP, and spread cap unchanged. |
 
 ## Post-measurement candidates (do not implement during the freeze)
 

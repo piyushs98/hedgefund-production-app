@@ -51,6 +51,7 @@ class TestGateDefaults(unittest.TestCase):
         self.assertEqual(config.BLACKOUT_DAYS_AFTER, 1)
         self.assertTrue(config.EARNINGS_FLATTEN_SPANNING)
         self.assertEqual(config.MIDDAY_LLM_TIMEOUT_S, 60)
+        self.assertEqual(config.MARK_BLACKOUT_MINUTES, 45)
 
 
 class TestMarkLookup(unittest.TestCase):
@@ -741,5 +742,251 @@ class TestCloseWiresGate(unittest.TestCase):
         rem.assert_called_once()
 
 
+class TestUnderlyingStop(unittest.TestCase):
+    def test_call_stop_spot_formula(self):
+        trade = {
+            "ticker": "NVDA",
+            "direction": "CALL",
+            "entry_price": 1.795,
+            "stop_loss": 1.436,
+            "take_profit": 2.693,
+            "stop_entry_spot": 219.818,
+            "delta": 0.50,
+        }
+        levels = position_exits.ensure_underlying_levels(trade)
+        self.assertAlmostEqual(levels["stop_spot"], 219.10, places=1)
+        # TP 2.693 - 1.795 = 0.898 / 0.50 = 1.796
+        self.assertAlmostEqual(levels["target_spot"], 221.61, places=1)
+
+    def test_put_stop_spot_formula(self):
+        trade = {
+            "ticker": "QQQ",
+            "direction": "PUT",
+            "entry_price": 2.00,
+            "stop_loss": 1.60,
+            "take_profit": 3.00,
+            "stop_entry_spot": 500.0,
+            "delta": -0.50,
+        }
+        levels = position_exits.ensure_underlying_levels(trade)
+        self.assertAlmostEqual(levels["stop_spot"], 500.80, places=2)
+        self.assertAlmostEqual(levels["target_spot"], 498.00, places=2)
+
+    def test_missing_delta_uses_half_and_tags_estimated(self):
+        trade = {
+            "ticker": "MSFT",
+            "direction": "CALL",
+            "entry_price": 2.79,
+            "stop_loss": 2.23,
+            "take_profit": 4.185,
+            "stop_entry_spot": 510.0,
+        }
+        levels = position_exits.ensure_underlying_levels(trade)
+        self.assertTrue(levels["underlying_delta_est"])
+        self.assertAlmostEqual(levels["underlying_delta"], 0.50)
+        self.assertAlmostEqual(
+            levels["stop_spot"],
+            510.0 - (2.79 - 2.23) / 0.50,
+            places=2,
+        )
+
+    def test_underlying_stop_fires_when_mark_missing_spot_through(self):
+        trade = {
+            "ticker": "NVDA",
+            "direction": "CALL",
+            "strike": 230,
+            "expiration": "2026-08-31",
+            "entry_price": 1.795,
+            "stop_loss": 1.436,
+            "take_profit": 2.693,
+            "stop_entry_spot": 219.818,
+            "delta": 0.50,
+            "entry_timestamp": "2026-08-27T14:00:00Z",
+        }
+        scored = {
+            "NVDA": {
+                "options_dict": {
+                    "current_price": 218.57,
+                    "error": "option_chain failed",
+                    "chains": {},
+                },
+                "card": None,
+            }
+        }
+        with mock.patch("position_exits.close_open_position") as close:
+            close.return_value = {
+                "ticker": "NVDA",
+                "reason": "UNDERLYING_STOP",
+                "ok": True,
+                "exit_price": 1.17,
+            }
+            with mock.patch("tracker_agent.save_active_trade", return_value=True):
+                with mock.patch(
+                    "tracker_agent.load_active_trades", return_value=[]
+                ):
+                    with mock.patch("broadcaster.send_discord_alert", return_value=True):
+                        summary = position_exits.run_scan_exits(
+                            [trade],
+                            scored,
+                            session_date=date(2026, 8, 28),
+                            force_eod=False,
+                            now_cdt=datetime(2026, 8, 28, 10, 0, 0),
+                        )
+        self.assertEqual(len(summary["closed"]), 1)
+        self.assertEqual(close.call_args[0][2], "UNDERLYING_STOP")
+        # Estimated premium ≈ SL at the stop_spot; further through → below SL
+        self.assertLess(close.call_args[0][1], 1.436)
+
+    def test_underlying_tp_fires_call(self):
+        trade = {
+            "ticker": "MSFT",
+            "direction": "CALL",
+            "strike": 510,
+            "expiration": "2026-09-04",
+            "entry_price": 2.79,
+            "stop_loss": 2.23,
+            "take_profit": 4.185,
+            "stop_entry_spot": 505.0,
+            "delta": 0.50,
+        }
+        reason, px = position_exits.underlying_exit_reason(trade, 510.0)
+        self.assertEqual(reason, "UNDERLYING_TAKE_PROFIT")
+        self.assertIsNotNone(px)
+
+    def test_spot_not_through_does_not_fire(self):
+        trade = {
+            "ticker": "NVDA",
+            "direction": "CALL",
+            "entry_price": 1.795,
+            "stop_loss": 1.436,
+            "take_profit": 2.693,
+            "stop_entry_spot": 219.818,
+            "delta": 0.50,
+        }
+        reason, px = position_exits.underlying_exit_reason(trade, 220.50)
+        self.assertIsNone(reason)
+        self.assertIsNone(px)
+
+    def test_real_mark_still_uses_premium_stop(self):
+        trade = {
+            "trade_id": "t-nvda",
+            "ticker": "NVDA",
+            "direction": "CALL",
+            "strike": 230.0,
+            "expiration": "2026-08-31",
+            "entry_price": 1.795,
+            "stop_loss": 1.436,
+            "take_profit": 2.693,
+            "stop_entry_spot": 219.818,
+            "delta": 0.50,
+        }
+        # Mark through SL; spot still above stop_spot — premium stop wins
+        scored = {
+            "NVDA": {
+                "options_dict": {
+                    "current_price": 221.0,
+                    "chains": {
+                        "2026-08-31": {
+                            "calls": [
+                                {"strike": 230.0, "bid": 1.00, "ask": 1.20, "lastPrice": 1.10}
+                            ],
+                            "puts": [],
+                        }
+                    },
+                },
+                "card": None,
+            }
+        }
+        with mock.patch("position_exits.close_open_position") as close:
+            close.return_value = {"ticker": "NVDA", "reason": "STOP_LOSS", "ok": True}
+            with mock.patch("position_exits.record_position_mark", return_value=True):
+                with mock.patch("tracker_agent.save_active_trade", return_value=True):
+                    with mock.patch(
+                        "tracker_agent.load_active_trades", return_value=[]
+                    ):
+                        position_exits.run_scan_exits(
+                            [trade],
+                            scored,
+                            session_date=date(2026, 8, 27),
+                            force_eod=False,
+                        )
+        self.assertEqual(close.call_args[0][2], "STOP_LOSS")
+
+    def test_discord_line_tags_underlying(self):
+        line = position_exits.format_closed_discord_line(
+            {
+                "ticker": "NVDA",
+                "reason": "UNDERLYING_STOP",
+                "exit_price": 0.42,
+                "spot": 218.57,
+                "stop_spot": 219.10,
+            }
+        )
+        self.assertIn("UNDERLYING_STOP", line)
+        self.assertIn("~0.42", line)
+        self.assertIn("est, mark unavailable", line)
+        self.assertIn("218.57", line)
+        self.assertIn("219.1", line)
+
+
+class TestAlertThrottle(unittest.TestCase):
+    def test_escalates_first_then_double_then_ten(self):
+        self.assertTrue(position_exits._should_escalate(0, 2))
+        self.assertFalse(position_exits._should_escalate(2, 3))
+        self.assertTrue(position_exits._should_escalate(2, 4))
+        self.assertFalse(position_exits._should_escalate(4, 7))
+        self.assertTrue(position_exits._should_escalate(4, 8))
+        self.assertTrue(position_exits._should_escalate(8, 10))
+        self.assertFalse(position_exits._should_escalate(10, 15))
+        self.assertTrue(position_exits._should_escalate(10, 20))
+
+    def test_mark_fail_does_not_alert_every_streak(self):
+        trade = {
+            "ticker": "IWM",
+            "direction": "CALL",
+            "strike": 302.0,
+            "expiration": "2026-08-05",
+            "entry_price": 1.42,
+            "mark_fail_alert_at": 2,
+            "mark_fail_streak": 2,
+        }
+        alerts = []
+        position_exits._alert_mark_failure(trade, 3)
+        self.assertEqual(alerts, [])
+        with mock.patch(
+            "broadcaster.send_discord_alert",
+            side_effect=lambda m: alerts.append(m) or True,
+        ):
+            position_exits._alert_mark_failure(trade, 4)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(trade["mark_fail_alert_at"], 4)
+
+
+class TestCircuitBreakerAlertThrottle(unittest.TestCase):
+    def test_reopen_does_not_alert_every_time(self):
+        import tempfile
+        import os
+        from circuit_breaker import CircuitBreaker
+
+        tmp = tempfile.TemporaryDirectory()
+        db = os.path.join(tmp.name, "h.db")
+        alerts = []
+        br = CircuitBreaker(failure_threshold=2, cooldown_seconds=0, db_path=db)
+        with mock.patch("circuit_breaker.broadcaster") as b:
+            b.send_discord_alert.side_effect = lambda m: alerts.append(m) or True
+            br.record_failure("a")
+            br.record_failure("a")  # first OPEN
+            first = len(alerts)
+            self.assertGreaterEqual(first, 1)
+            br._write(state="HALF_OPEN")
+            br.record_failure("a")  # re-OPEN, failures=3, not double of 2
+            self.assertEqual(len(alerts), first)
+            br._write(state="HALF_OPEN")
+            br.record_failure("a")  # failures=4 = 2*2, escalate
+            self.assertGreater(len(alerts), first)
+        tmp.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()
+

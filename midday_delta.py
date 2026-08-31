@@ -1502,8 +1502,71 @@ def run_exit_only_pass(
     }
 
     if breaker.is_open():
-        print("🛑 [exit-pass] Circuit breaker OPEN — exit pass suspended.")
-        result["aborted"] = True
+        print(
+            "🛑 [exit-pass] Circuit breaker OPEN — chain quotes skipped; "
+            "still checking underlying stops via spot."
+        )
+        result["circuit_breaker_open"] = True
+        try:
+            from data_engineer import fetch_spot as _fetch_spot
+            from tracker_agent import load_active_trades as _load
+            import position_exits as _pex
+            open_trades = _load() or []
+            result["open_before"] = len(open_trades)
+            if not open_trades:
+                result["aborted"] = True
+                return result
+            scored_spot: dict[str, dict] = {}
+            for t in open_trades:
+                if not isinstance(t, dict) or not t.get("ticker"):
+                    continue
+                tk = str(t["ticker"]).upper()
+                spot = None
+                try:
+                    spot = _fetch_spot(tk)
+                except Exception as se:
+                    print(f"[exit-pass] [{tk}] spot-only fetch failed: {se}")
+                scored_spot[tk] = {
+                    "options_dict": {
+                        "current_price": spot,
+                        "error": "circuit_breaker_open",
+                        "chains": {},
+                    },
+                    "card": None,
+                    "pivot_data": {},
+                }
+            exit_summary = _pex.run_scan_exits(
+                open_trades,
+                scored_spot,
+                scan_id=scan_id,
+                now_cdt=_chicago_now(),
+            )
+            result["closed"] = [
+                {
+                    "ticker": c.get("ticker"),
+                    "reason": c.get("reason"),
+                    "exit_price": c.get("exit_price"),
+                    "pnl": c.get("pnl"),
+                }
+                for c in (exit_summary.get("closed") or [])
+            ]
+            if exit_summary.get("closed"):
+                try:
+                    import broadcaster
+                    lines = [
+                        _pex.format_closed_discord_line(c)
+                        for c in exit_summary["closed"]
+                    ]
+                    broadcaster.send_discord_alert(
+                        f"📉 **EXIT PASS [{clock} CDT]**\n" + "\n".join(lines)
+                    )
+                except Exception as disc_err:
+                    print(f"[exit-pass] Discord warn: {disc_err}")
+            result["marks_failed"] = exit_summary.get("marks_failed")
+            result["open_after"] = exit_summary.get("open_after")
+        except Exception as e:
+            print(f"[exit-pass] breaker-open underlying pass failed: {e}")
+            result["aborted"] = True
         return result
 
     try:
@@ -1628,36 +1691,36 @@ def run_exit_only_pass(
                             pass
                 else:
                     print(
-                        f"[exit-pass] [{ticker}] light quote failed: {od.get('error')} "
-                        f"— trying full chain"
+                        f"[exit-pass] [{ticker}] light quote failed: {od.get('error')}"
                     )
+                    # Spot often survives chain throttle — keep it and skip
+                    # the full-chain hammer that worsens Yahoo v7 rate limits.
+                    if od.get("current_price") not in (None, "N/A", ""):
+                        options_dict = od
+                        mode = "spot_only"
+                    breaker.record_failure(f"exit_quote:{ticker}")
             except MasterBotScanError as e:
                 print(f"[exit-pass] [{ticker}] light quote timeout: {e.message}")
+                breaker.record_failure(f"exit_quote:{ticker}")
             except Exception as e:
                 print(f"[exit-pass] [{ticker}] light quote error: {e}")
+                breaker.record_failure(f"exit_quote:{ticker}")
 
-        # --- fallback: full multi-expiry chain ---
+        # Spot-only if the chain path died. Do not fan out full multi-expiry
+        # chains on a quote failure — that is what kept the v7 endpoint hot.
         if options_dict is None:
             try:
-                options_json = _call_with_timeout(
-                    lambda t=ticker: fetch_options_data(t),
-                    timeout_s=API_CALL_TIMEOUT_S,
-                    step=f"exit_yf_options_fallback:{ticker}",
-                )
-                od = json.loads(options_json)
-                if "error" not in od:
-                    options_dict = od
-                    mode = "full_chain_fallback"
-                    breaker.record_success(f"exit_options:{ticker}")
-                else:
-                    print(f"[exit-pass] [{ticker}] full chain error: {od.get('error')}")
-                    breaker.record_failure(f"exit_options:{ticker}")
-            except MasterBotScanError as e:
-                print(f"[exit-pass] [{ticker}] full chain isolated: {e.step}: {e.message}")
-                breaker.record_failure(f"exit_options:{ticker}")
-            except Exception as e:
-                print(f"[exit-pass] [{ticker}] full chain error: {e}")
-                breaker.record_failure(f"exit_options:{ticker}")
+                from data_engineer import fetch_spot as _fs
+                spot = _fs(ticker)
+                if spot is not None:
+                    options_dict = {
+                        "current_price": spot,
+                        "error": "quote_failed",
+                        "chains": {},
+                    }
+                    mode = "spot_only"
+            except Exception as se:
+                print(f"[exit-pass] [{ticker}] spot fallback failed: {se}")
 
         result["quote_mode_counts"][mode] = (
             result["quote_mode_counts"].get(mode, 0) + 1
@@ -1678,6 +1741,7 @@ def run_exit_only_pass(
     print(
         f"[exit-pass] quote modes: single={result['quote_mode_counts'].get('single_contract', 0)} "
         f"fallback={result['quote_mode_counts'].get('full_chain_fallback', 0)} "
+        f"spot_only={result['quote_mode_counts'].get('spot_only', 0)} "
         f"failed={result['quote_mode_counts'].get('failed', 0)}"
     )
 
