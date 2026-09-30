@@ -396,6 +396,11 @@ def record_executed_trade(ticker, contract, scan_id=None, card=None, pivot_data=
             "[CEO] Successfully recorded new position to active_trades.json "
             "and SQLite active_trades_store"
         )
+        try:
+            import book_state
+            book_state.emit_book_state(reason="open")
+        except Exception as bs_err:
+            print(f"[CEO] BOOK_STATE emit warn: {bs_err}")
     else:
         try:
             import write_guard
@@ -1455,6 +1460,11 @@ def run_macro_loop():
         virtual_broker.reset_ledger_if_requested()
     except Exception as reset_err:
         print(f"[System] WARNING: ledger reset failed: {reset_err}")
+    try:
+        import book_state
+        book_state.restore_at_boot()
+    except Exception as restore_err:
+        print(f"[System] WARNING: BOOK_STATE restore failed: {restore_err}")
     # Resolved Part C knobs (env at process start — restart to retune without code change)
     try:
         import fill_accounting as _fa
@@ -1671,6 +1681,17 @@ def run_macro_loop():
                 continue
 
             elif is_trading_mode:
+                try:
+                    import book_state as _bs
+                    if _bs.trading_blocked():
+                        print(
+                            f"[System State] TRADING HALTED: {_bs.block_reason()} "
+                            "Set CONFIRM_STALE_BOOK=<BOOK_STATE date> and restart."
+                        )
+                        time.sleep(60)
+                        continue
+                except Exception as halt_err:
+                    print(f"[System] trading-halt check warn: {halt_err}")
                 print(
                     f"\n[System State] 📈 ACTIVE TRADING MODE "
                     f"(EST {now.strftime('%H:%M:%S')} | CDT {cdt_clock_str(now_cdt)})"

@@ -345,6 +345,19 @@ def _write_trades(trades: list[dict[str, Any]], store: Path) -> bool:
         return False
 
 
+def replace_active_trades(
+    trades: list[dict[str, Any]],
+    path: Path | str | None = None,
+) -> bool:
+    """Overwrite the open book with `trades` (JSON + SQLite mirror)."""
+    store = Path(path) if path else ACTIVE_TRADES_PATH
+    if not isinstance(trades, list):
+        print("[Tracker] replace_active_trades: expected a list")
+        return False
+    cleaned = [t for t in trades if isinstance(t, dict) and t.get("ticker")]
+    return _write_trades(cleaned, store)
+
+
 # ===========================================================================
 # SQLITE MIRROR (active_trades_store in news_room.db)
 # ---------------------------------------------------------------------------

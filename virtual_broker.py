@@ -138,6 +138,53 @@ def reset_book_for_tests() -> None:
         pass
 
 
+def restore_ledger_snapshot(
+    *,
+    buying_power: float,
+    realized_mid: float,
+    realized_fill: float,
+) -> None:
+    """Overwrite portfolio_ledger from a Discord BOOK_STATE. No paper_buy replay."""
+    ensure_ledger()
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE portfolio_ledger
+            SET buying_power = ?, total_realized_pnl = ?,
+                total_realized_pnl_fill = ?, updated_at = ?
+            WHERE id = 1
+            """,
+            (
+                float(buying_power),
+                float(realized_mid),
+                float(realized_fill),
+                now,
+            ),
+        )
+        conn.commit()
+    _book["session_date"] = None
+
+
+def restore_session_book(
+    *,
+    session_date: str | None,
+    start_realized: float = 0.0,
+    start_realized_fill: float = 0.0,
+    peak_deployed: float = 0.0,
+    open_cost: float | None = None,
+) -> None:
+    """Rehydrate in-process peak-deployed book after a Discord restore."""
+    _book["session_date"] = session_date
+    _book["start_realized"] = float(start_realized or 0.0)
+    _book["start_realized_fill"] = float(start_realized_fill or 0.0)
+    _book["peak_deployed"] = float(peak_deployed or 0.0)
+    if open_cost is not None:
+        _book["open_cost"] = float(open_cost)
+    else:
+        _book["open_cost"] = _deployed_from_open_trades()
+
+
 def _chicago_date_str() -> str:
     try:
         import pytz

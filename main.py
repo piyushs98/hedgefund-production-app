@@ -20,13 +20,22 @@ Serve with (Procfile):
 
 from __future__ import annotations
 
+import atexit
 import os
+import signal
 import time
 import traceback
 from datetime import datetime, timezone
 from threading import Lock, Thread
 
 from flask import Flask, jsonify
+
+_PROCESS_START_MONO = time.monotonic()
+_shutdown_hook_installed = False
+
+
+def hours_awake_this_session() -> float:
+    return max(0.0, (time.monotonic() - _PROCESS_START_MONO) / 3600.0)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -89,10 +98,19 @@ def start_master_bot() -> None:
 # ===========================================================================
 
 @app.route("/")
+def home():
+    """Cheap liveness for pingers that expect a plain body."""
+    return "OK", 200
+
+
 @app.route("/health")
 def health():
-    """Render / ops liveness — always cheap."""
-    return "OK", 200
+    """Render / ops liveness. hours_awake_this_session is process uptime."""
+    return jsonify({
+        "status": "OK",
+        "hours_awake_this_session": round(hours_awake_this_session(), 3),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }), 200
 
 
 @app.route("/status")
@@ -102,6 +120,7 @@ def status():
     return jsonify({
         "status": "live",
         "service": "master_bot",
+        "hours_awake_this_session": round(hours_awake_this_session(), 3),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
@@ -133,13 +152,6 @@ def prepare_process() -> None:
     except Exception as e:
         print(f"[main] WARNING: ledger reset failed: {e}")
 
-    # Log-only path inventory (Stage 1). Never writes or restores state.
-    try:
-        import state_preflight
-        state_preflight.run_preflight()
-    except Exception as e:
-        print(f"[main] WARNING: state preflight failed: {e}")
-
     # Paper ledger used by master_bot EXECUTE path (not for a web UI).
     try:
         import virtual_broker
@@ -148,12 +160,58 @@ def prepare_process() -> None:
     except Exception as e:
         print(f"[main] WARNING: virtual broker init failed: {e}")
 
+    # Discord BOOK_STATE → open book / ledger / session counter, before
+    # preflight and before the first scan. No-op on later calls.
+    try:
+        import book_state
+        book_state.restore_at_boot()
+    except Exception as e:
+        print(f"[main] WARNING: BOOK_STATE restore failed: {e}")
+
+    # Log-only path inventory (Stage 1). Never writes or restores state.
+    try:
+        import state_preflight
+        state_preflight.run_preflight()
+    except Exception as e:
+        print(f"[main] WARNING: state preflight failed: {e}")
+
+    _install_shutdown_hook()
     start_master_bot()
     port = os.environ.get("PORT", "10000")
     print(
         f"[main] Process ready — Master Bot + health on PORT={port} "
         f"(gunicorn workers=1 required)"
     )
+
+
+def _install_shutdown_hook() -> None:
+    """SIGTERM/atexit: write BOOK_STATE before Render kills the worker."""
+    global _shutdown_hook_installed
+    if _shutdown_hook_installed:
+        return
+    _shutdown_hook_installed = True
+
+    def _emit(_signum=None, _frame=None):
+        try:
+            import book_state
+            book_state.emit_shutdown_book_state()
+        except Exception as e:
+            print(f"[main] shutdown BOOK_STATE failed: {e}")
+
+    atexit.register(_emit)
+    prev = signal.getsignal(signal.SIGTERM)
+
+    def _term(signum, frame):
+        _emit()
+        if callable(prev) and prev not in (signal.SIG_DFL, signal.SIG_IGN):
+            prev(signum, frame)
+        else:
+            raise SystemExit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, _term)
+    except Exception as e:
+        print(f"[main] SIGTERM hook failed: {e}")
 
 
 # Gunicorn loads main:app with __name__ == "main" → bootstrap daemons on import.

@@ -22,7 +22,9 @@ weights, day_cap, MIN_PREMIUM, blackout window, …), waits until the
 30 sessions are done. Record any allowed exception in `FREEZE.md` with
 date and reason.
 
-Deploys wipe the on-disk ledger. Do not deploy unless the exception
-rules above require it. Discord is the durable store.
+Deploys wipe the on-disk ledger. Discord BOOK_STATE is restored at boot.
+Do not deploy unless the exception rules above require it, and only when
+a BOOK_STATE line is already in the channel (or BOOK_STATE_BOOTSTRAP is
+set). Prefer outside RTH. Discord is the durable store.
 
 Queued, not now: ATR/delta stops; pivot-weight question.

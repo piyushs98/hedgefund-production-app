@@ -283,6 +283,37 @@ def session_snapshot() -> dict[str, Any]:
     return dict(_session)
 
 
+def restore_session_snapshot(snap: dict[str, Any] | None) -> None:
+    """Rehydrate Chicago-session counters from a Discord BOOK_STATE."""
+    if not isinstance(snap, dict):
+        return
+    day = snap.get("session_date")
+    _session["session_date"] = str(day) if day else _session.get("session_date")
+    for key in (
+        "scans",
+        "entries",
+        "closes",
+        "criticals",
+        "realized_mid",
+        "realized_fill",
+        "planned_risk_closed",
+        "spy_open",
+        "spy_high",
+        "spy_low",
+        "spy_close",
+    ):
+        if key not in snap:
+            continue
+        val = snap.get(key)
+        if key in ("scans", "entries", "closes", "criticals"):
+            try:
+                _session[key] = int(val or 0)
+            except (TypeError, ValueError):
+                _session[key] = 0
+        else:
+            _session[key] = val
+
+
 def _hhmm(raw: Any) -> str:
     if raw is None or raw == "":
         return _NA

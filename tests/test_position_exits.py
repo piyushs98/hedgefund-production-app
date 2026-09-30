@@ -95,9 +95,12 @@ class TestExitRules(unittest.TestCase):
         self.db = os.path.join(self.tmp.name, "news.db")
         self.trades_path = Path(self.tmp.name) / "active_trades.json"
         self.trades_path.write_text("[]", encoding="utf-8")
+        self._bs_emit = mock.patch("book_state.emit_book_state", return_value=None)
+        self._bs_emit.start()
 
     def tearDown(self):
         position_exits.reset_eod_flags_for_tests()
+        self._bs_emit.stop()
         self.tmp.cleanup()
 
     def _trade(self, **over):

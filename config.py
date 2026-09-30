@@ -47,6 +47,13 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
+# Read-only bot for BOOK_STATE restore (channel history). Webhook still writes.
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
+# Set to the BOOK_STATE date (YYYY-MM-DD) or "1" to trade after a stale restore.
+CONFIRM_STALE_BOOK = os.environ.get("CONFIRM_STALE_BOOK", "")
+# Optional one-line BOOK_STATE used only when Discord history has none.
+BOOK_STATE_BOOTSTRAP = os.environ.get("BOOK_STATE_BOOTSTRAP", "")
 
 # Public dashboard (Discord alert deep-links). Override via env if the Render
 # service name ever changes; default is the production service URL.

@@ -178,6 +178,11 @@ def maybe_emit_eod_book(now_cdt: datetime | None = None) -> str | None:
         broadcaster.send_discord_alert(payload)
     except Exception as e:
         print(f"[Exits] BOOK Discord warn: {e}")
+    try:
+        import book_state
+        book_state.emit_book_state(reason="eod")
+    except Exception as e:
+        print(f"[Exits] BOOK_STATE eod emit warn: {e}")
     return line
 
 
@@ -1191,6 +1196,12 @@ def close_open_position(
             print(f"[Exits] TRADE Discord warn: {disc_err}")
     except Exception as trade_err:
         print(f"[Exits] TRADE line failed for {ticker}: {trade_err}")
+    try:
+        import book_state
+        book_state.note_exit(ticker)
+        book_state.emit_book_state(reason="close")
+    except Exception as bs_err:
+        print(f"[Exits] BOOK_STATE emit warn: {bs_err}")
     return result
 
 
@@ -1636,4 +1647,9 @@ def run_scan_exits(
     book_line = maybe_emit_eod_book(now)
     if book_line:
         summary["book_line"] = book_line
+    try:
+        import book_state
+        book_state.emit_book_state(reason="scan")
+    except Exception as e:
+        print(f"[Exits] BOOK_STATE scan emit warn: {e}")
     return summary
