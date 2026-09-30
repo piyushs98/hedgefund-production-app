@@ -245,6 +245,12 @@ def note_entry() -> None:
     _session["entries"] = int(_session.get("entries") or 0) + 1
 
 
+def void_note_entry() -> None:
+    """Reverse note_entry when a paper debit is unwound before a position exists."""
+    _ensure_session_day()
+    _session["entries"] = max(0, int(_session.get("entries") or 0) - 1)
+
+
 def note_close(*, pnl_mid: float, pnl_fill: float, planned_risk: float | None) -> None:
     _ensure_session_day()
     _session["closes"] = int(_session.get("closes") or 0) + 1

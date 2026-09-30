@@ -36,6 +36,7 @@ MACRO_RESTART_SLEEP = int(os.environ.get("MACRO_RESTART_SLEEP", "60"))
 _init_lock = Lock()
 _background_loops_started = False
 _process_prepared = False
+_macro_thread: Thread | None = None
 
 app = Flask(__name__)
 
@@ -66,7 +67,7 @@ def _macro_worker() -> None:
 
 def start_master_bot() -> None:
     """Start Master Bot exactly once per OS process (gunicorn workers=1)."""
-    global _background_loops_started
+    global _background_loops_started, _macro_thread
     with _init_lock:
         if _background_loops_started:
             print(
@@ -80,6 +81,7 @@ def start_master_bot() -> None:
             name="macro-master-bot",
             daemon=True,
         )
+        _macro_thread = macro
         macro.start()
         print(f"[main] Master Bot daemon started exactly once: {macro.name}")
 
@@ -91,19 +93,37 @@ def start_master_bot() -> None:
 @app.route("/")
 @app.route("/health")
 def health():
-    """Render / ops liveness — always cheap."""
+    """Process liveness. Stays HTTP 200 so a slow loop cannot restart-loop the host."""
     return "OK", 200
+
+
+def _worker_status() -> dict:
+    alive = bool(_macro_thread is not None and _macro_thread.is_alive())
+    age = None
+    try:
+        import master_bot
+        hb = getattr(master_bot, "_macro_heartbeat_at", None)
+        if isinstance(hb, (int, float)):
+            age = round(time.time() - float(hb), 1)
+    except Exception:
+        age = None
+    return {
+        "worker_alive": alive,
+        "heartbeat_age_s": age,
+    }
 
 
 @app.route("/status")
 @app.route("/api/status")
 def status():
-    """Tiny JSON heartbeat (no portfolio / trades / UI)."""
-    return jsonify({
+    """JSON heartbeat. worker_alive is the macro thread, not a restart signal."""
+    body = {
         "status": "live",
         "service": "master_bot",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    body.update(_worker_status())
+    return jsonify(body)
 
 
 # ===========================================================================

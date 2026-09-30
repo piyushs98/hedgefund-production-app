@@ -832,6 +832,202 @@ def paper_buy(
     return result
 
 
+def void_unpersisted_buy(
+    contract: Any,
+    entry_price: float | int | None,
+    quantity: int | None = None,
+) -> dict[str, Any]:
+    """
+    Reverse a paper_buy whose position record never landed.
+
+    Credits the debit back. Does not write an EXIT row and does not change
+    realized P&L. Drops the matching PAPER_BUY_OPEN marker when one exists.
+    """
+    ensure_ledger()
+    try:
+        premium = float(entry_price)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": f"invalid entry_price: {entry_price!r}"}
+    qty = resolve_quantity(contract, quantity)
+    if qty < 1 or premium <= 0:
+        return {"ok": False, "error": "nothing to void", "quantity": qty}
+    cost = premium * CONTRACT_MULTIPLIER * qty
+    meta = _contract_meta(contract)
+    if isinstance(contract, dict):
+        meta = contract
+    ticker = meta.get("ticker") or meta.get("symbol")
+    direction = meta.get("direction") or ""
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT buying_power FROM portfolio_ledger WHERE id = 1"
+            ).fetchone()
+            if not row:
+                return {"ok": False, "error": "portfolio_ledger missing after ensure"}
+            new_bp = float(row["buying_power"]) + cost
+            conn.execute(
+                """
+                UPDATE portfolio_ledger
+                SET buying_power = ?, updated_at = ?
+                WHERE id = 1
+                """,
+                (new_bp, now),
+            )
+            conn.execute(
+                """
+                DELETE FROM trade_history
+                WHERE id = (
+                    SELECT id FROM trade_history
+                    WHERE notes = 'PAPER_BUY_OPEN'
+                      AND IFNULL(ticker, '') = IFNULL(?, '')
+                      AND ABS(entry_price - ?) < 0.0001
+                    ORDER BY id DESC
+                    LIMIT 1
+                )
+                """,
+                (ticker, premium),
+            )
+            conn.commit()
+    except Exception as e:
+        try:
+            import write_guard
+            write_guard.record_write_fail("paper_broker", e)
+        except Exception:
+            pass
+        return {"ok": False, "error": str(e)}
+    note_session_close(cost)
+    fp = _entry_fingerprint(ticker, direction, premium)
+    _pending_slippage.pop(fp, None)
+    try:
+        fill_accounting.void_note_entry()
+    except Exception:
+        pass
+    print(
+        f"[VirtualBroker] void_unpersisted_buy {ticker or '?'} "
+        f"qty={qty} @ ${premium:.2f} → credit ${cost:.2f}; "
+        f"buying_power → ${new_bp:.2f}"
+    )
+    return {
+        "ok": True,
+        "cost": cost,
+        "quantity": qty,
+        "buying_power": new_bp,
+    }
+
+
+def _find_committed_close(
+    conn: sqlite3.Connection,
+    meta: dict[str, Any],
+    ticker: str | None,
+    direction: str | None,
+    strike: Any,
+    expiration: Any,
+    entry: float,
+):
+    """Return an existing EXIT row for this lot, or None."""
+    tid = None
+    if isinstance(meta, dict):
+        raw_id = meta.get("trade_id")
+        if raw_id:
+            tid = str(raw_id)
+    if tid:
+        return conn.execute(
+            """
+            SELECT id, pnl, pnl_mid, pnl_fill, entry_price, exit_price,
+                   entry_mid, entry_ask, exit_mid, exit_bid, fill_est, slippage
+            FROM trade_history
+            WHERE IFNULL(notes, '') LIKE 'EXIT:%'
+              AND json_extract(contract_json, '$.trade_id') = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (tid,),
+        ).fetchone()
+    exp_s = str(expiration) if expiration else ""
+    dir_s = str(direction) if direction else ""
+    try:
+        strike_f = float(strike) if strike is not None else None
+    except (TypeError, ValueError):
+        strike_f = None
+    if strike_f is None:
+        strike_clause = "strike IS NULL"
+        params: tuple[Any, ...] = (ticker or "", dir_s, entry, exp_s)
+    else:
+        strike_clause = "ABS(IFNULL(strike, -999999) - ?) < 0.02"
+        params = (ticker or "", dir_s, entry, exp_s, strike_f)
+    return conn.execute(
+        f"""
+        SELECT id, pnl, pnl_mid, pnl_fill, entry_price, exit_price,
+               entry_mid, entry_ask, exit_mid, exit_bid, fill_est, slippage
+        FROM trade_history
+        WHERE IFNULL(notes, '') LIKE 'EXIT:%'
+          AND IFNULL(ticker, '') = ?
+          AND IFNULL(direction, '') = ?
+          AND ABS(entry_price - ?) < 0.0001
+          AND IFNULL(expiration, '') = ?
+          AND {strike_clause}
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+
+
+def _duplicate_sell_result(prior: Any, ledger: Any) -> dict[str, Any]:
+    def _num(key: str, fallback: float | None = None) -> float | None:
+        try:
+            val = prior[key]
+        except (KeyError, IndexError, TypeError):
+            val = None
+        if val is None:
+            return fallback
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return fallback
+
+    pnl_mid = _num("pnl_mid", _num("pnl"))
+    pnl_fill = _num("pnl_fill", pnl_mid)
+    try:
+        bp = float(ledger["buying_power"]) if ledger is not None else None
+    except (KeyError, TypeError, ValueError, IndexError):
+        bp = None
+    try:
+        realized = float(ledger["total_realized_pnl"]) if ledger is not None else None
+    except (KeyError, TypeError, ValueError, IndexError):
+        realized = None
+    try:
+        realized_fill = (
+            float(ledger["total_realized_pnl_fill"] or 0.0)
+            if ledger is not None
+            else None
+        )
+    except (KeyError, TypeError, ValueError, IndexError):
+        realized_fill = None
+    result = {
+        "ok": True,
+        "duplicate": True,
+        "pnl": pnl_mid,
+        "pnl_mid": pnl_mid,
+        "pnl_fill": pnl_fill,
+        "entry_price": _num("entry_price"),
+        "entry_mid": _num("entry_mid", _num("entry_price")),
+        "entry_ask": _num("entry_ask", _num("entry_price")),
+        "exit_price": _num("exit_price"),
+        "exit_mid": _num("exit_mid", _num("exit_price")),
+        "exit_bid": _num("exit_bid", _num("exit_price")),
+        "fill_est": bool(prior["fill_est"]) if prior["fill_est"] is not None else False,
+        "buying_power": bp,
+        "total_realized_pnl": realized,
+        "total_realized_pnl_fill": realized_fill,
+    }
+    slip = _num("slippage")
+    if slip is not None:
+        result["slippage"] = slip
+    return result
+
+
 def paper_sell(
     contract: Any,
     exit_price: float | int | None,
@@ -909,6 +1105,25 @@ def paper_sell(
         dir_str = dir_str or oc.get("direction") or ""
 
     with _connect() as conn:
+        _ensure_slippage_column(conn)
+        prior = _find_committed_close(
+            conn, meta if isinstance(meta, dict) else {},
+            ticker, dir_str, strike, expiration, entry,
+        )
+        if prior is not None:
+            ledger = conn.execute(
+                "SELECT buying_power, total_realized_pnl, total_realized_pnl_fill "
+                "FROM portfolio_ledger WHERE id = 1"
+            ).fetchone()
+            dup = _duplicate_sell_result(prior, ledger)
+            dup["quantity"] = qty
+            dup["capital_back"] = 0.0
+            print(
+                f"[VirtualBroker] paper_sell duplicate {ticker or '?'} "
+                f"{dir_str} qty={qty} entry=${entry:.2f} — no second credit"
+            )
+            return dup
+
         row = conn.execute(
             "SELECT buying_power, total_realized_pnl, total_realized_pnl_fill "
             "FROM portfolio_ledger WHERE id = 1"

@@ -18,8 +18,19 @@ Stage 3 fixes vs the original reference design:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timezone
 from typing import Iterable
+
+
+def _chicago_session_date(now: datetime) -> date:
+    """Session date for the daily entry cap. `now` may be UTC."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    try:
+        import pytz
+        return now.astimezone(pytz.timezone("America/Chicago")).date()
+    except Exception:
+        return now.date()
 
 
 def _norm_direction(direction: str | None) -> str | None:
@@ -86,6 +97,31 @@ class SignalGate:
         self._open: set[str] = set()
         # Pre-admit snapshots for rollback_admit (ticker -> prior last_entry_at, entries_today)
         self._admit_snapshots: dict[str, tuple[datetime | None, int]] = {}
+        # Chicago date entries_today belongs to. None until the first scan.
+        self._entries_session: date | None = None
+
+    def roll_entries_session(self, now: datetime) -> bool:
+        """
+        Zero entries_today when the Chicago session date changes.
+
+        Open positions, exit cooldowns, streaks, and direction locks stay.
+        The first scan of a process only anchors the date.
+        """
+        day = _chicago_session_date(now)
+        previous = self._entries_session
+        if previous == day:
+            return False
+        self._entries_session = day
+        if previous is None:
+            return False
+        for st in self.state.values():
+            st.entries_today = 0
+        self._admit_snapshots.clear()
+        print(
+            f"[Gate] session roll {previous.isoformat()} → {day.isoformat()}: "
+            "entries_today reset; open book and cooldowns kept"
+        )
+        return True
 
     def _st(self, ticker: str) -> TickerState:
         key = str(ticker).upper().strip()
@@ -307,6 +343,7 @@ class SignalGate:
         3. Admit in conviction order against concurrent / cooldown / caps.
         closed_this_scan: tickers closed earlier in this scan — never re-admit.
         """
+        self.roll_entries_session(now)
         decisions: dict[str, GateDecision] = {}
         eligible: list[tuple[str, str, float, str]] = []  # ticker, dir, score, pre_reason
         closed_set = {str(t).upper().strip() for t in (closed_this_scan or ()) if t}

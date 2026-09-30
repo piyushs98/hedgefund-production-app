@@ -48,6 +48,15 @@ from yf_client import SESSION
 # Wall-clock budget per external call. Keep well under gunicorn --timeout 120
 # so a hung Yahoo/Gemini request cannot pin a gthread until worker kill.
 API_CALL_TIMEOUT_S = 20
+
+# Unix time of the last macro-loop iteration. /status reads this.
+# /health stays HTTP 200 so a slow iteration cannot restart-loop the host.
+_macro_heartbeat_at: float | None = None
+
+
+def note_macro_heartbeat() -> None:
+    global _macro_heartbeat_at
+    _macro_heartbeat_at = time.time()
 # google-genai HttpOptions.timeout is in milliseconds.
 LLM_HTTP_TIMEOUT_MS = 20_000
 # Provider chain may use two sequential attempts (primary + backup).
@@ -406,6 +415,61 @@ def record_executed_trade(ticker, contract, scan_id=None, card=None, pivot_data=
             pass
         print(f"[CEO] WARNING: failed to record {ticker} to {ACTIVE_TRADES_PATH}")
     return ok
+
+
+def commit_open_position(
+    ticker,
+    contract,
+    *,
+    scan_id=None,
+    card=None,
+    pivot_data=None,
+    entry_price=None,
+    quantity=None,
+) -> bool:
+    """
+    Persist a filled paper buy. If the position record does not land, reverse
+    the cash debit and the gate admit. JSON is a projection of that record.
+    """
+    persisted = False
+    try:
+        persisted = bool(
+            record_executed_trade(
+                ticker,
+                contract,
+                scan_id=scan_id,
+                card=card,
+                pivot_data=pivot_data,
+            )
+        )
+    except Exception as pe:
+        print(f"[CEO] persist warn {ticker}: {pe}")
+        persisted = False
+    if persisted:
+        return True
+    px = entry_price
+    if px is None and isinstance(contract, dict):
+        px = contract.get("entry_premium")
+    qty = quantity
+    if qty is None and isinstance(contract, dict):
+        qty = contract.get("quantity")
+    print(
+        f"[CEO] CRITICAL: {ticker} debit has no position record — "
+        "reversing the paper buy"
+    )
+    try:
+        undone = virtual_broker.void_unpersisted_buy(
+            contract, px, quantity=qty
+        )
+        if not undone.get("ok"):
+            print(f"[CEO] CRITICAL: void failed {ticker}: {undone}")
+    except Exception as ve:
+        print(f"[CEO] CRITICAL: void raised {ticker}: {ve}")
+    try:
+        signal_gate.get_gate().rollback_admit(ticker)
+    except Exception as ge:
+        print(f"[CEO] rollback_admit warn {ticker}: {ge}")
+    return False
 
 
 # ==========================================
@@ -1246,7 +1310,7 @@ def run_portfolio_scan(
                 scan_id, card,
                 adversarial_result=adv_result,
                 selected_contract=contract,
-                agent_params={"weights": weights, "futures_pct": futures_pct,
+                agent_params={"futures_pct": futures_pct,
                               "macro_vector": macro_vector[:300] if macro_vector else ""},
             )
 
@@ -1334,24 +1398,31 @@ def run_portfolio_scan(
                             pass
                     else:
                         contract["quantity"] = qty
-                        record_executed_trade(
+                        booked = commit_open_position(
                             ticker,
                             contract,
                             scan_id=scan_id,
                             card=card,
                             pivot_data=pivot_data,
+                            entry_price=entry_px,
+                            quantity=qty,
                         )
-                        ticker_summary["trade_executed"] = True
-                        result["trades"].append({
-                            "ticker": ticker,
-                            "direction": contract.get("direction"),
-                            "strike": contract.get("strike"),
-                            "expiration": contract.get("expiration"),
-                            "entry_premium": contract.get("entry_premium"),
-                            "quantity": qty,
-                            "total_score": card.total_score,
-                            "action_flag": card.action_flag,
-                        })
+                        if not booked:
+                            card.action_flag = "PASS"
+                            card.reasons.append("Broker: position record failed")
+                            ticker_summary["action_flag"] = "PASS"
+                        else:
+                            ticker_summary["trade_executed"] = True
+                            result["trades"].append({
+                                "ticker": ticker,
+                                "direction": contract.get("direction"),
+                                "strike": contract.get("strike"),
+                                "expiration": contract.get("expiration"),
+                                "entry_premium": contract.get("entry_premium"),
+                                "quantity": qty,
+                                "total_score": card.total_score,
+                                "action_flag": card.action_flag,
+                            })
                 except Exception as persist_err:
                     # Never let state I/O kill the portfolio scan
                     print(f"[CEO] WARNING: active_trades persistence failed "
@@ -1559,6 +1630,7 @@ def run_macro_loop():
 
     while True:
         try:
+            note_macro_heartbeat()
             now = datetime.now(est_tz)
             current_time = now.time()
             now_cdt = datetime.now(cdt_tz) if cdt_tz else now

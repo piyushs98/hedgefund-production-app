@@ -174,7 +174,12 @@ class TestExitRules(unittest.TestCase):
     def test_expiry_flatten_past_date_only(self):
         """Same-day (0DTE) is NOT expiry-flattened at the open — only past dates."""
         trade = self._trade(expiration="2026-08-04")
-        scored = {"IWM": {"options_dict": self._options(0.50, 0.60), "card": None}}
+        scored = {
+            "IWM": {
+                "options_dict": self._options(0.50, 0.60, exp="2026-08-04"),
+                "card": None,
+            }
+        }
 
         with mock.patch("position_exits.close_open_position") as close:
             close.return_value = {"ticker": "IWM", "reason": "EXPIRY_FLATTEN", "ok": True}
@@ -245,7 +250,7 @@ class TestExitRules(unittest.TestCase):
         from datetime import timezone as _tz
         long["entry_timestamp"] = datetime.now(_tz.utc).isoformat()
         scored = {
-            "IWM": {"options_dict": self._options(1.00, 1.20), "card": None},
+            "IWM": {"options_dict": self._options(1.00, 1.20, exp="2026-08-06"), "card": None},
             "SPY": {
                 "options_dict": {
                     "current_price": 500.0,
@@ -371,7 +376,7 @@ class TestExitRules(unittest.TestCase):
         trade["thesis_below_streak"] = 1
         scored = {
             "IWM": {
-                "options_dict": self._options(8.60, 8.80),
+                "options_dict": self._options(8.60, 8.80, exp="2026-08-12"),
                 "card": mock.Mock(total_score=12.0, block_reason=None, metrics={}),
             }
         }
@@ -397,7 +402,7 @@ class TestExitRules(unittest.TestCase):
         trade["entry_score"] = 86.0
         scored = {
             "IWM": {
-                "options_dict": self._options(1.50, 1.70),
+                "options_dict": self._options(1.50, 1.70, exp="2026-08-12"),
                 "card": mock.Mock(total_score=12.0, block_reason=None, metrics={}),
             }
         }
@@ -429,7 +434,7 @@ class TestExitRules(unittest.TestCase):
         )
         scored = {
             "IWM": {
-                "options_dict": self._options(1.50, 1.70),
+                "options_dict": self._options(1.50, 1.70, exp="2026-08-12"),
                 "card": dirty,
             }
         }
@@ -456,7 +461,7 @@ class TestExitRules(unittest.TestCase):
         trade["entry_score"] = 65.0
         scored = {
             "IWM": {
-                "options_dict": self._options(1.50, 1.70),
+                "options_dict": self._options(1.50, 1.70, exp="2026-08-12"),
                 "card": mock.Mock(total_score=12.0),
             }
         }
@@ -480,7 +485,7 @@ class TestExitRules(unittest.TestCase):
         trade["entry_score"] = 88.0
         scored = {
             "IWM": {
-                "options_dict": self._options(1.50, 1.70),
+                "options_dict": self._options(1.50, 1.70, exp="2026-08-12"),
                 "card": mock.Mock(total_score=78.0),
             }
         }
@@ -505,7 +510,7 @@ class TestExitRules(unittest.TestCase):
         trade["take_profit"] = 1.40
         scored = {
             "IWM": {
-                "options_dict": self._options(1.50, 1.70),
+                "options_dict": self._options(1.50, 1.70, exp="2026-08-12"),
                 "card": mock.Mock(total_score=12.0, block_reason=None, metrics={}),
             }
         }
@@ -535,7 +540,7 @@ class TestExitRules(unittest.TestCase):
         trade["thesis_below_streak"] = 1
         scored = {
             "IWM": {
-                "options_dict": self._options(3.00, 3.20),
+                "options_dict": self._options(3.00, 3.20, exp="2026-08-12"),
                 "card": mock.Mock(total_score=49.0, block_reason=None, metrics={}),
                 "pivot_data": {"pivot": 301.5, "close": 302.0},
             }
@@ -569,7 +574,7 @@ class TestExitRules(unittest.TestCase):
         trade["entry_dte"] = 7
         scored = {
             "IWM": {
-                "options_dict": self._options(1.50, 1.70),
+                "options_dict": self._options(1.50, 1.70, exp="2026-08-12"),
                 "card": mock.Mock(total_score=72.0),
                 "pivot_data": {"pivot": 301.5, "close": 302.0},
             }

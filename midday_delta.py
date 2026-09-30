@@ -879,7 +879,7 @@ def run_thirty_min_scan(
         fetch_intraday_drift,
         get_latest_futures_pct,
         ensure_news_context,
-        record_executed_trade,
+        commit_open_position,
         MasterBotScanError,
         _call_with_timeout,
         API_CALL_TIMEOUT_S,
@@ -1282,28 +1282,32 @@ def run_thirty_min_scan(
                             pass
                     else:
                         contract["quantity"] = qty
-                        try:
-                            record_executed_trade(
-                                ticker,
-                                contract,
-                                scan_id=scan_id,
-                                card=card,
-                                pivot_data=pivot_data,
-                            )
-                        except Exception as pe:
-                            print(f"[{ticker}] persist warn: {pe}")
-                        result["trades"].append({
-                            "ticker": ticker,
-                            "direction": contract.get("direction"),
-                            "strike": contract.get("strike"),
-                            "expiration": contract.get("expiration"),
-                            "entry_premium": contract.get("entry_premium"),
-                            "stop_loss": contract.get("stop_loss"),
-                            "take_profit": contract.get("take_profit"),
-                            "quantity": qty,
-                            "gate_rank": getattr(gdec, "conviction_rank", None),
-                            "total_score": card.total_score,
-                        })
+                        booked = commit_open_position(
+                            ticker,
+                            contract,
+                            scan_id=scan_id,
+                            card=card,
+                            pivot_data=pivot_data,
+                            entry_price=contract.get("entry_premium"),
+                            quantity=qty,
+                        )
+                        if not booked:
+                            card.action_flag = "PASS"
+                            card.reasons.append("Broker: position record failed")
+                            contract = None
+                        else:
+                            result["trades"].append({
+                                "ticker": ticker,
+                                "direction": contract.get("direction"),
+                                "strike": contract.get("strike"),
+                                "expiration": contract.get("expiration"),
+                                "entry_premium": contract.get("entry_premium"),
+                                "stop_loss": contract.get("stop_loss"),
+                                "take_profit": contract.get("take_profit"),
+                                "quantity": qty,
+                                "gate_rank": getattr(gdec, "conviction_rank", None),
+                                "total_score": card.total_score,
+                            })
 
         snap = _card_snapshot(card, atr_abs=atr_abs)
         prev = (baseline.get("tickers") or {}).get(ticker)
@@ -1468,6 +1472,17 @@ def run_thirty_min_scan(
     return result
 
 
+def _emit_eod_book_into(result: dict[str, Any]) -> None:
+    """BOOK/SESSION at 14:45 Chicago, including a flat book."""
+    try:
+        import position_exits as _pex
+        line = _pex.maybe_emit_eod_book(_chicago_now())
+        if line:
+            result["book_line"] = line
+    except Exception as e:
+        print(f"[exit-pass] EOD book emit failed: {e}")
+
+
 def run_exit_only_pass(
     breaker: CircuitBreaker,
     *,
@@ -1515,6 +1530,7 @@ def run_exit_only_pass(
             result["open_before"] = len(open_trades)
             if not open_trades:
                 result["aborted"] = True
+                _emit_eod_book_into(result)
                 return result
             scored_spot: dict[str, dict] = {}
             for t in open_trades:
@@ -1567,6 +1583,7 @@ def run_exit_only_pass(
         except Exception as e:
             print(f"[exit-pass] breaker-open underlying pass failed: {e}")
             result["aborted"] = True
+        _emit_eod_book_into(result)
         return result
 
     try:
@@ -1586,6 +1603,7 @@ def run_exit_only_pass(
         except Exception:
             pass
         print(f"[exit-pass] {clock} CDT — no open positions; skip mark fetches.")
+        _emit_eod_book_into(result)
         return result
 
     print(
@@ -1639,6 +1657,7 @@ def run_exit_only_pass(
                 print(
                     f"[exit-pass] {clock} CDT — book flat after carry review."
                 )
+                _emit_eod_book_into(result)
                 return result
     except Exception as carry_err:
         print(f"[exit-pass] carry review warn: {carry_err}")

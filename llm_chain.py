@@ -59,8 +59,14 @@ class LLMChainError(Exception):
 
 
 def _run_with_deadline(fn, *, timeout_s, step):
-    """Hard wall-clock envelope so a hung SDK cannot freeze the trading thread."""
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    """Hard wall-clock envelope so a hung SDK cannot freeze the trading thread.
+
+    Do not use ``with ThreadPoolExecutor``: its shutdown waits for the
+    running task, so a timed-out call returns only after the task finishes.
+    cancel_futures does not kill a call that has already started.
+    """
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
         future = pool.submit(fn)
         try:
             return future.result(timeout=timeout_s)
@@ -70,6 +76,11 @@ def _run_with_deadline(fn, *, timeout_s, step):
                 step=step,
                 is_timeout=True,
             ) from exc
+    finally:
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            pool.shutdown(wait=False)
 
 
 def _resolve_keys():

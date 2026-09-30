@@ -168,16 +168,25 @@ def maybe_emit_eod_book(now_cdt: datetime | None = None) -> str | None:
     except Exception as e:
         print(f"[Exits] SESSION line failed: {e}")
         session_line = None
-    mark_eod_book_done(now.date())
     print(f"[Exits] {line}")
     if session_line:
         print(f"[Exits] {session_line}")
     try:
         import broadcaster
         payload = line if not session_line else f"{line}\n{session_line}"
-        broadcaster.send_discord_alert(payload)
+        delivered = bool(broadcaster.send_discord_alert(payload))
     except Exception as e:
         print(f"[Exits] BOOK Discord warn: {e}")
+        delivered = False
+    if not delivered:
+        # Leave the day unlatched so the next pass retries. A failed send
+        # must not be the only copy of the session record.
+        print(
+            f"[Exits] BOOK/SESSION for {now.date().isoformat()} "
+            "not delivered — will retry"
+        )
+        return None
+    mark_eod_book_done(now.date())
     return line
 
 
@@ -238,40 +247,33 @@ def evaluate_exit_reason_for_mark(
     clean prints below THESIS_EXIT_SCORE. SL/TP/expiry always run.
     """
     entry = _entry_premium(trade)
-    exit_px = mark
     exp_d = _parse_exp_date(_trade_expiration(trade))
     cal_dte = (exp_d - sess).days if exp_d is not None else None
     is_0dte = exp_d is not None and exp_d == sess
     carry_min = _carry_min_dte()
 
-    # Selective EOD — short-dated only (1DTE and under)
+    # Forced flatten needs the contract's own mark. A missing quote is an
+    # unresolved settlement — entry premium is not a fill.
+    kind = None
     if do_eod and cal_dte is not None and cal_dte < carry_min:
-        if exit_px is None and entry is not None:
-            exit_px = entry
-        return "EOD_FLATTEN", exit_px
-
-    # 0DTE hard flatten
-    if is_0dte and is_zero_dte_flatten_window(now):
-        if exit_px is None and entry is not None:
-            exit_px = entry
-        return "ZERO_DTE_FLATTEN", exit_px
-
-    # Past expiry
-    if exp_d is not None and exp_d < sess:
-        if exit_px is None and entry is not None:
-            exit_px = entry
-        return "EXPIRY_FLATTEN", exit_px
-
-    # Earnings: flatten lots whose expiry spans the print, once inside
-    # the blackout window. Off when EARNINGS_FLATTEN_SPANNING is false.
-    try:
-        import earnings_blackout
-        if earnings_blackout.should_flatten_trade(trade, sess):
-            if exit_px is None and entry is not None:
-                exit_px = entry
-            return "EARNINGS_FLATTEN", exit_px
-    except Exception:
-        pass
+        kind = "EOD_FLATTEN"
+    elif is_0dte and is_zero_dte_flatten_window(now):
+        kind = "ZERO_DTE_FLATTEN"
+    elif exp_d is not None and exp_d < sess:
+        kind = "EXPIRY_FLATTEN"
+    else:
+        # Earnings: flatten lots whose expiry spans the print, once inside
+        # the blackout window. Off when EARNINGS_FLATTEN_SPANNING is false.
+        try:
+            import earnings_blackout
+            if earnings_blackout.should_flatten_trade(trade, sess):
+                kind = "EARNINGS_FLATTEN"
+        except Exception:
+            pass
+    if kind:
+        if mark is None:
+            return kind, None
+        return kind, mark
 
     if mark is None:
         return None, None
@@ -792,14 +794,8 @@ def lookup_option_mark(
 
     sides = chains.get(exp) or chains.get(str(exp))
     if not isinstance(sides, dict):
-        # Fallback: search all loaded expiries for matching strike
-        for _e, s in chains.items():
-            if not isinstance(s, dict):
-                continue
-            contracts = s.get(side_key) or []
-            hit = _match_contract(contracts, strike)
-            if hit:
-                return _mark_from_contract(hit, spot)
+        # Exact expiry only. A same-strike quote on another date is a
+        # different contract and must stay unresolved.
         return out
 
     contracts = sides.get(side_key) or []
@@ -1089,6 +1085,7 @@ def close_open_position(
         "quantity": qty,
         "ok": False,
     }
+    sell: dict[str, Any] = {}
     try:
         sell = virtual_broker.paper_sell(
             trade,
@@ -1103,6 +1100,7 @@ def close_open_position(
         )
         result["sell"] = sell
         result["ok"] = bool(sell.get("ok"))
+        result["duplicate"] = bool(sell.get("duplicate"))
         if sell.get("pnl") is not None:
             result["pnl"] = sell["pnl"]
         result["pnl_mid"] = sell.get("pnl_mid", sell.get("pnl"))
@@ -1113,25 +1111,43 @@ def close_open_position(
                 result.update(stats)
     except Exception as e:
         print(f"[Exits] paper_sell failed for {ticker}: {e}")
+        result["ok"] = False
         result["sell_error"] = str(e)
         if "STOP_LOSS" in str(reason):
             stats = stop_loss_slippage(trade, exit_price, None)
             if stats:
                 result.update(stats)
 
+    if not result.get("ok"):
+        # Cash was not credited. Keep the lot, the gate slot, and the record.
+        print(
+            f"[Exits] close FAILED {ticker} reason={reason} "
+            f"exit=${float(exit_price):.4f} — position retained"
+        )
+        return result
+
     try:
         removed = remove_active_trade(trade)
         result["removed"] = bool(removed)
     except Exception as e:
         print(f"[Exits] remove_active_trade failed for {ticker}: {e}")
+        result["removed"] = False
         result["remove_error"] = str(e)
-        # Still try to free the gate if remove path failed before on_close
-        try:
-            import signal_gate
-            if ticker and ticker != "?":
-                signal_gate.get_gate().on_close(ticker)
-        except Exception:
-            pass
+        print(
+            f"[Exits] {ticker} cash close committed but the book row remains "
+            f"({reason}). No TRADE line yet — next pass retries the remove."
+        )
+        return result
+
+    if not result.get("removed"):
+        # No matching book row. A replay of an already-removed close must
+        # not emit a second TRADE line.
+        if sell.get("duplicate"):
+            print(
+                f"[Exits] {ticker} close already recorded ({reason}); "
+                "book row absent — TRADE not repeated"
+            )
+            return result
 
     if "STOP_LOSS" in str(reason) and result.get("planned_risk") is not None:
         slip = result.get("slippage_pct")
@@ -1183,6 +1199,7 @@ def close_open_position(
             fill_est=bool(result.get("fill_est")),
         )
         result["trade_line"] = trade_line
+        result["trade_emitted"] = True
         print(f"[Exits] {trade_line}")
         try:
             import broadcaster
@@ -1357,6 +1374,26 @@ def _alert_mark_failure(trade: dict[str, Any], streak: int, *, all_failed: bool 
         broadcaster.send_discord_alert(msg)
     except Exception as e:
         print(f"[Exits] mark-fail Discord warn: {e}")
+
+
+def _alert_unresolved_settlement(trade: dict[str, Any], reason: str) -> None:
+    """One page per position per forced-flatten kind. Does not invent a fill."""
+    flag = f"unresolved_alerted_{reason}"
+    if trade.get(flag):
+        return
+    trade[flag] = True
+    label = _fmt_contract_label(trade)
+    msg = (
+        f"🚨 **CRITICAL: UNRESOLVED {reason} {label}**\n"
+        f"No option mark for this contract. The position stays open. "
+        f"Settlement is not recorded at the entry price."
+    )
+    print(f"[Exits] {msg.replace(chr(10), ' | ')}")
+    try:
+        import broadcaster
+        broadcaster.send_discord_alert(msg)
+    except Exception as e:
+        print(f"[Exits] unresolved-settlement Discord warn: {e}")
 
 
 def _alert_unprotected(trade: dict[str, Any], minutes: float) -> None:
@@ -1550,13 +1587,35 @@ def run_scan_exits(
             card=card,
             options_dict=options_dict,
         )
-        if reason is None and mark is None:
+        forced_unresolved = (
+            reason in (
+                "EOD_FLATTEN",
+                "ZERO_DTE_FLATTEN",
+                "EXPIRY_FLATTEN",
+                "EARNINGS_FLATTEN",
+            )
+            and exit_px is None
+        )
+        if forced_unresolved or (reason is None and mark is None):
             u_reason, u_px = underlying_exit_reason(trade, mark_info.get("spot"))
             if u_reason and u_px is not None:
                 reason, exit_px = u_reason, u_px
+                forced_unresolved = False
                 trade["_underlying_spot"] = mark_info.get("spot")
                 trade["_underlying_stop_spot"] = trade.get("stop_spot")
                 trade["_underlying_target_spot"] = trade.get("target_spot")
+        if forced_unresolved:
+            _alert_unresolved_settlement(trade, str(reason))
+            summary.setdefault("unresolved", []).append(
+                {"ticker": ticker, "reason": reason}
+            )
+            if reason == "EOD_FLATTEN":
+                summary["eod_unresolved"] = True
+            try:
+                from tracker_agent import save_active_trade
+                save_active_trade(trade)
+            except Exception:
+                pass
         skip_log = trade.pop("_time_stop_skip_log", None)
         if skip_log:
             summary["time_stop_skipped"].append(skip_log)
@@ -1572,11 +1631,11 @@ def run_scan_exits(
             except Exception:
                 pass
 
-        if reason is None:
+        if reason is None or forced_unresolved:
             continue
 
         if exit_px is None:
-            print(f"[Exits] {ticker} would close ({reason}) but no mark/entry — skip")
+            print(f"[Exits] {ticker} would close ({reason}) but no mark — skip")
             continue
 
         closed = close_open_position(trade, float(exit_px), reason)
@@ -1594,11 +1653,23 @@ def run_scan_exits(
             )
             print(f"[Exits] {line}")
             closed["underlying_line"] = line
-        summary["closed"].append(closed)
+        if closed.get("ok") and closed.get("removed", True):
+            summary["closed"].append(closed)
+        else:
+            summary.setdefault("close_failed", []).append(ticker)
+            print(
+                f"[Exits] {ticker} {reason} not booked "
+                f"(ok={closed.get('ok')} removed={closed.get('removed')})"
+            )
 
-    if do_eod:
+    if do_eod and not summary.get("eod_unresolved"):
         mark_eod_done(now.date())
         summary["eod_triggered"] = True
+    elif do_eod and summary.get("eod_unresolved"):
+        print(
+            "[Exits] EOD flatten incomplete — day not latched; "
+            "unpriced short-dated lots stay open for the next pass"
+        )
 
     # Zero marks while book is open → fleet-wide CRITICAL
     if (
