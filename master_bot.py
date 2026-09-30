@@ -92,6 +92,7 @@ from sector_scrapers import (
 from gov_policy_scraper import scrape_gov_policy
 from china_macro_scraper import scrape_china_macro
 from earnings_calendar_scraper import scrape_earnings_calendar
+import night_mode
 from innovation_manager import generate_macro_catalyst_vector
 
 # Manager tier
@@ -757,13 +758,15 @@ OUTPUT RULES (strict):
 def run_night_harvest():
     print("[System State] Triggering background scrapers...")
     try:
+        # Earnings first so the one crumb attempt lands on the blackout
+        # calendar. A 429 suppresses the rest of this pass.
+        scrape_earnings_calendar(TICKERS)
+        fetch_overnight_futures()
         scrape_tech_sector()
         scrape_macro_finance()
         scrape_politics_government()
-        fetch_overnight_futures()
         scrape_gov_policy(TICKERS)
         scrape_china_macro(TICKERS)
-        scrape_earnings_calendar(TICKERS)
         clear_expired_news()
         try:
             from news_memory import purge_synthetic_innovation_rows
@@ -772,6 +775,11 @@ def run_night_harvest():
             print(f"[System] synthetic innovation purge warn: {purge_err}")
     except Exception as err:
         print(f"❌ Scraper error in night harvest: {err}")
+    try:
+        import earnings_blackout
+        earnings_blackout.log_config(alert=True)
+    except Exception as earn_err:
+        print(f"[Earnings] post-harvest calendar check failed: {earn_err}")
 
 
 def is_us_equity_market_open(now=None):
@@ -1422,15 +1430,22 @@ def run_macro_loop():
 
     # Optional escape hatch: FULL_LLM_INTRADAY=true restores the old heavy scan.
     full_llm_intraday = os.environ.get("FULL_LLM_INTRADAY", "false").lower() == "true"
+    # Resolved before the banner so the headline cannot drift from [Cadence].
+    exit_interval, full_scan_interval = night_mode.resolve_cadence(
+        getattr(config, "EXIT_INTERVAL_SECONDS", 300),
+        getattr(config, "FULL_SCAN_INTERVAL_SECONDS", 1800),
+    )
 
     print(
         "\n--- INITIATING MASTER BOT "
-        "(15-min exits / 30-min full scan + 11:00 CDT midday macro) ---"
+        f"{night_mode.boot_headline(exit_interval, full_scan_interval)} ---"
     )
     print(f"Loaded Tickers: {TICKERS}")
     print(
-        f"[System] Intraday mode: "
-        f"{'FULL LLM escape hatch' if full_llm_intraday else 'split cadence: EXIT every 15m, FULL score/admit every 30m'}"
+        "[System] Intraday mode: "
+        + night_mode.intraday_mode_line(
+            full_llm_intraday, exit_interval, full_scan_interval
+        )
     )
     config.assert_secrets(require_discord=False)
     # Wipe stale book BEFORE preflight / gate / first scan / carry review.
@@ -1462,7 +1477,9 @@ def run_macro_loop():
         config.log_risk_config()
     try:
         import earnings_blackout
-        earnings_blackout.log_config()
+        earnings_blackout.log_config(
+            alert=not night_mode.harvest_still_ahead(holidays=NYSE_HOLIDAYS)
+        )
     except Exception as earn_err:
         print(f"[Earnings] config unavailable: {earn_err}")
     try:
@@ -1508,16 +1525,8 @@ def run_macro_loop():
     morning_macro_context = ""
     last_briefing_date = None
     last_midday_macro_date = None  # once/day 11:00 CDT isolation
-    # Split cadence (Part 3): loop ticks every EXIT_INTERVAL; full score/admit
-    # on alternate ticks (or when FULL_SCAN_INTERVAL elapsed).
-    exit_interval = int(getattr(config, "EXIT_INTERVAL_SECONDS", 900) or 900)
-    full_scan_interval = int(
-        getattr(config, "FULL_SCAN_INTERVAL_SECONDS", 1800) or 1800
-    )
-    if exit_interval < 60:
-        exit_interval = 60
-    if full_scan_interval < exit_interval:
-        full_scan_interval = exit_interval
+    # exit_interval / full_scan_interval were resolved from config before
+    # the boot banner. Same numbers feed [Cadence] and the exit-only line.
     last_full_scan_mono = 0.0  # force full scan on first trading tick
     print(
         f"[Cadence] EXIT_INTERVAL={exit_interval}s "
@@ -1617,15 +1626,33 @@ def run_macro_loop():
 
             if is_night_mode:
                 print(f"\n[System State] 🌙 NIGHT MODE (EST {now.strftime('%Y-%m-%d %H:%M:%S')})")
-                run_night_harvest()
-                print("[System State] Overnight harvest complete. Sleeping until next state check...")
-                for _ in range(45):
-                    time.sleep(60)
-                    nxt = datetime.now(est_tz)
-                    if (nxt.time() >= meeting_start
-                            and nxt.weekday() <= 4
-                            and nxt.strftime("%Y-%m-%d") not in NYSE_HOLIDAYS):
-                        break
+                harvest_key = night_mode.harvest_session_key(now, NYSE_HOLIDAYS)
+                if night_mode.already_harvested(harvest_key):
+                    print(
+                        f"[System State] Night harvest already done for {harvest_key}. "
+                        "Skipping Yahoo."
+                    )
+                else:
+                    run_night_harvest()
+                    night_mode.mark_harvested(harvest_key)
+                    print(
+                        f"[System State] Night harvest recorded for {harvest_key} "
+                        "(once per pre-market date)."
+                    )
+                target = night_mode.next_premarket(now, NYSE_HOLIDAYS)
+                chunks = list(night_mode.iter_night_sleep_chunks(now, NYSE_HOLIDAYS))
+                if not chunks:
+                    chunks = [float(night_mode.MIN_NIGHT_CHECK_S)]
+                total = sum(chunks)
+                print(
+                    "[System State] Sleeping until pre-market "
+                    f"{target.strftime('%Y-%m-%d %H:%M %Z')} "
+                    f"({total / 3600:.2f}h). "
+                    "State checks are an hour apart, or the exact remainder "
+                    "when the pre-market is closer than that."
+                )
+                for chunk in chunks:
+                    time.sleep(chunk)
                 continue
 
             elif is_prep_meeting:
@@ -1730,10 +1757,7 @@ def run_macro_loop():
                     )
                     last_full_scan_mono = time.monotonic()
                 else:
-                    print(
-                        "[System State] EXIT-ONLY PASS (15-min) — mark open book, "
-                        "no new admits."
-                    )
+                    print(night_mode.exit_only_line(exit_interval))
                     try:
                         run_exit_only_pass(breaker)
                     except Exception as exit_pass_err:

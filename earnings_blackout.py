@@ -38,14 +38,18 @@ _calendar: dict[str, date] | None = None
 _sources: dict[str, str] = {}
 # First blackout-check exception this process → Discord CRITICAL.
 _blackout_check_alerted: bool = False
+# Empty / partial calendar from failed fetches → Discord CRITICAL once.
+_unavailable_alerted: bool = False
+_INDEX_ETFS = {"SPY", "QQQ", "IWM"}
 
 
 def reset_for_tests() -> None:
     """Drop the in-process calendar so the next load sees patched env/DB."""
-    global _calendar, _sources, _blackout_check_alerted
+    global _calendar, _sources, _blackout_check_alerted, _unavailable_alerted
     _calendar = None
     _sources = {}
     _blackout_check_alerted = False
+    _unavailable_alerted = False
 
 
 def set_calendar_for_tests(
@@ -249,8 +253,35 @@ def should_flatten_trade(
     return exp >= print_on
 
 
-def log_config() -> None:
-    """Boot log: resolved prints, windows, flatten policy."""
+def earnings_universe() -> list[str]:
+    """Single names the blackout covers. Index ETFs have no earnings print."""
+    out: list[str] = []
+    for ticker in getattr(config, "TICKERS", []) or []:
+        key = str(ticker).upper().strip()
+        if key and key not in _INDEX_ETFS and key not in out:
+            out.append(key)
+    return out
+
+
+def calendar_gap(cal: dict[str, date] | None = None) -> list[str]:
+    """Universe names with no last-known print date.
+
+    An empty gap means every single name has a date (scraper or env).
+    A name missing from the calendar is unprotected. A failed fetch must
+    not put that name in the clear.
+    """
+    if cal is None:
+        cal = load_calendar()
+    return [ticker for ticker in earnings_universe() if ticker not in cal]
+
+
+def log_config(*, alert: bool = False) -> None:
+    """Boot / post-harvest log: resolved prints, windows, flatten policy.
+
+    ``alert=True`` pages Discord when any universe name has no date.
+    A failed fetch leaves the previous date in place. No date at all is
+    blackout protection unavailable, never "no earnings coming."
+    """
     cal = load_calendar(force=True)
     before = int(getattr(config, "BLACKOUT_DAYS_BEFORE", 1))
     after = int(getattr(config, "BLACKOUT_DAYS_AFTER", 1))
@@ -264,17 +295,58 @@ def log_config() -> None:
         f"{getattr(config, 'EARNINGS_IMMINENT_EXTRA_DAYS', 3)} "
         f"EARNINGS_BLACKOUT={env_raw}"
     )
-    if not cal:
-        print("[Earnings] calendar empty — no ticker blacked out")
-        return
-    for ticker in sorted(cal):
-        print_on = cal[ticker]
-        start, end = blackout_window(print_on)
-        src = _sources.get(ticker, "?")
+    gap = calendar_gap(cal)
+    if cal:
+        for ticker in sorted(cal):
+            print_on = cal[ticker]
+            start, end = blackout_window(print_on)
+            src = _sources.get(ticker, "?")
+            print(
+                f"[Earnings]   {ticker} print={print_on.isoformat()} "
+                f"({src}) blackout={start.isoformat()}..{end.isoformat()}"
+            )
+    if gap:
+        named = ", ".join(gap)
         print(
-            f"[Earnings]   {ticker} print={print_on.isoformat()} "
-            f"({src}) blackout={start.isoformat()}..{end.isoformat()}"
+            "[Earnings] CRITICAL: blackout protection unavailable for "
+            f"{named}. No last-known earnings date. "
+            "A failed fetch is an unknown calendar, not a clear book."
         )
+        if alert:
+            alert_blackout_unavailable(gap)
+        return
+    if not cal:
+        print(
+            "[Earnings] CRITICAL: blackout protection unavailable. "
+            "No earnings dates are known."
+        )
+        if alert:
+            alert_blackout_unavailable([])
+
+
+def alert_blackout_unavailable(missing: list[str]) -> None:
+    """Page once per process when the blackout has no date to enforce."""
+    global _unavailable_alerted
+    if _unavailable_alerted:
+        return
+    _unavailable_alerted = True
+    universe = earnings_universe()
+    if not missing or (universe and len(missing) >= len(universe)):
+        detail = "no earnings dates are known"
+    else:
+        detail = "no last-known print date for " + ", ".join(missing)
+    msg = (
+        "🚨 **CRITICAL: EARNINGS BLACKOUT UNAVAILABLE** — "
+        f"{detail}. A failed fetch is not a clear calendar. "
+        "Blackout protection is down for those names until a date is known."
+    )
+    print(f"[Earnings] {msg}")
+    try:
+        import broadcaster
+        delivered = broadcaster.send_discord_alert(msg)
+        print(f"[Earnings] blackout-unavailable CRITICAL delivered={delivered}")
+    except Exception as send_err:
+        print(f"[Earnings] blackout-unavailable CRITICAL send failed: {send_err}")
 
 
 def alert_blackout_check_failed(ticker: str, err: BaseException) -> None:

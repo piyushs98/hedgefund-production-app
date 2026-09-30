@@ -129,6 +129,80 @@ class TestScraperAndEnvMerge(unittest.TestCase):
         self.assertEqual(cal["NVDA"], date(2026, 8, 26))
         self.assertEqual(eb.calendar_source("NVDA"), "env")
 
+    def test_failed_fetch_keeps_last_known_date(self):
+        import earnings_calendar_scraper as ecs
+        news_memory.save_innovation_data(
+            "NVDA",
+            "EARNINGS",
+            "Corporate Earnings Scheduled for 2026-08-26",
+        )
+        with mock.patch.object(
+            ecs.yf, "Ticker", side_effect=RuntimeError("HTTP 401")
+        ):
+            with mock.patch.object(ecs.time, "sleep"):
+                outcomes = ecs.scrape_earnings_calendar(["NVDA", "AAPL", "SPY"])
+        self.assertEqual(outcomes["NVDA"], "failed")
+        self.assertEqual(outcomes["AAPL"], "failed")
+        self.assertNotIn("SPY", outcomes)
+        with mock.patch.dict(os.environ, {"EARNINGS_BLACKOUT": ""}, clear=False):
+            cal = eb.load_calendar(force=True)
+        self.assertEqual(cal["NVDA"], date(2026, 8, 26))
+        self.assertNotIn("AAPL", cal)
+        self.assertTrue(eb.is_blacked_out("NVDA", date(2026, 8, 26)))
+
+    def test_empty_payload_does_not_clear_last_known_date(self):
+        import earnings_calendar_scraper as ecs
+        news_memory.save_innovation_data(
+            "NVDA",
+            "EARNINGS",
+            "Corporate Earnings Scheduled for 2026-08-26",
+        )
+        fake = mock.Mock()
+        fake.calendar = {}
+        with mock.patch.object(ecs.yf, "Ticker", return_value=fake):
+            with mock.patch.object(ecs.time, "sleep"):
+                outcomes = ecs.scrape_earnings_calendar(["NVDA"])
+        self.assertEqual(outcomes["NVDA"], "failed")
+        with mock.patch.dict(os.environ, {"EARNINGS_BLACKOUT": ""}, clear=False):
+            cal = eb.load_calendar(force=True)
+        self.assertEqual(cal["NVDA"], date(2026, 8, 26))
+
+    def test_empty_calendar_pages_critical_and_is_not_a_clear_book(self):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {"EARNINGS_BLACKOUT": ""}, clear=False):
+            with mock.patch("broadcaster.send_discord_alert", return_value=True) as send:
+                with contextlib.redirect_stdout(buf):
+                    eb.log_config(alert=True)
+                    eb.log_config(alert=True)
+        text = buf.getvalue()
+        self.assertNotIn("no ticker blacked out", text)
+        self.assertIn("blackout protection unavailable", text)
+        self.assertEqual(send.call_count, 1)
+        msg = send.call_args[0][0]
+        self.assertIn("EARNINGS BLACKOUT UNAVAILABLE", msg)
+        self.assertIn("no earnings dates are known", msg)
+
+    def test_known_dates_do_not_page(self):
+        import io
+        import contextlib
+        for ticker in ("AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA"):
+            news_memory.save_innovation_data(
+                ticker,
+                "EARNINGS",
+                "Corporate Earnings Scheduled for 2026-11-04",
+            )
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {"EARNINGS_BLACKOUT": ""}, clear=False):
+            with mock.patch("broadcaster.send_discord_alert", return_value=True) as send:
+                with contextlib.redirect_stdout(buf):
+                    eb.log_config(alert=True)
+        self.assertNotIn("no ticker blacked out", buf.getvalue())
+        self.assertIn("NVDA print=2026-11-04", buf.getvalue())
+        send.assert_not_called()
+        self.assertEqual(eb.calendar_gap(), [])
+
 
 class TestGateBlockReason(unittest.TestCase):
     def setUp(self):

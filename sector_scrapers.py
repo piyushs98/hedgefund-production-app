@@ -2,10 +2,28 @@ import os
 import time
 import yfinance as yf
 from news_memory import save_headline, clear_expired_news
-from yf_client import SESSION, TICKER_PACING_SECONDS
+from yf_client import SESSION, TICKER_PACING_SECONDS, crumb_backoff_remaining
 
 # Configuration variables
 BYPASS_SCRAPER_WAIT = os.environ.get("BYPASS_SCRAPER_WAIT", "false").lower() == "true"
+
+# One night harvest hits each of these once. Disabled gov/China scrapers
+# are not in the list — they do not call Yahoo.
+TECH_NEWS_TICKERS = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA"]
+MACRO_NEWS_TICKERS = ["SPY", "QQQ", "IWM"]
+POLITICS_NEWS_SOURCES = ["^GSPC", "^TNX"]
+FUTURES_SYMBOLS = ("ES=F", "NQ=F")
+
+
+def _crumb_blocked(label: str) -> bool:
+    """True when getcrumb returned 429 and the backoff window is still open."""
+    remaining = crumb_backoff_remaining()
+    if remaining <= 0:
+        return False
+    print(
+        f"[Yahoo] skipping {label} — crumb backoff {remaining:.0f}s remaining"
+    )
+    return True
 
 def extract_article_info(article):
     """
@@ -36,11 +54,13 @@ def scrape_tech_sector():
     Employee Tier - Tech Scraper:
     Scrapes live news for AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA and saves it.
     """
-    tickers = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA"]
+    tickers = list(TECH_NEWS_TICKERS)
     print("[Employee] Tech Scraper: Scanning tech sector news...")
     
     count = 0
     for i, ticker in enumerate(tickers):
+        if _crumb_blocked("tech news"):
+            break
         try:
             stock = yf.Ticker(ticker, session=SESSION)
             articles = stock.news
@@ -63,11 +83,13 @@ def scrape_macro_finance():
     Employee Tier - Macro Scraper:
     Scrapes broad index ETFs (SPY, QQQ, IWM) for macroeconomic news.
     """
-    tickers = ["SPY", "QQQ", "IWM"]
+    tickers = list(MACRO_NEWS_TICKERS)
     print("[Employee] Macro Scraper: Scanning macroeconomic index news...")
     
     count = 0
     for i, ticker in enumerate(tickers):
+        if _crumb_blocked("macro news"):
+            break
         try:
             stock = yf.Ticker(ticker, session=SESSION)
             articles = stock.news
@@ -92,11 +114,13 @@ def scrape_politics_government():
     Uses broad index feeds (^GSPC, ^TNX) and filters for policy/macro economic keywords.
     """
     print("[Employee] Politics/Gov Scraper: Scanning broad feeds for economic policy & Fed news...")
-    source_tickers = ["^GSPC", "^TNX"]
+    source_tickers = list(POLITICS_NEWS_SOURCES)
     keywords = ["fed", "federal reserve", "powell", "yellen", "tariff", "policy", "rate", "inflation", "economic", "treasury", "government", "white house", "congress"]
     
     count = 0
     for i, source in enumerate(source_tickers):
+        if _crumb_blocked("politics news"):
+            break
         try:
             stock = yf.Ticker(source, session=SESSION)
             articles = stock.news
@@ -128,12 +152,14 @@ def fetch_overnight_futures():
     print("[Employee] Futures Scraper: Scraping overnight global futures...")
     futures = {
         "ES=F": "S&P 500 E-mini Futures",
-        "NQ=F": "Nasdaq 100 E-mini Futures"
+        "NQ=F": "Nasdaq 100 E-mini Futures",
     }
     
     count = 0
-    futures_items = list(futures.items())
+    futures_items = [(symbol, futures[symbol]) for symbol in FUTURES_SYMBOLS]
     for i, (symbol, name) in enumerate(futures_items):
+        if _crumb_blocked("overnight futures"):
+            break
         try:
             ticker = yf.Ticker(symbol, session=SESSION)
             info = ticker.info

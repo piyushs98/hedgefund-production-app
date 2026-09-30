@@ -9,6 +9,10 @@ import sector_scrapers
 
 
 class TestFuturesNoZeroWrite(unittest.TestCase):
+    def setUp(self):
+        import yf_client
+        yf_client.reset_crumb_backoff_for_tests()
+
     def test_writes_nothing_when_pct_and_price_missing(self):
         fake = mock.Mock()
         fake.info = {}

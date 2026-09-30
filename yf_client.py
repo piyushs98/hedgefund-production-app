@@ -12,6 +12,7 @@ a background trading thread forever.
 
 from __future__ import annotations
 
+import threading
 import time
 
 import requests
@@ -59,6 +60,105 @@ SESSION.headers.update({
 _timeout_adapter = TimeoutHTTPAdapter(timeout=DEFAULT_TIMEOUT)
 SESSION.mount("http://", _timeout_adapter)
 SESSION.mount("https://", _timeout_adapter)
+
+# Crumb HTTP 429. Yahoo's getcrumb is what quoteSummary (earnings, futures
+# info, and anything else that needs a crumb) depends on. A 429 used to be
+# retried on the next night-loop pass ~95s later, which kept the IP throttled
+# until the open. Back off exponentially and do not send another getcrumb
+# until the window expires. Base 15 min, then 30, 60, 120, cap 4 h.
+_CRUMB_BACKOFF_BASE_S = 15 * 60
+_CRUMB_BACKOFF_CAP_S = 4 * 60 * 60
+_crumb_lock = threading.Lock()
+_crumb_backoff_until = 0.0  # time.monotonic()
+_crumb_backoff_exp = 0
+_original_session_request = SESSION.request
+
+
+def reset_crumb_backoff_for_tests() -> None:
+    global _crumb_backoff_until, _crumb_backoff_exp
+    with _crumb_lock:
+        _crumb_backoff_until = 0.0
+        _crumb_backoff_exp = 0
+
+
+def crumb_backoff_remaining() -> float:
+    with _crumb_lock:
+        return max(0.0, _crumb_backoff_until - time.monotonic())
+
+
+def note_crumb_429() -> float:
+    """Record a getcrumb 429. Returns the new backoff length in seconds."""
+    global _crumb_backoff_until, _crumb_backoff_exp
+    with _crumb_lock:
+        delay = min(
+            _CRUMB_BACKOFF_CAP_S,
+            _CRUMB_BACKOFF_BASE_S * (2 ** _crumb_backoff_exp),
+        )
+        _crumb_backoff_exp = min(_crumb_backoff_exp + 1, 8)
+        _crumb_backoff_until = time.monotonic() + delay
+        return float(delay)
+
+
+def note_crumb_ok() -> None:
+    """A real crumb arrived. The next 429 starts the ladder over at 15 min."""
+    global _crumb_backoff_until, _crumb_backoff_exp
+    with _crumb_lock:
+        _crumb_backoff_until = 0.0
+        _crumb_backoff_exp = 0
+
+
+def _is_crumb_url(url) -> bool:
+    return "getcrumb" in str(url or "").lower()
+
+
+def _synthetic_crumb_429(url: str) -> requests.Response:
+    response = requests.Response()
+    response.status_code = 429
+    response.reason = "Too Many Requests"
+    response.url = url
+    response.headers["Content-Type"] = "text/plain"
+    response.encoding = "utf-8"
+    response._content = b"Too Many Requests"
+    return response
+
+
+def _note_crumb_response(url, response) -> None:
+    final_url = str(getattr(response, "url", "") or "")
+    if not (_is_crumb_url(url) or _is_crumb_url(final_url)):
+        return
+    code = getattr(response, "status_code", None)
+    body = ""
+    if code in (200, 429):
+        try:
+            body = response.text or ""
+        except Exception:
+            body = ""
+    if code == 429 or "Too Many Requests" in body[:400]:
+        delay = note_crumb_429()
+        print(
+            f"[Yahoo] Crumb fetch rate-limited (HTTP {code}), "
+            f"backing off {int(delay)}s. Not retrying this loop."
+        )
+        return
+    if code == 200 and body and "<html>" not in body[:200] and len(body) < 200:
+        note_crumb_ok()
+
+
+def _request_with_crumb_backoff(method, url, *args, **kwargs):
+    url_text = url if isinstance(url, str) else str(url)
+    if _is_crumb_url(url_text) and crumb_backoff_remaining() > 0:
+        remaining = crumb_backoff_remaining()
+        print(
+            f"[Yahoo] crumb fetch suppressed — backoff {remaining:.0f}s "
+            "remaining (not retrying a 429)"
+        )
+        return _synthetic_crumb_429(url_text)
+    response = _original_session_request(method, url, *args, **kwargs)
+    _note_crumb_response(url_text, response)
+    return response
+
+
+SESSION.request = _request_with_crumb_backoff
 
 TICKER_PACING_SECONDS = 2
 
