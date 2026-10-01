@@ -370,6 +370,7 @@ class TestGateDataReasons(unittest.TestCase):
         self.assertEqual(
             sg._compact_reason("blackout_check_failed"), "blackout_check_failed"
         )
+        self.assertEqual(sg._compact_reason("data_unavailable"), "data_unavailable")
         # liq-killed total no longer the only path — but below_thr still exists
         self.assertEqual(sg._compact_reason("score 0.0 below 70"), "below_thr")
 
@@ -408,6 +409,32 @@ class TestGateDataReasons(unittest.TestCase):
         self.assertIn("no_liq_data×1", summary)
         self.assertIn("spread_untradeable×1", summary)
         self.assertIn("no_momentum_data×1", summary)
+        self.assertNotIn("below_thr", summary)
+
+    def test_unscored_outage_is_data_unavailable_not_below_thr(self):
+        gate = sg.reset_gate_for_tests(
+            sg.GateConfig(threshold=70.0, persist_cycles=1, max_concurrent=10)
+        )
+        now = datetime.now(timezone.utc)
+        names = [
+            "SPY", "QQQ", "IWM", "AAPL", "MSFT",
+            "NVDA", "AMZN", "META", "GOOGL", "TSLA",
+        ]
+        decs = gate.process_scan(
+            [
+                sg.Observation(
+                    ticker=name,
+                    score=0.0,
+                    direction=None,
+                    action_flag="PASS",
+                    block_reason="data_unavailable",
+                )
+                for name in names
+            ],
+            now,
+        )
+        summary = gate.format_scan_summary(decs)
+        self.assertIn("data_unavailable×10", summary)
         self.assertNotIn("below_thr", summary)
 
 

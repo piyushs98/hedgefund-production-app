@@ -104,6 +104,63 @@ def _chicago_now():
     return datetime.now(pytz.timezone("America/Chicago"))
 
 
+# One NO MARKET DATA page per Chicago session. A failed Discord send stays
+# pending so the next pass, including a breaker-open return, can retry.
+_market_data_alerted_date: str | None = None
+_market_data_alert_pending: tuple[str, int] | None = None
+
+
+def reset_market_data_alert_for_tests() -> None:
+    global _market_data_alerted_date, _market_data_alert_pending
+    _market_data_alerted_date = None
+    _market_data_alert_pending = None
+
+
+def _chicago_session_date_str() -> str:
+    return _chicago_now().date().isoformat()
+
+
+def _no_market_data_message(fetched: int, universe_n: int) -> str:
+    return (
+        "🚨 **CRITICAL: NO MARKET DATA — "
+        f"{fetched}/{universe_n} tickers fetched, trading suspended.**"
+    )
+
+
+def _send_no_market_data_alert(fetched: int, universe_n: int) -> bool:
+    """Page once when this scan fetched zero chains. Latch after Discord accepts."""
+    global _market_data_alerted_date, _market_data_alert_pending
+    day = _chicago_session_date_str()
+    if _market_data_alerted_date == day:
+        return False
+    if universe_n <= 0 or fetched != 0:
+        return False
+    msg = _no_market_data_message(fetched, universe_n)
+    print(f"[scan] {msg}")
+    ok = False
+    try:
+        ok = bool(broadcaster.send_discord_alert(msg))
+    except Exception as exc:
+        print(f"[scan] no-market-data Discord warn: {exc}")
+        ok = False
+    if ok:
+        _market_data_alerted_date = day
+        _market_data_alert_pending = None
+    else:
+        _market_data_alert_pending = (day, universe_n)
+    return ok
+
+
+def _retry_pending_market_data_alert() -> None:
+    pending = _market_data_alert_pending
+    if not pending:
+        return
+    day, universe_n = pending
+    if day != _chicago_session_date_str():
+        return
+    _send_no_market_data_alert(0, universe_n)
+
+
 def _edt_now():
     if pytz is None:
         return datetime.now()
@@ -906,6 +963,7 @@ def run_thirty_min_scan(
         print("🛑 [scan] Circuit breaker OPEN — 30-min scan suspended.")
         result["aborted"] = True
         result["circuit_breaker_open"] = True
+        _retry_pending_market_data_alert()
         return result
 
     today = _edt_now().strftime("%Y-%m-%d")
@@ -942,6 +1000,7 @@ def run_thirty_min_scan(
     telemetry_candidates: list[dict] = []
     # Phase-1 workspace: score all tickers before any admit (rank-before-admit).
     scored: dict[str, dict[str, Any]] = {}
+    chains_fetched = 0
 
     for idx, ticker in enumerate(universe):
         row: dict[str, Any] = {"ticker": ticker, "error": None}
@@ -955,11 +1014,13 @@ def run_thirty_min_scan(
             if "error" in options_dict:
                 row["error"] = options_dict["error"]
                 row["action_flag"] = "PASS"
+                row["block_reason"] = "data_unavailable"
                 rows_by_ticker[ticker] = row
                 result["results"].append(row)
                 breaker.record_failure(f"options:{ticker}")
                 continue
             breaker.record_success(f"options:{ticker}")
+            chains_fetched += 1
 
             pivot_data = _call_with_timeout(
                 lambda t=ticker: fetch_pivot_data(t),
@@ -1035,12 +1096,15 @@ def run_thirty_min_scan(
                     "atr_abs": None,
                     "direction": None,
                 }
+            else:
+                row["block_reason"] = "data_unavailable"
             rows_by_ticker[ticker] = row
             result["results"].append(row)
         except Exception as e:
             print(f"[{ticker}] error: {e}")
             row["error"] = str(e)
             row["action_flag"] = "PASS"
+            row["block_reason"] = "data_unavailable"
             rows_by_ticker[ticker] = row
             result["results"].append(row)
 
@@ -1157,7 +1221,13 @@ def run_thirty_min_scan(
         ctx = scored.get(ticker)
         if not ctx:
             observations.append(
-                signal_gate.Observation(ticker=ticker, score=0.0, direction=None, action_flag="PASS")
+                signal_gate.Observation(
+                    ticker=ticker,
+                    score=0.0,
+                    direction=None,
+                    action_flag="PASS",
+                    block_reason="data_unavailable",
+                )
             )
             continue
         card = ctx["card"]
@@ -1191,6 +1261,9 @@ def run_thirty_min_scan(
     gate_summary = gate.format_scan_summary(gate_decisions)
     print(f"[scan] {gate_summary}")
     result["gate_summary"] = gate_summary
+    result["chains_fetched"] = chains_fetched
+    if chains_fetched == 0 and universe:
+        _send_no_market_data_alert(0, len(universe))
 
     # ---- Phase 2: strike + paper buy only for admitted tickers ----
     strike_rejects: list[str] = []

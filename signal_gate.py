@@ -475,6 +475,7 @@ def _compact_reason(reason: str) -> str:
         "blackout_check_failed",
         "no_pivot_data",
         "no_atr_data",
+        "data_unavailable",
     ):
         return r
     if "no_liq_data" in r or "no liq" in r:
@@ -493,6 +494,8 @@ def _compact_reason(reason: str) -> str:
         return "no_pivot_data"
     if "no_atr_data" in r:
         return "no_atr_data"
+    if "data_unavailable" in r:
+        return "data_unavailable"
     if "same_scan" in r:
         return "same_scan"
     if "post_exit" in r:
