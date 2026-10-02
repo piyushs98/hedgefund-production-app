@@ -165,6 +165,8 @@ class TestEntryFilters(unittest.TestCase):
             def option_chain(self, exp):
                 return _Chain()
 
+        from data_engineer import reset_yahoo_ticker_cache_for_tests
+        reset_yahoo_ticker_cache_for_tests()
         with mock.patch("data_engineer.yf.Ticker", return_value=_T()):
             raw = fetch_contract_quote("SPY", "2026-08-14", 500.0, "CALL")
         od = json.loads(raw)

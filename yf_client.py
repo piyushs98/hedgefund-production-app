@@ -73,12 +73,36 @@ _crumb_backoff_until = 0.0  # time.monotonic()
 _crumb_backoff_exp = 0
 _original_session_request = SESSION.request
 
+# Minimum gap between real Yahoo HTTP sends. One clock for the process so a
+# scan, an exit pass, and the night harvest cannot burst. Not a strategy knob.
+# The synthetic crumb-429 short-circuit does not count as a send.
+_YAHOO_MIN_INTERVAL_S = 0.5
+_pace_lock = threading.Lock()
+_last_yahoo_send = 0.0
+
 
 def reset_crumb_backoff_for_tests() -> None:
     global _crumb_backoff_until, _crumb_backoff_exp
     with _crumb_lock:
         _crumb_backoff_until = 0.0
         _crumb_backoff_exp = 0
+
+
+def reset_request_pace_for_tests() -> None:
+    global _last_yahoo_send
+    with _pace_lock:
+        _last_yahoo_send = 0.0
+
+
+def _pace_before_send() -> None:
+    global _last_yahoo_send
+    if _YAHOO_MIN_INTERVAL_S <= 0:
+        return
+    with _pace_lock:
+        wait = _YAHOO_MIN_INTERVAL_S - (time.monotonic() - _last_yahoo_send)
+        if wait > 0:
+            time.sleep(wait)
+        _last_yahoo_send = time.monotonic()
 
 
 def crumb_backoff_remaining() -> float:
@@ -153,6 +177,7 @@ def _request_with_crumb_backoff(method, url, *args, **kwargs):
             "remaining (not retrying a 429)"
         )
         return _synthetic_crumb_429(url_text)
+    _pace_before_send()
     response = _original_session_request(method, url, *args, **kwargs)
     _note_crumb_response(url_text, response)
     return response

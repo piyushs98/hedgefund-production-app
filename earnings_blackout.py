@@ -162,6 +162,32 @@ def calendar_source(ticker: str) -> str | None:
     return _sources.get(str(ticker).upper().strip())
 
 
+def feed_source_token() -> str:
+    """
+    SESSION earnings token across the single-name universe.
+
+    none: any name has no date. env: every date is an env override.
+    yahoo: at least one date came from the Yahoo scraper and none are missing.
+    """
+    cal = load_calendar()
+    universe = earnings_universe()
+    if not universe:
+        return "none"
+    sources: list[str] = []
+    for ticker in universe:
+        if ticker not in cal:
+            return "none"
+        src = _sources.get(ticker)
+        if src not in ("env", "scraper"):
+            return "none"
+        sources.append(src)
+    if all(src == "env" for src in sources):
+        return "env"
+    if any(src == "scraper" for src in sources):
+        return "yahoo"
+    return "none"
+
+
 def session_date_for(when: date | datetime | None = None) -> date:
     """America/New_York session date (equity calendar). Naive → .date()."""
     if when is None:

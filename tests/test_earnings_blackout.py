@@ -385,6 +385,40 @@ class TestFlattenSpanning(unittest.TestCase):
         self.assertNotEqual(reason, "EARNINGS_FLATTEN")
 
 
+class TestFeedSourceToken(unittest.TestCase):
+    def setUp(self):
+        eb.reset_for_tests()
+
+    def tearDown(self):
+        eb.reset_for_tests()
+
+    def test_none_when_any_single_name_has_no_date(self):
+        names = eb.earnings_universe()
+        self.assertGreaterEqual(len(names), 2)
+        present = {n: date(2026, 10, 1) for n in names[:-1]}
+        sources = {n: "env" for n in names[:-1]}
+        eb.set_calendar_for_tests(present, sources)
+        self.assertEqual(eb.feed_source_token(), "none")
+
+    def test_env_when_every_date_is_an_override(self):
+        names = eb.earnings_universe()
+        eb.set_calendar_for_tests(
+            {n: date(2026, 10, 1) for n in names},
+            {n: "env" for n in names},
+        )
+        self.assertEqual(eb.feed_source_token(), "env")
+
+    def test_yahoo_when_any_scraper_date_and_no_gap(self):
+        names = eb.earnings_universe()
+        sources = {n: "env" for n in names}
+        sources[names[0]] = "scraper"
+        eb.set_calendar_for_tests(
+            {n: date(2026, 10, 1) for n in names},
+            sources,
+        )
+        self.assertEqual(eb.feed_source_token(), "yahoo")
+
+
 class TestConfigDefaults(unittest.TestCase):
     def test_blackout_defaults(self):
         self.assertEqual(config.BLACKOUT_DAYS_BEFORE, 1)

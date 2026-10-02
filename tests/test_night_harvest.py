@@ -136,9 +136,11 @@ class TestNightSchedule(unittest.TestCase):
 class TestCrumbBackoff(unittest.TestCase):
     def setUp(self):
         yf_client.reset_crumb_backoff_for_tests()
+        yf_client.reset_request_pace_for_tests()
 
     def tearDown(self):
         yf_client.reset_crumb_backoff_for_tests()
+        yf_client.reset_request_pace_for_tests()
 
     def test_429_backs_off_exponentially(self):
         first = yf_client.note_crumb_429()

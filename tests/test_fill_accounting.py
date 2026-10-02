@@ -187,7 +187,13 @@ class TestTradeAndSessionLines(unittest.TestCase):
         )
         self.assertTrue(line.endswith("carried y") or line.split("|")[-1] == "carried y")
 
+    def _session_line(self, **kwargs):
+        with mock.patch.object(fa, "_futures_saved_recently", return_value=False), \
+             mock.patch("earnings_blackout.feed_source_token", return_value="none"):
+            return fa.format_session_line(**kwargs)
+
     def test_session_line_field_count(self):
+        fa.reset_session_for_tests()
         fa.note_scan()
         fa.note_scan()
         fa.note_entry()
@@ -196,7 +202,7 @@ class TestTradeAndSessionLines(unittest.TestCase):
         fa.note_spy(767.50)
         fa.note_spy(764.20)
         fa.note_critical()
-        line = fa.format_session_line(
+        line = self._session_line(
             equity_fill=10041.0,
             peak_deployed=2778.0,
             open_value=1100.0,
@@ -205,7 +211,7 @@ class TestTradeAndSessionLines(unittest.TestCase):
         )
         parts = line.split("|")
         self.assertEqual(len(parts), fa.SESSION_FIELD_COUNT)
-        self.assertEqual(fa.SESSION_FIELD_COUNT, 18)
+        self.assertEqual(fa.SESSION_FIELD_COUNT, 22)
         self.assertEqual(parts[0], "SESSION")
         self.assertTrue(parts[1].startswith("v"))
         self.assertEqual(parts[3], "scans 2")
@@ -222,18 +228,44 @@ class TestTradeAndSessionLines(unittest.TestCase):
         self.assertEqual(parts[15], "spy_range_pct 0.43")
         self.assertEqual(parts[16], "criticals 1")
         self.assertEqual(parts[17], "bp 9476")
+        self.assertEqual(parts[18], "chain=blocked")
+        self.assertEqual(parts[19], "news=blocked")
+        self.assertEqual(parts[20], "futures=blocked")
+        self.assertEqual(parts[21], "earnings=none")
+
+    def test_session_feed_status_sticks_and_does_not_downgrade(self):
+        fa.reset_session_for_tests()
+        fa.note_chain_ok()
+        fa.note_news_ok()
+        fa.note_futures_ok()
+        with mock.patch("earnings_blackout.feed_source_token", return_value="yahoo"):
+            line = fa.format_session_line(
+                equity_fill=10000.0,
+                peak_deployed=0.0,
+                open_value=0.0,
+                bp=10000.0,
+                now=datetime(2026, 8, 25, 14, 45, 0),
+            )
+        parts = line.split("|")
+        self.assertEqual(parts[17], "bp 10000")
+        self.assertEqual(parts[18], "chain=ok")
+        self.assertEqual(parts[19], "news=ok")
+        self.assertEqual(parts[20], "futures=ok")
+        self.assertEqual(parts[21], "earnings=yahoo")
 
     def test_session_bp_n_a_when_missing_keeps_arity(self):
-        line = fa.format_session_line(
+        fa.reset_session_for_tests()
+        line = self._session_line(
             equity_fill=10000.0,
             peak_deployed=0.0,
             open_value=0.0,
             now=datetime(2026, 8, 25, 14, 45, 0),
         )
         parts = line.split("|")
-        self.assertEqual(len(parts), 18)
+        self.assertEqual(len(parts), 22)
         self.assertEqual(parts[16], "criticals 0")
         self.assertEqual(parts[17], "bp n/a")
+        self.assertEqual(parts[18], "chain=blocked")
 
 
 class TestLedgerFillSeries(unittest.TestCase):

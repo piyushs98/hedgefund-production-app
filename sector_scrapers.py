@@ -205,6 +205,11 @@ def fetch_overnight_futures():
             saved = save_headline(
                 symbol, "Macro", "Yahoo Finance", title, sentiment_score=pct_change
             )
+            try:
+                import fill_accounting
+                fill_accounting.note_futures_ok()
+            except Exception:
+                pass
             if saved:
                 count += 1
                 print(f"[Employee] Futures Scraper: Saved {name} pre-market headline.")

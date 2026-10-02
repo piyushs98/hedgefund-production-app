@@ -548,10 +548,19 @@ def fetch_intraday_drift(ticker, breaker=None):
         return None
 
 
+def _note_news_ok() -> None:
+    try:
+        import fill_accounting
+        fill_accounting.note_news_ok()
+    except Exception:
+        pass
+
+
 def ensure_news_context(ticker, breaker=None):
     """DB-first news retrieval with the live yfinance cold-start fallback."""
     news_string = get_historical_context(ticker, days=90)
     if news_string.strip():
+        _note_news_ok()
         return news_string
     print(f"[{ticker}] 👷 No news in database. Running live yfinance fallback...")
     try:
@@ -568,6 +577,8 @@ def ensure_news_context(ticker, breaker=None):
             if title and title != "Unknown Title":
                 save_headline(ticker, "Fallback", publisher, title)
         news_string = get_historical_context(ticker, days=90)
+        # A completed fetch is ok even when Yahoo returns no headlines.
+        _note_news_ok()
         if breaker:
             breaker.record_success(f"news:{ticker}")
     except MasterBotScanError as e:

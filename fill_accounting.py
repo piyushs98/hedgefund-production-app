@@ -38,6 +38,9 @@ _session: dict[str, Any] = {
     "spy_high": None,
     "spy_low": None,
     "spy_close": None,
+    "chain_ok": False,
+    "news_ok": False,
+    "futures_ok": False,
 }
 
 
@@ -55,6 +58,9 @@ def reset_session_for_tests() -> None:
     _session["spy_high"] = None
     _session["spy_low"] = None
     _session["spy_close"] = None
+    _session["chain_ok"] = False
+    _session["news_ok"] = False
+    _session["futures_ok"] = False
     global _version_cache
     _version_cache = None
 
@@ -233,6 +239,9 @@ def _ensure_session_day() -> None:
     _session["spy_high"] = None
     _session["spy_low"] = None
     _session["spy_close"] = None
+    _session["chain_ok"] = False
+    _session["news_ok"] = False
+    _session["futures_ok"] = False
 
 
 def note_scan() -> None:
@@ -265,6 +274,58 @@ def note_close(*, pnl_mid: float, pnl_fill: float, planned_risk: float | None) -
 def note_critical() -> None:
     _ensure_session_day()
     _session["criticals"] = int(_session.get("criticals") or 0) + 1
+
+
+def note_chain_ok() -> None:
+    """A chain payload with no error landed this Chicago session. Sticky."""
+    _ensure_session_day()
+    _session["chain_ok"] = True
+
+
+def note_news_ok() -> None:
+    """Headlines were available, or a live Yahoo news fetch succeeded. Sticky."""
+    _ensure_session_day()
+    _session["news_ok"] = True
+
+
+def note_futures_ok() -> None:
+    """Overnight ES or NQ percent was read from Yahoo. Sticky for the session."""
+    _ensure_session_day()
+    _session["futures_ok"] = True
+
+
+def _futures_saved_recently(hours: int = 36) -> bool:
+    """
+    True when an ES or NQ percent was written in the lookback.
+
+    The scoring read stays on its own 18-hour window. This wider read is
+    only the SESSION token, so a harvest from the prior evening is still
+    visible at 14:45 and a failed harvest is not.
+    """
+    try:
+        with sqlite3.connect(config.NEWS_DB_PATH, timeout=30.0) as conn:
+            row = conn.execute(
+                """SELECT 1 FROM headlines
+                   WHERE ticker IN ('ES=F', 'NQ=F')
+                     AND sentiment_score IS NOT NULL
+                     AND timestamp >= datetime('now', ?)
+                   LIMIT 1""",
+                (f"-{int(hours)} hours",),
+            ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
+def _earnings_feed_token() -> str:
+    try:
+        import earnings_blackout
+        token = earnings_blackout.feed_source_token()
+    except Exception:
+        return "none"
+    if token not in ("env", "yahoo", "none"):
+        return "none"
+    return token
 
 
 def note_spy(spot: float | None) -> None:
@@ -572,8 +633,9 @@ def format_session_line(
     now: datetime | None = None,
 ) -> str:
     """
-    One pipe-delimited SESSION line at 14:45. 18 fields, fixed order.
-    Columns 1–17 unchanged; bp is trailing column 18 (mid-cash buying power).
+    One pipe-delimited SESSION line at 14:45. 22 fields, fixed order.
+    Columns 1–18 unchanged (bp is column 18). Columns 19–22 are feed status:
+    chain, news, futures, earnings.
     """
     snap = session_snapshot()
     planned = _f(snap.get("planned_risk_closed"))
@@ -610,9 +672,13 @@ def format_session_line(
         _fmt_float("spy_range_pct", spy_range, 2, signed=False),
         _fmt_int("criticals", snap.get("criticals"), signed=False),
         _fmt_int("bp", bp, signed=False),
+        "chain=ok" if snap.get("chain_ok") else "chain=blocked",
+        "news=ok" if snap.get("news_ok") else "news=blocked",
+        "futures=ok" if snap.get("futures_ok") or _futures_saved_recently() else "futures=blocked",
+        f"earnings={_earnings_feed_token()}",
     ]
     return "|".join(fields)
 
 
 TRADE_FIELD_COUNT = 26
-SESSION_FIELD_COUNT = 18
+SESSION_FIELD_COUNT = 22
