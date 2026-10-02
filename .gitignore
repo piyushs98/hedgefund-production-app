@@ -17,11 +17,14 @@ __pycache__/
 *.pyc
 .DS_Store
 
-# Local application logs
+# Local application logs (run_local.sh)
 *.log
+logs/
 mac_ssl_fix.sh
 patcher.py
 
 # Local SQLite state (ephemeral on free tier; never commit)
 data/*.db
+data/*.db-wal
+data/*.db-shm
 *.db
