@@ -369,7 +369,7 @@ def alert_blackout_unavailable(missing: list[str]) -> None:
     print(f"[Earnings] {msg}")
     try:
         import broadcaster
-        delivered = broadcaster.send_discord_alert(msg)
+        delivered = broadcaster.send_discord_alert(msg, critical=True)
         print(f"[Earnings] blackout-unavailable CRITICAL delivered={delivered}")
     except Exception as send_err:
         print(f"[Earnings] blackout-unavailable CRITICAL send failed: {send_err}")
@@ -395,7 +395,7 @@ def alert_blackout_check_failed(ticker: str, err: BaseException) -> None:
     print(f"[Earnings] {msg}")
     try:
         import broadcaster
-        delivered = broadcaster.send_discord_alert(msg)
+        delivered = broadcaster.send_discord_alert(msg, critical=True)
         print(f"[Earnings] blackout-check CRITICAL delivered={delivered}")
     except Exception as send_err:
         print(f"[Earnings] blackout-check CRITICAL send failed: {send_err}")

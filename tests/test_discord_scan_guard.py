@@ -45,6 +45,7 @@ class TestScanDiscordGuard(unittest.TestCase):
             text = send.call_args[0][0]
             self.assertIn("CRITICAL: SCAN DISCORD FAILED", text)
             self.assertIn("10:03", text)
+            self.assertTrue(send.call_args.kwargs.get("critical"))
 
     def test_admit_on_first_miss_is_critical(self):
         with mock.patch("broadcaster.send_discord_alert", return_value=True) as send:

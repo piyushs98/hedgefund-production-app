@@ -486,7 +486,7 @@ def alert_llm_dual_fail(step: str, exc: BaseException | None) -> None:
     print(f"[LLM] {msg.replace(chr(10), ' | ')}")
     try:
         import broadcaster
-        delivered = broadcaster.send_discord_alert(msg)
+        delivered = broadcaster.send_discord_alert(msg, critical=True)
         print(f"[LLM] dual-fail CRITICAL delivered={delivered} step={key}")
     except Exception as send_err:
         print(f"[LLM] dual-fail CRITICAL send failed: {send_err}")

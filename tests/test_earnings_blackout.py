@@ -260,7 +260,7 @@ class TestGateBlockReason(unittest.TestCase):
         with mock.patch.object(eb, "is_blacked_out", side_effect=RuntimeError("db locked")):
             with mock.patch(
                 "broadcaster.send_discord_alert",
-                side_effect=lambda m: alerts.append(m) or True,
+                side_effect=lambda m, **_k: alerts.append(m) or True,
             ):
                 decs = gate.process_scan(
                     [

@@ -36,7 +36,7 @@ class DataUnavailableScanTests(unittest.TestCase):
         self.sent: list[str] = []
         self._send_ok = True
 
-        def _send(message):
+        def _send(message, critical=False):
             text = str(message)
             self.sent.append(text)
             if "NO MARKET DATA" in text:

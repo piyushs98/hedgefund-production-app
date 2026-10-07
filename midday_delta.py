@@ -139,7 +139,7 @@ def _send_no_market_data_alert(fetched: int, universe_n: int) -> bool:
     print(f"[scan] {msg}")
     ok = False
     try:
-        ok = bool(broadcaster.send_discord_alert(msg))
+        ok = bool(broadcaster.send_discord_alert(msg, critical=True))
     except Exception as exc:
         print(f"[scan] no-market-data Discord warn: {exc}")
         ok = False
@@ -825,7 +825,7 @@ def _note_scan_discord_result(
     print(f"[scan] {msg.replace(chr(10), ' | ')}")
     try:
         import broadcaster
-        delivered = broadcaster.send_discord_alert(msg)
+        delivered = broadcaster.send_discord_alert(msg, critical=True)
         print(f"[scan] scan-discord CRITICAL delivered={delivered}")
     except Exception as e:
         print(f"[scan] scan-discord CRITICAL send failed: {e}")
@@ -1495,7 +1495,7 @@ def run_thirty_min_scan(
         )
         print(f"[scan] {msg}")
         try:
-            broadcaster.send_discord_alert(msg)
+            broadcaster.send_discord_alert(msg, critical=True)
         except Exception as crit_err:
             print(f"[scan] data-outage Discord warn: {crit_err}")
         result["data_outage_critical"] = True

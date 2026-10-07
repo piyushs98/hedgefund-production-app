@@ -76,7 +76,7 @@ class TestMiddayRouting(unittest.TestCase):
             deepseek_error=RuntimeError("DeepSeek HTTP 401: bad key"),
         )
         with mock.patch.object(llm_chain, "generate_text", side_effect=exc):
-            with mock.patch("broadcaster.send_discord_alert", side_effect=lambda m: alerts.append(m) or True):
+            with mock.patch("broadcaster.send_discord_alert", side_effect=lambda m, **_k: alerts.append(m) or True):
                 a = midday_delta.run_midday_macro_meeting()
                 b = midday_delta.run_midday_macro_meeting()
         self.assertNotIn("LLM offline", a)
@@ -110,7 +110,7 @@ class TestPreMarketDualFail(unittest.TestCase):
             with mock.patch.object(llm_chain, "generate_text", side_effect=exc):
                 with mock.patch(
                     "broadcaster.send_discord_alert",
-                    side_effect=lambda m: alerts.append(m) or True,
+                    side_effect=lambda m, **_k: alerts.append(m) or True,
                 ):
                     with mock.patch(
                         "midday_delta.store_morning_briefing", return_value=None
@@ -132,7 +132,7 @@ class TestPreMarketDualFail(unittest.TestCase):
             with mock.patch.object(llm_chain, "generate_text", return_value=""):
                 with mock.patch(
                     "broadcaster.send_discord_alert",
-                    side_effect=lambda m: alerts.append(m) or True,
+                    side_effect=lambda m, **_k: alerts.append(m) or True,
                 ):
                     with mock.patch(
                         "midday_delta.store_morning_briefing", return_value=None

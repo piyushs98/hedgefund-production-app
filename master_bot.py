@@ -1787,23 +1787,26 @@ def run_macro_loop():
                     )
                 pull_first_squawk()
                 target = night_mode.next_premarket(now, NYSE_HOLIDAYS)
-                chunks = list(night_mode.iter_night_sleep_chunks(now, NYSE_HOLIDAYS))
-                if not chunks:
-                    chunks = [float(night_mode.MIN_NIGHT_CHECK_S)]
-                total = sum(chunks)
+                remain_h = max(
+                    0.0,
+                    (target - night_mode.as_eastern(now)).total_seconds() / 3600.0,
+                )
                 print(
                     "[System State] Sleeping until pre-market "
                     f"{target.strftime('%Y-%m-%d %H:%M %Z')} "
-                    f"({total / 3600:.2f}h). "
-                    "State checks are an hour apart. "
-                    "First Squawk is read between those checks, then once "
+                    f"({remain_h:.2f}h). "
+                    "Each wait is at most 60s and checks the wall clock, "
+                    "so a wake during the night is back on this target "
+                    "within one minute. "
+                    "First Squawk is read at most once an hour, then once "
                     "more before the morning brief. Yahoo is not called again."
                 )
-                night_mode.sleep_night_chunks(
-                    chunks,
+                night_mode.sleep_until_premarket(
+                    now,
                     time.sleep,
-                    between=pull_first_squawk,
-                    after_each=note_macro_heartbeat,
+                    holidays=NYSE_HOLIDAYS,
+                    on_tick=note_macro_heartbeat,
+                    on_hour=pull_first_squawk,
                 )
                 continue
 
@@ -2010,7 +2013,7 @@ def run_macro_loop():
                 f"Dashboard: {dashboard_url}"
             )
             try:
-                delivered = broadcaster.send_discord_alert(critical_alert)
+                delivered = broadcaster.send_discord_alert(critical_alert, critical=True)
                 if not delivered:
                     print(
                         "[CRITICAL BOT ERROR] Discord delivery failed after "

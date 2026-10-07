@@ -172,7 +172,7 @@ class TestExitRules(unittest.TestCase):
         self.assertEqual(summary["closed"][0]["reason"], "TAKE_PROFIT")
 
     def test_expiry_flatten_past_date_only(self):
-        """Same-day (0DTE) is NOT expiry-flattened at the open — only past dates."""
+        """A past expiration settles at intrinsic, ignoring a stale option mark."""
         trade = self._trade(expiration="2026-08-04")
         scored = {
             "IWM": {
@@ -181,21 +181,26 @@ class TestExitRules(unittest.TestCase):
             }
         }
 
-        with mock.patch("position_exits.close_open_position") as close:
-            close.return_value = {"ticker": "IWM", "reason": "EXPIRY_FLATTEN", "ok": True}
-            with mock.patch("position_exits.record_position_mark", return_value=True):
-                with mock.patch("tracker_agent.save_active_trade", return_value=True):
-                    with mock.patch(
-                        "tracker_agent.load_active_trades", return_value=[]
-                    ):
-                        summary = position_exits.run_scan_exits(
-                            [trade],
-                            scored,
-                            session_date=date(2026, 8, 5),
-                            force_eod=False,
-                            now_cdt=datetime(2026, 8, 5, 10, 0, 0),
-                        )
-        self.assertEqual(close.call_args[0][2], "EXPIRY_FLATTEN")
+        with mock.patch("position_exits._yahoo_official_close", return_value=310.0):
+            with mock.patch("position_exits.close_open_position") as close:
+                close.return_value = {
+                    "ticker": "IWM", "reason": "EXPIRED", "ok": True, "removed": True,
+                }
+                with mock.patch(
+                    "tracker_agent.load_active_trades", return_value=[]
+                ):
+                    summary = position_exits.run_scan_exits(
+                        [trade],
+                        scored,
+                        session_date=date(2026, 8, 5),
+                        force_eod=False,
+                        now_cdt=datetime(2026, 8, 5, 10, 0, 0),
+                    )
+        self.assertEqual(close.call_args[0][2], "EXPIRED")
+        # 310 - 302, not the stale 0.55 option mid.
+        self.assertAlmostEqual(close.call_args[0][1], 8.0)
+        self.assertEqual(len(summary["closed"]), 1)
+        self.assertNotIn("unresolved", summary)
 
     def test_zero_dte_flatten_at_1300_cdt(self):
         trade = self._trade(expiration="2026-08-05")
@@ -337,7 +342,7 @@ class TestExitRules(unittest.TestCase):
         scored = {"IWM": {"options_dict": {"current_price": 302.0, "chains": {}}, "card": None}}
         alerts = []
 
-        def _capture(msg):
+        def _capture(msg, **_k):
             alerts.append(msg)
             return True
 
@@ -639,7 +644,7 @@ class TestExitRules(unittest.TestCase):
             with mock.patch.object(config, "NEWS_DB_PATH", self.db):
                 with mock.patch(
                     "broadcaster.send_discord_alert",
-                    side_effect=lambda m: alerts.append(m) or True,
+                    side_effect=lambda m, **_k: alerts.append(m) or True,
                 ):
                     with mock.patch(
                         "tracker_agent.load_active_trades", return_value=[]
@@ -1060,11 +1065,133 @@ class TestAlertThrottle(unittest.TestCase):
         self.assertEqual(alerts, [])
         with mock.patch(
             "broadcaster.send_discord_alert",
-            side_effect=lambda m: alerts.append(m) or True,
+            side_effect=lambda m, **_k: alerts.append(m) or True,
         ):
             position_exits._alert_mark_failure(trade, 4)
         self.assertEqual(len(alerts), 1)
         self.assertEqual(trade["mark_fail_alert_at"], 4)
+
+
+class TestExpiredSettlement(unittest.TestCase):
+    def _run(self, trade, close_px, session=date(2026, 10, 7)):
+        scored = {"TSLA": {"options_dict": {"current_price": 1.0, "chains": {}}, "card": None}}
+        alerts = []
+
+        def _cap(msg, **_k):
+            alerts.append(str(msg))
+            return True
+
+        with mock.patch("position_exits._yahoo_official_close", return_value=close_px):
+            with mock.patch("position_exits.close_open_position") as close:
+                close.return_value = {
+                    "ticker": trade["ticker"],
+                    "reason": "EXPIRED",
+                    "ok": True,
+                    "removed": True,
+                }
+                with mock.patch("broadcaster.send_discord_alert", side_effect=_cap):
+                    with mock.patch(
+                        "tracker_agent.load_active_trades", return_value=[]
+                    ):
+                        summary = position_exits.run_scan_exits(
+                            [trade],
+                            scored,
+                            session_date=session,
+                            force_eod=False,
+                            now_cdt=datetime(2026, 10, 7, 8, 30, 0),
+                        )
+        return summary, close, alerts
+
+    def _tsla(self, **over):
+        trade = {
+            "trade_id": "9d590ab8-05cf-481e-8989-d3b7fe4bb179",
+            "ticker": "TSLA",
+            "direction": "CALL",
+            "strike": 377.5,
+            "expiration": "2026-10-05",
+            "entry_price": 1.53,
+            "entry_ask": 1.53,
+            "last_bid": 2.16,
+            "quantity": 4,
+        }
+        trade.update(over)
+        return trade
+
+    def test_call_settles_at_intrinsic_and_frees_the_slot(self):
+        summary, close, alerts = self._run(self._tsla(), 400.0)
+        self.assertEqual(close.call_args[0][2], "EXPIRED")
+        self.assertAlmostEqual(close.call_args[0][1], 22.5)
+        self.assertEqual(close.call_args[0][0]["last_bid"], 22.5)
+        self.assertEqual(len(summary["closed"]), 1)
+        self.assertFalse(any("UNRESOLVED" in a for a in alerts))
+        self.assertNotIn("unresolved", summary)
+
+    def test_put_intrinsic(self):
+        trade = self._tsla(direction="PUT", strike=400.0, trade_id="future-put")
+        _summary, close, _alerts = self._run(trade, 377.5)
+        self.assertAlmostEqual(close.call_args[0][1], 22.5)
+        self.assertEqual(close.call_args[0][2], "EXPIRED")
+
+    def test_otm_call_closes_at_zero(self):
+        _summary, close, _alerts = self._run(self._tsla(), 300.0)
+        self.assertEqual(close.call_args[0][1], 0.0)
+        self.assertEqual(close.call_args[0][2], "EXPIRED")
+
+    def test_missing_close_does_not_page_or_close(self):
+        summary, close, alerts = self._run(self._tsla(), None)
+        close.assert_not_called()
+        self.assertEqual(summary["expired_waiting"][0]["ticker"], "TSLA")
+        self.assertNotIn("unresolved", summary)
+        self.assertFalse(any("UNRESOLVED" in a for a in alerts))
+        self.assertEqual(summary["closed"], [])
+
+    def test_carry_review_does_not_prefix_carry(self):
+        trade = self._tsla()
+        scored = {"TSLA": {"options_dict": {}, "card": None, "pivot_data": {}}}
+        position_exits.reset_eod_flags_for_tests()
+        with mock.patch("position_exits._yahoo_official_close", return_value=400.0):
+            with mock.patch("position_exits.close_open_position") as close:
+                close.return_value = {
+                    "ticker": "TSLA", "reason": "EXPIRED", "ok": True, "removed": True,
+                }
+                with mock.patch("broadcaster.send_discord_alert", return_value=True):
+                    summary = position_exits.run_morning_carry_review(
+                        [trade],
+                        scored,
+                        session_date=date(2026, 10, 7),
+                        now_cdt=datetime(2026, 10, 7, 8, 30, 0),
+                        force=True,
+                    )
+        self.assertEqual(close.call_args[0][2], "EXPIRED")
+        self.assertIn("CLOSE EXPIRED", summary["lines"][0])
+        self.assertNotIn("CARRY_EXPIRED", summary["lines"][0])
+
+    def test_live_lot_does_not_fetch_an_expiry_close(self):
+        trade = self._tsla(expiration="2026-10-09")
+        with mock.patch("position_exits._yahoo_official_close") as yahoo:
+            with mock.patch("position_exits.close_open_position") as close:
+                close.return_value = {"ok": True, "removed": True}
+                with mock.patch("position_exits.record_position_mark", return_value=True):
+                    with mock.patch("tracker_agent.save_active_trade", return_value=True):
+                        with mock.patch(
+                            "tracker_agent.load_active_trades", return_value=[]
+                        ):
+                            position_exits.run_scan_exits(
+                                [trade],
+                                {"TSLA": {"options_dict": {
+                                    "current_price": 400.0,
+                                    "chains": {"2026-10-09": {"calls": [{
+                                        "strike": 377.5, "bid": 2.0, "ask": 2.2,
+                                        "lastPrice": 2.1,
+                                    }], "puts": []}},
+                                }, "card": None}},
+                                session_date=date(2026, 10, 7),
+                                force_eod=False,
+                                now_cdt=datetime(2026, 10, 7, 10, 0, 0),
+                            )
+        yahoo.assert_not_called()
+        if close.called:
+            self.assertNotEqual(close.call_args[0][2], "EXPIRED")
 
 
 class TestCircuitBreakerAlertThrottle(unittest.TestCase):
@@ -1078,7 +1205,7 @@ class TestCircuitBreakerAlertThrottle(unittest.TestCase):
         alerts = []
         br = CircuitBreaker(failure_threshold=2, cooldown_seconds=0, db_path=db)
         with mock.patch("circuit_breaker.broadcaster") as b:
-            b.send_discord_alert.side_effect = lambda m: alerts.append(m) or True
+            b.send_discord_alert.side_effect = lambda m, **_k: alerts.append(m) or True
             br.record_failure("a")
             br.record_failure("a")  # first OPEN
             first = len(alerts)

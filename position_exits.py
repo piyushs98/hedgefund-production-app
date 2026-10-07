@@ -5,7 +5,10 @@ Runs inside the 30-minute scan. No tracker daemon, no Gemini, no new process.
 
   B1  Selective EOD flatten at EXIT_EOD_FLATTEN_CDT (default 14:45 CDT):
       only calendar_dte < CARRY_MIN_DTE (default 2) — multi-day may overnight
-  B2  Expiry flatten when expiration date is strictly before session date
+  B2  Expired contracts (expiration date strictly before the session date)
+      settle at intrinsic value from the underlying close on the
+      expiration date, reason EXPIRED. A missing close waits for the
+      next pass and does not page UNRESOLVED.
   B3  Stop-loss / take-profit vs live option mark each scan
   B4  Persist a mark row every scan for every still-open (and pre-close) position
   B5  Breakeven lock / trailing giveback / time stop (uses peak_pnl_pct from B4)
@@ -24,7 +27,8 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from datetime import date, datetime, time, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 import config
@@ -253,6 +257,11 @@ def evaluate_exit_reason_for_mark(
     is_0dte = exp_d is not None and exp_d == sess
     carry_min = _carry_min_dte()
 
+    # An expired contract settles at intrinsic from the underlying close
+    # on the expiration date. A stale option mark is not that fill.
+    if exp_d is not None and exp_d < sess:
+        return "EXPIRED", None
+
     # Forced flatten needs the contract's own mark. A missing quote is an
     # unresolved settlement — entry premium is not a fill.
     kind = None
@@ -260,8 +269,6 @@ def evaluate_exit_reason_for_mark(
         kind = "EOD_FLATTEN"
     elif is_0dte and is_zero_dte_flatten_window(now):
         kind = "ZERO_DTE_FLATTEN"
-    elif exp_d is not None and exp_d < sess:
-        kind = "EXPIRY_FLATTEN"
     else:
         # Earnings: flatten lots whose expiry spans the print, once inside
         # the blackout window. Off when EARNINGS_FLATTEN_SPANNING is false.
@@ -357,6 +364,31 @@ def run_morning_carry_review(
         if not isinstance(trade, dict) or not trade.get("ticker"):
             continue
         ticker = str(trade["ticker"])
+        expired, intrinsic = settlement_for_expired(trade, sess)
+        if expired:
+            label = _fmt_contract_label(trade)
+            entry = _entry_premium(trade)
+            e_s = f"{entry:.2f}" if entry is not None else "?"
+            if intrinsic is None:
+                summary["held"].append(ticker)
+                action = "HOLD (expiry close unavailable)"
+                px_s = "n/a"
+            else:
+                trade["last_bid"] = intrinsic
+                trade["last_ask"] = intrinsic
+                closed = close_open_position(trade, float(intrinsic), "EXPIRED")
+                px_s = f"{intrinsic:.2f}"
+                if closed.get("ok") and closed.get("removed", True):
+                    summary["closed"].append(closed)
+                    action = "CLOSE EXPIRED"
+                else:
+                    summary["held"].append(ticker)
+                    action = "HOLD (expiry close failed)"
+            line = f"CARRY {label} | entry {e_s} -> {px_s} | {action}"
+            lines.append(line)
+            print(f"[CarryReview] {line}")
+            continue
+
         ctx = scored_by_ticker.get(ticker) or scored_by_ticker.get(ticker.upper()) or {}
         options_dict = ctx.get("options_dict")
         card = ctx.get("card")
@@ -455,7 +487,11 @@ def run_morning_carry_review(
             except Exception:
                 pass
 
-        if reason and exit_px is not None:
+        if reason == "EXPIRED":
+            # The expired branch above owns this close. Never prefix CARRY_.
+            summary["held"].append(ticker)
+            action = "HOLD (expiry close unavailable)"
+        elif reason and exit_px is not None:
             closed = close_open_position(trade, float(exit_px), f"CARRY_{reason}")
             summary["closed"].append(closed)
             action = f"CLOSE {reason}"
@@ -761,6 +797,132 @@ def _parse_exp_date(exp_str: str | None) -> date | None:
         return None
 
 
+def _intrinsic_from_close(trade: dict[str, Any], underlying_close: float | None) -> float | None:
+    """Per-share intrinsic. 0 is a real out-of-the-money settlement."""
+    strike = _trade_strike(trade)
+    spot = _f(underlying_close)
+    if strike is None or spot is None or spot <= 0:
+        return None
+    if "PUT" in _trade_direction(trade):
+        return max(0.0, strike - spot)
+    return max(0.0, spot - strike)
+
+
+def _bar_matches_day(ts: Any, exp_day: date) -> bool:
+    if hasattr(ts, "tzinfo") and ts.tzinfo is not None:
+        try:
+            import pytz
+            if ts.astimezone(pytz.timezone("America/New_York")).date() == exp_day:
+                return True
+        except Exception:
+            pass
+    day = ts.date() if hasattr(ts, "date") else None
+    return day == exp_day
+
+
+def _close_from_daily_history(hist: Any, exp_day: date) -> float | None:
+    """Official close on exp_day only. A neighboring session is not used."""
+    if hist is None or getattr(hist, "empty", True):
+        return None
+    try:
+        closes = hist["Close"]
+    except Exception:
+        return None
+    matched = None
+    seen = []
+    for ts, value in closes.items():
+        seen.append(str(ts))
+        if _bar_matches_day(ts, exp_day):
+            matched = value
+            break
+    if matched is None:
+        print(
+            f"[Exits] daily history has no {exp_day.isoformat()} close "
+            f"(rows={seen[:4]})"
+        )
+        return None
+    px = _f(matched)
+    if px is None or px <= 0:
+        return None
+    return px
+
+
+def _yahoo_official_close(ticker: str, exp_day: date) -> float | None:
+    """One paced daily bar for the expiration date.
+
+    End is exclusive. A crumb backoff skips the read. A failure is not
+    retried in this pass and does not invent a price.
+    """
+    import yf_client
+
+    if yf_client.crumb_backoff_remaining() > 0:
+        print(
+            f"[Exits] {ticker} expiry close {exp_day.isoformat()} deferred — "
+            "Yahoo crumb backoff, not retrying a 429"
+        )
+        return None
+
+    def _read():
+        import yfinance as yf
+
+        end = exp_day + timedelta(days=1)
+        return yf.Ticker(str(ticker).upper(), session=yf_client.SESSION).history(
+            start=exp_day.isoformat(),
+            end=end.isoformat(),
+            interval="1d",
+            auto_adjust=False,
+        )
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        hist = pool.submit(_read).result(timeout=20)
+    except Exception as exc:
+        print(
+            f"[Exits] {ticker} expiry close {exp_day.isoformat()} "
+            f"unavailable: {exc}"
+        )
+        return None
+    finally:
+        # Do not join a hung Yahoo worker. The HTTP adapter already times out.
+        pool.shutdown(wait=False, cancel_futures=True)
+    return _close_from_daily_history(hist, exp_day)
+
+
+def settlement_for_expired(
+    trade: dict[str, Any],
+    sess: date,
+) -> tuple[bool, float | None]:
+    """(False, None) when the contract is still alive.
+
+    (True, None) when it expired and the official close is not known yet.
+    (True, intrinsic) when it can settle, including intrinsic 0.
+    """
+    exp_d = _parse_exp_date(_trade_expiration(trade))
+    if exp_d is None or exp_d >= sess:
+        return False, None
+    ticker = str(trade.get("ticker") or "").upper()
+    try:
+        underlying = _yahoo_official_close(ticker, exp_d)
+    except Exception as exc:
+        print(
+            f"[Exits] {ticker} expiry close {exp_d.isoformat()} unavailable: {exc}"
+        )
+        underlying = None
+    intrinsic = _intrinsic_from_close(trade, underlying)
+    if intrinsic is None:
+        print(
+            f"[Exits] {ticker} expired {exp_d.isoformat()} — underlying close "
+            "unavailable, will retry next pass. Not closing and not paging "
+            "UNRESOLVED."
+        )
+        return True, None
+    print(
+        f"[Exits] {ticker} expired {exp_d.isoformat()} "
+        f"underlying close {underlying} intrinsic {intrinsic}"
+    )
+    return True, intrinsic
+
+
 def lookup_option_mark(
     trade: dict[str, Any],
     options_dict: dict[str, Any] | None,
@@ -1062,6 +1224,14 @@ def close_open_position(
     # Underlying fallback is an estimated premium, not a bid.
     if "UNDERLYING_" in str(reason):
         exit_bid = None
+    # Expiration settlement is the intrinsic value, including 0. The
+    # stored last_bid is an old quote and is not the fill.
+    expired = str(reason) == "EXPIRED"
+    if expired:
+        intrinsic = max(0.0, float(exit_price))
+        trade["last_bid"] = intrinsic
+        trade["last_ask"] = intrinsic
+        exit_bid = intrinsic
     # TRADE records unrounded (bid+ask)/2 when present; debit/SL stay on
     # rounded entry_premium so sizing and stops do not change.
     record_mid = _f(trade.get("entry_mid"))
@@ -1072,6 +1242,7 @@ def close_open_position(
         exit_mid=float(exit_price),
         entry_ask=entry_ask,
         exit_bid=exit_bid,
+        zero_bid_ok=expired,
     )
     result: dict[str, Any] = {
         "ticker": ticker,
@@ -1374,7 +1545,7 @@ def _alert_mark_failure(trade: dict[str, Any], streak: int, *, all_failed: bool 
     print(f"[Exits] {msg.replace(chr(10), ' | ')}")
     try:
         import broadcaster
-        broadcaster.send_discord_alert(msg)
+        broadcaster.send_discord_alert(msg, critical=True)
     except Exception as e:
         print(f"[Exits] mark-fail Discord warn: {e}")
 
@@ -1394,7 +1565,7 @@ def _alert_unresolved_settlement(trade: dict[str, Any], reason: str) -> None:
     print(f"[Exits] {msg.replace(chr(10), ' | ')}")
     try:
         import broadcaster
-        broadcaster.send_discord_alert(msg)
+        broadcaster.send_discord_alert(msg, critical=True)
     except Exception as e:
         print(f"[Exits] unresolved-settlement Discord warn: {e}")
 
@@ -1414,7 +1585,7 @@ def _alert_unprotected(trade: dict[str, Any], minutes: float) -> None:
     print(f"[Exits] {msg.replace(chr(10), ' | ')}")
     try:
         import broadcaster
-        broadcaster.send_discord_alert(msg)
+        broadcaster.send_discord_alert(msg, critical=True)
     except Exception as e:
         print(f"[Exits] UNPROTECTED Discord warn: {e}")
 
@@ -1477,6 +1648,25 @@ def run_scan_exits(
             continue
         ticker = str(trade["ticker"])
         summary["positions_checked"] += 1
+        expired, intrinsic = settlement_for_expired(trade, sess)
+        if expired:
+            if intrinsic is None:
+                summary.setdefault("expired_waiting", []).append(
+                    {"ticker": ticker, "reason": "EXPIRED"}
+                )
+                continue
+            trade["last_bid"] = intrinsic
+            trade["last_ask"] = intrinsic
+            closed = close_open_position(trade, float(intrinsic), "EXPIRED")
+            if closed.get("ok") and closed.get("removed", True):
+                summary["closed"].append(closed)
+            else:
+                summary.setdefault("close_failed", []).append(ticker)
+                print(
+                    f"[Exits] {ticker} EXPIRED not booked "
+                    f"(ok={closed.get('ok')} removed={closed.get('removed')})"
+                )
+            continue
         ctx = scored_by_ticker.get(ticker) or scored_by_ticker.get(ticker.upper()) or {}
         options_dict = ctx.get("options_dict")
         card = ctx.get("card")

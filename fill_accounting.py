@@ -23,11 +23,12 @@ CONTRACT_MULTIPLIER = 100
 _NA = "n/a"
 _version_cache: str | None = None
 
-# Pinned to the Oct 2 trading tree. Bump only when scoring, sizing, exits,
-# the gate, the universe, cadence, or chain-load behavior changes.
-# Dashboard files and the Squawk shadow do not move it. Env and git HEAD
-# are ignored so a deploy checkout cannot undo the pin.
-TRADING_STAMP = "7a25760"
+# First 7 hex of the trading-module hash. Bump only when scoring, sizing,
+# exits, the gate, the universe, cadence, or chain-load behavior changes.
+# v7a25760 is the Oct 2 tree. This pin moved for the expired-contract
+# settlement (freeze exception 11). Dashboard files and the Squawk shadow
+# do not move it. Env and git HEAD are ignored.
+TRADING_STAMP = "9c3cc4d"
 
 # Chicago-session counters. Discord SESSION line is the durable copy.
 _session: dict[str, Any] = {
@@ -168,6 +169,7 @@ def resolve_fill_prices(
     exit_mid: float,
     entry_ask: float | None = None,
     exit_bid: float | None = None,
+    zero_bid_ok: bool = False,
 ) -> dict[str, Any]:
     """
     Selected-contract fill pair. Missing bid/ask fall back to mid and tag fill=est.
@@ -181,7 +183,10 @@ def resolve_fill_prices(
     if ask is None or ask <= 0:
         ask = float(entry_mid)
         est = True
-    if bid is None or bid <= 0:
+    # A real settlement can be 0 (expired out of the money). Callers
+    # pass zero_bid_ok for that case. Any other missing or non-positive
+    # bid still falls back to the mid and is an estimate.
+    if bid is None or bid < 0 or (bid == 0 and not zero_bid_ok):
         bid = float(exit_mid)
         est = True
     return {

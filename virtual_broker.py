@@ -1073,11 +1073,17 @@ def paper_sell(
     bid_arg = exit_bid
     if bid_arg is None:
         bid_arg = fill_accounting.extract_bid(meta) if isinstance(meta, dict) else None
+    # EXPIRED settles at intrinsic, which is 0 when the contract finishes
+    # out of the money. That 0 is the fill, not a missing bid.
+    settled = notes == "EXIT:EXPIRED"
+    if settled:
+        bid_arg = max(0.0, exit_)
     quotes = fill_accounting.resolve_fill_prices(
         entry_mid=entry,
         exit_mid=exit_,
         entry_ask=ask_arg,
         exit_bid=bid_arg,
+        zero_bid_ok=settled,
     )
     if fill_est:
         quotes["fill_est"] = True

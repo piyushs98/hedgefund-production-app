@@ -350,7 +350,7 @@ def log_risk_config() -> None:
         print(f"[Risk] {msg}")
         try:
             import broadcaster
-            broadcaster.send_discord_alert(msg)
+            broadcaster.send_discord_alert(msg, critical=True)
         except Exception as e:
             print(f"[Risk] CRITICAL Discord warn: {e}")
 

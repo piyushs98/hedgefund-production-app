@@ -96,6 +96,87 @@ class SquawkWindowTests(unittest.TestCase):
         self.assertEqual(pulled, [])
 
 
+class WallClockNightWaitTests(unittest.TestCase):
+    def test_wake_past_the_target_does_not_finish_the_old_sleep(self):
+        start = _et(2026, 10, 6, 20, 0)
+        target = night_mode.next_premarket(start, set())
+        state = {"now": start}
+        slept = []
+        hours = []
+
+        def sleep(secs):
+            self.assertLessEqual(secs, 60)
+            slept.append(secs)
+            state["now"] = target + timedelta(minutes=5)
+
+        night_mode.sleep_until_premarket(
+            start,
+            sleep,
+            holidays=set(),
+            now_fn=lambda: state["now"],
+            on_tick=lambda: hours.append("tick"),
+            on_hour=lambda: hours.append("hour"),
+        )
+        self.assertEqual(len(slept), 1)
+        self.assertEqual(hours, [])
+
+    def test_multi_hour_jump_reads_once_and_not_after_arrival(self):
+        start = _et(2026, 10, 6, 20, 0)
+        target = night_mode.next_premarket(start, set())
+        state = {"now": start}
+        slept = []
+        hours = []
+        calls = {"n": 0}
+
+        def sleep(secs):
+            self.assertLessEqual(secs, 60)
+            slept.append(secs)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                state["now"] = start + timedelta(hours=5)
+            else:
+                state["now"] = target
+
+        night_mode.sleep_until_premarket(
+            start,
+            sleep,
+            holidays=set(),
+            now_fn=lambda: state["now"],
+            on_hour=lambda: hours.append(state["now"]),
+        )
+        self.assertEqual(len(hours), 1)
+        self.assertEqual(len(slept), 2)
+        self.assertLess(hours[0], target)
+
+    def test_sixty_second_ticks_do_not_read_every_tick(self):
+        start = _et(2026, 10, 7, 8, 0)
+        target = night_mode.next_premarket(start, set())
+        self.assertEqual(target, _et(2026, 10, 7, 9, 15))
+        state = {"now": start}
+        slept = []
+        hours = []
+        ticks = []
+
+        def sleep(secs):
+            self.assertLessEqual(secs, 60)
+            slept.append(secs)
+            state["now"] = state["now"] + timedelta(seconds=secs)
+
+        night_mode.sleep_until_premarket(
+            start,
+            sleep,
+            holidays=set(),
+            now_fn=lambda: state["now"],
+            on_tick=lambda: ticks.append(state["now"]),
+            on_hour=lambda: hours.append(state["now"]),
+        )
+        self.assertEqual(len(hours), 1)
+        self.assertEqual(hours[0], _et(2026, 10, 7, 9, 0))
+        self.assertEqual(len(slept), 75)
+        self.assertEqual(len(ticks), 74)
+        self.assertGreater(len(slept), len(hours))
+
+
 class SquawkContextTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

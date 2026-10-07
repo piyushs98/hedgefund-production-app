@@ -374,7 +374,7 @@ class TestLedgerFillSeries(unittest.TestCase):
         alerts = []
         with mock.patch(
             "broadcaster.send_discord_alert",
-            side_effect=lambda m: alerts.append(m) or True,
+            side_effect=lambda m, **_k: alerts.append(m) or True,
         ):
             with mock.patch("tracker_agent.remove_active_trade", return_value=True):
                 out = position_exits.close_open_position(trade, 4.05, "TAKE_PROFIT")
@@ -398,7 +398,7 @@ class TestLedgerFillSeries(unittest.TestCase):
         alerts = []
         with mock.patch(
             "broadcaster.send_discord_alert",
-            side_effect=lambda m: alerts.append(m) or True,
+            side_effect=lambda m, **_k: alerts.append(m) or True,
         ):
             with mock.patch("tracker_agent.remove_active_trade", return_value=True):
                 out = position_exits.close_open_position(trade, 2.71, "TRAILING_GIVEBACK")
@@ -424,7 +424,7 @@ class TestLedgerFillSeries(unittest.TestCase):
         alerts = []
         with mock.patch(
             "broadcaster.send_discord_alert",
-            side_effect=lambda m: alerts.append(m) or True,
+            side_effect=lambda m, **_k: alerts.append(m) or True,
         ):
             with mock.patch("tracker_agent.remove_active_trade", return_value=True):
                 out = position_exits.close_open_position(trade, 0.05, "EXPIRY_FLATTEN")
@@ -439,6 +439,79 @@ class TestLedgerFillSeries(unittest.TestCase):
             ).fetchone()[0]
         self.assertIn("9d590ab8-05cf-481e-8989-d3b7fe4bb179", raw)
         self.assertIn('"excluded_from_measurement": "y"', raw)
+
+    def test_expired_settlement_uses_intrinsic_not_the_stale_bid(self):
+        trade = {
+            "trade_id": "9d590ab8-05cf-481e-8989-d3b7fe4bb179",
+            "ticker": "TSLA",
+            "direction": "CALL",
+            "strike": 377.5,
+            "expiration": "2026-10-05",
+            "entry_price": 1.53,
+            "entry_ask": 1.53,
+            "last_bid": 2.16,
+            "quantity": 4,
+            "entry_timestamp": "2026-10-02T19:40:29Z",
+        }
+        alerts = []
+        with mock.patch(
+            "broadcaster.send_discord_alert",
+            side_effect=lambda m, **_k: alerts.append(m) or True,
+        ):
+            with mock.patch("tracker_agent.remove_active_trade", return_value=True):
+                out = position_exits.close_open_position(trade, 22.5, "EXPIRED")
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["fill_est"])
+        self.assertAlmostEqual(out["exit_bid"], 22.5)
+        self.assertAlmostEqual(out["pnl_fill"], (22.5 - 1.53) * 100 * 4)
+        self.assertEqual(trade.get("excluded_from_measurement"), "y")
+        trade_line = next(a for a in alerts if a.startswith("TRADE|"))
+        self.assertIn("EXPIRED", trade_line)
+        self.assertTrue(trade_line.endswith("|excluded_from_measurement=y"))
+        self.assertNotIn("fill=est", trade_line)
+
+    def test_otm_expiry_keeps_a_zero_bid_and_a_future_lot_is_measured(self):
+        trade = {
+            "trade_id": "future-lot-not-in-the-gap",
+            "ticker": "TSLA",
+            "direction": "CALL",
+            "strike": 377.5,
+            "expiration": "2026-11-20",
+            "entry_price": 1.53,
+            "entry_ask": 1.53,
+            "last_bid": 2.16,
+            "quantity": 4,
+        }
+        alerts = []
+        with mock.patch(
+            "broadcaster.send_discord_alert",
+            side_effect=lambda m, **_k: alerts.append(m) or True,
+        ):
+            with mock.patch("tracker_agent.remove_active_trade", return_value=True):
+                out = position_exits.close_open_position(trade, 0.0, "EXPIRED")
+        self.assertTrue(out["ok"])
+        self.assertFalse(out["fill_est"])
+        self.assertEqual(out["exit_bid"], 0.0)
+        self.assertAlmostEqual(out["pnl_fill"], (0.0 - 1.53) * 100 * 4)
+        self.assertNotEqual(trade.get("excluded_from_measurement"), "y")
+        trade_line = next(a for a in alerts if a.startswith("TRADE|"))
+        self.assertNotIn("excluded_from_measurement", trade_line)
+
+    def test_brief_header_does_not_count_as_a_critical(self):
+        import broadcaster
+        fa.reset_session_for_tests()
+        with mock.patch.object(broadcaster, "WEBHOOK_URL", "https://example.invalid/hook"):
+            with mock.patch.object(broadcaster, "_post_chunk", return_value=True):
+                broadcaster.send_discord_alert(
+                    "Top 3 Critical News Alerts\nCritical Macro / Policy Shifts"
+                )
+                self.assertEqual(fa._session["criticals"], 0)
+                broadcaster.send_discord_alert(
+                    "🚨 **CRITICAL: NO MARKET DATA**",
+                    critical=True,
+                )
+                self.assertEqual(fa._session["criticals"], 1)
+        fa.reset_session_for_tests()
 
 
 class TestVersionStamp(unittest.TestCase):
@@ -458,12 +531,50 @@ class TestVersionStamp(unittest.TestCase):
         self.assertTrue(ver.startswith("v"))
         self.assertGreaterEqual(len(ver), 2)
 
-    def test_code_version_is_the_oct2_trading_stamp(self):
+    def test_code_version_is_pinned_not_git_head(self):
+        # Oct 2's posted SESSION line is v7a25760. The pin moved when
+        # expired contracts started settling at intrinsic.
         fa._version_cache = None
         with mock.patch.dict(os.environ, {"GIT_COMMIT": "deadbeef1234567890", "RENDER_GIT_COMMIT": "cafebabe"}):
             fa._version_cache = None
-            self.assertEqual(fa.code_version(), "v7a25760")
+            self.assertEqual(fa.code_version(), "v" + fa.TRADING_STAMP)
+            self.assertEqual(fa.TRADING_STAMP, "9c3cc4d")
+            self.assertNotEqual(fa.code_version(), "vdeadbee")
         fa._version_cache = None
+
+    def test_trading_module_hash_locks_the_stamp(self):
+        import hashlib
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        modules = (
+            "config.py",
+            "position_exits.py",
+            "scoring_engine.py",
+            "signal_gate.py",
+            "strike_selector.py",
+            "virtual_broker.py",
+        )
+        # sha256 of those six files at 9608f59, the tree that still
+        # stamped v7a25760. A later edit with the stamp left at that pin fails.
+        pinned_tree = (
+            "3e43274bd5b98338dd740a2bcbb4d3af01d95de37eae2556aae53887d6abf5b4"
+        )
+        digest = hashlib.sha256()
+        for rel in modules:
+            data = (root / rel).read_bytes()
+            digest.update(rel.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(data)
+            digest.update(b"\0")
+        current = digest.hexdigest()
+        stamp = fa.TRADING_STAMP
+        self.assertEqual(len(stamp), 7)
+        if stamp == "7a25760":
+            self.assertEqual(current, pinned_tree)
+        else:
+            self.assertNotEqual(current, pinned_tree)
+            self.assertEqual(stamp, current[:7])
 
 
 class TestQuotePrecision(unittest.TestCase):

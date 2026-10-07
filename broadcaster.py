@@ -113,15 +113,18 @@ def _post_chunk(chunk):
     return False
 
 
-def send_discord_alert(message):
+def send_discord_alert(message, critical=False):
     """Send a message to Discord, chunking as needed. Returns True only if
     every chunk delivered. Never raises — a webhook outage must not be able
-    to crash the trading loop (Master Bot survival > alert delivery)."""
+    to crash the trading loop (Master Bot survival > alert delivery).
+
+    ``critical=True`` is the only path that increments the session CRITICAL
+    count. A morning brief that happens to contain the word does not.
+    """
     try:
         if not message or not str(message).strip():
             return False
-        text = str(message)
-        if "CRITICAL" in text.upper():
+        if critical:
             try:
                 import fill_accounting
                 fill_accounting.note_critical()

@@ -234,7 +234,7 @@ class TestLedgerBootReset(unittest.TestCase):
         with mock.patch.object(config, "RESET_LEDGER_ON_BOOT", True):
             with mock.patch(
                 "broadcaster.send_discord_alert",
-                side_effect=lambda m: alerts.append(m) or True,
+                side_effect=lambda m, **_k: alerts.append(m) or True,
             ):
                 out = vb.reset_ledger_if_requested()
         self.assertIsNotNone(out)
@@ -265,7 +265,7 @@ class TestRiskConfigMismatch(unittest.TestCase):
         alerts = []
         with mock.patch.object(config, "ACCOUNT_SIZE", 10000.0):
             with mock.patch.object(config, "STARTING_BUYING_POWER", 100000.0):
-                with mock.patch("broadcaster.send_discord_alert", side_effect=lambda m: alerts.append(m) or True):
+                with mock.patch("broadcaster.send_discord_alert", side_effect=lambda m, **_k: alerts.append(m) or True):
                     config.log_risk_config()
         self.assertTrue(any("CRITICAL" in a and "100,000" in a for a in alerts), alerts)
 

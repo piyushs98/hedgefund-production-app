@@ -20,10 +20,18 @@ import config
 PREMARKET_TIME = time(9, 15, 0)
 NIGHT_START = time(16, 0, 0)
 CASH_CLOSE = time(16, 0, 0)
-# State checks during the overnight wait are an hour apart. The last slice
-# may be shorter so a 09:13 wake still reaches 09:15 instead of overshooting
-# the open by a full hour. Never a 60-second poll.
+# State checks during the precomputed overnight schedule are an hour apart.
+# The last slice may be shorter so a 09:13 wake still reaches 09:15 instead
+# of overshooting the open by a full hour. Never a 60-second poll of that
+# precomputed schedule: the old 60s loop broke on clock.time() >= 09:15,
+# which is true all evening, and harvested every minute.
 MIN_NIGHT_CHECK_S = 60 * 60
+# The live night wait uses this as a sleep quantum only. Each chunk is
+# followed by a wall-clock read against the next 09:15 ET, so a Mac that
+# wakes at 07:50 does not finish a precomputed multi-hour sleep. Harvest
+# stays once. A public-page read is gated on a wall-clock hour and does
+# not run after the target.
+NIGHT_WALL_CHUNK_S = 60
 
 _EASTERN = pytz.timezone("America/New_York")
 _memory_keys: set[str] = set()
@@ -167,6 +175,46 @@ def sleep_night_chunks(chunks, sleep, between=None, after_each=None) -> None:
             after_each()
         if between is not None and index < last:
             between()
+
+
+def sleep_until_premarket(
+    now,
+    sleep,
+    holidays=None,
+    now_fn=None,
+    on_tick=None,
+    on_hour=None,
+) -> None:
+    """Sleep until the next 09:15 ET, re-reading the wall clock.
+
+    Each sleep is at most ``NIGHT_WALL_CHUNK_S`` (60) seconds. When the
+    clock is already at or past the target, return immediately and do not
+    run ``on_hour``. ``on_tick`` runs after a chunk that has not reached
+    the target. ``on_hour`` runs at most once when wall time has advanced
+    an hour or more since the previous read, including one catch-up after
+    a multi-hour suspend, and never once per missed hour.
+
+    This does not harvest, score, size, or decide an exit. The 60-second
+    slice is the sleep quantum. It is not the old evening poll that
+    treated ``time() >= 09:15`` as the end of the wait.
+    """
+    target = next_premarket(now, holidays)
+    clock = as_eastern(now)
+    last_hour = clock
+    while clock < target:
+        remaining = (target - clock).total_seconds()
+        if remaining <= 0:
+            break
+        sleep(min(float(NIGHT_WALL_CHUNK_S), remaining))
+        clock = as_eastern(now_fn() if now_fn else None)
+        if clock >= target:
+            return
+        if on_tick is not None:
+            on_tick()
+        if (clock - last_hour).total_seconds() >= 3600:
+            if on_hour is not None:
+                on_hour()
+            last_hour = clock
 
 
 def iter_night_sleep_chunks(

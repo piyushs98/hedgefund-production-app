@@ -56,7 +56,7 @@ def _emit_critical(store: str, n: int, error: Any, detail: str) -> None:
     )
     try:
         import broadcaster
-        ok = broadcaster.send_discord_alert(text)
+        ok = broadcaster.send_discord_alert(text, critical=True)
         print(f"[write_guard] CRITICAL Discord alert for {store} delivered={ok}")
     except Exception as e:
         print(f"[write_guard] CRITICAL Discord alert FAILED for {store}: {e}")
