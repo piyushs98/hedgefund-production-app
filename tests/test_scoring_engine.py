@@ -518,10 +518,58 @@ class TestSubscoreFormat(unittest.TestCase):
         )
         bits = se.format_subscore_bits(card)
         for token in (
-            "piv=", "mom=", "dft=", "d30=", "vol=", "T=", "S=", "liq=", "dATR=",
-            "atm_n=", "med_spr=", "usable=",
+            "piv=", "mom=", "dft=", "d30=", "vol=", "T=", "S=", "squawk_s=+0.00",
+            "liq=", "dATR=", "atm_n=", "med_spr=", "usable=",
         ):
             self.assertIn(token, bits)
+
+    def test_staged_squawk_is_logged_and_not_scored(self):
+        import squawk_shadow
+
+        pivot_data = {
+            "close": 103.0,
+            "pivot": 100.0,
+            "r1": 104.0,
+            "s1": 96.0,
+            "pct_change": 1.5,
+        }
+        headlines = "No recent headlines or historical news found."
+        bare = se.score_ticker(
+            "NVDA",
+            _tight_chain(103.0),
+            pivot_data,
+            headlines,
+            futures_pct=0.09,
+            atr_pct=2.0,
+            atr_abs=2.0,
+        )
+        squawk_shadow.stage(
+            "NVDA",
+            "- [2026-10-07 14:00:00] NVIDIA BEATS AND THE STOCK GAINS (First Squawk)",
+        )
+        shadowed = se.score_ticker(
+            "NVDA",
+            _tight_chain(103.0),
+            pivot_data,
+            headlines,
+            futures_pct=0.09,
+            atr_pct=2.0,
+            atr_abs=2.0,
+        )
+        self.assertEqual(shadowed.total_score, bare.total_score)
+        self.assertEqual(shadowed.sentiment_score, bare.sentiment_score)
+        self.assertEqual(shadowed.action_flag, bare.action_flag)
+        self.assertGreater(shadowed.metrics["subscores"]["squawk_s"], 0.0)
+        self.assertIn("squawk_s=+", se.format_subscore_bits(shadowed))
+        self.assertEqual(squawk_shadow.take("NVDA"), "")
+
+    def test_data_fail_consumes_a_staged_squawk_line(self):
+        import squawk_shadow
+
+        squawk_shadow.stage("NOPE", "- [x] BEATS (First Squawk)")
+        card = se.score_ticker("NOPE", {}, None, "beats")
+        self.assertEqual(card.total_score, 0.0)
+        self.assertEqual(squawk_shadow.take("NOPE"), "")
 
 
 class TestWeightsRetired(unittest.TestCase):

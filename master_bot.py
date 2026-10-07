@@ -86,7 +86,13 @@ from data_engineer import fetch_options_data
 from math_agent import calculate_swing_targets
 
 # Memory
-from news_memory import get_historical_context, save_headline, clear_expired_news
+from news_memory import (
+    SQUAWK_PUBLISHER,
+    get_historical_context,
+    save_headline,
+    clear_expired_news,
+)
+import squawk_shadow
 import sqlite3
 
 # Executive briefing — scheduled 09:15–09:29 EST prep meeting.
@@ -556,31 +562,55 @@ def _note_news_ok() -> None:
         pass
 
 
-def _scoring_news(ticker):
-    """90-day context, with First Squawk limited to this session's window."""
+def _split_squawk(text: str) -> tuple[str, str]:
+    """Return (scored lines, First Squawk lines). Other publishers stay."""
+    scored: list[str] = []
+    squawk: list[str] = []
+    suffix = f"({SQUAWK_PUBLISHER})"
+    for line in (text or "").splitlines():
+        if line.rstrip().endswith(suffix):
+            squawk.append(line)
+        elif line.strip():
+            scored.append(line)
+    return "\n".join(scored), "\n".join(squawk)
+
+
+def _headline_stamp(line: str) -> str | None:
+    if "[" not in line or "]" not in line:
+        return None
+    inner = line.split("[", 1)[1].split("]", 1)[0].strip()
+    if len(inner) < 19:
+        return None
+    return inner[:19]
+
+
+def _stage_squawk(ticker: str, squawk_text: str) -> None:
+    """Stage this session's Squawk lines. The score string does not get them."""
     start, end = night_mode.squawk_window(None, NYSE_HOLIDAYS)
-    return get_historical_context(
-        ticker,
-        days=90,
-        squawk_since=night_mode.sqlite_utc(start),
-        squawk_until=night_mode.sqlite_utc(end),
-    )
+    since = night_mode.sqlite_utc(start)
+    until = night_mode.sqlite_utc(end)
+    kept = []
+    for line in (squawk_text or "").splitlines():
+        stamp = _headline_stamp(line)
+        if stamp is not None and since <= stamp < until:
+            kept.append(line)
+    squawk_shadow.stage(ticker, "\n".join(kept))
 
 
 def ensure_news_context(ticker, breaker=None):
     """DB-first news for the score, with a live yfinance cold start.
 
-    A First Squawk row counts from the prior cash close until this session's
-    close. Other publishers stay on the 90-day read. When the session window
-    is empty and older rows are already stored, Yahoo is not called.
+    The returned string is the Oct 2 input: other publishers on the 90-day
+    read, then the same Yahoo fallback and placeholder when that read is
+    empty. First Squawk lines are stored and staged for the shadow log.
+    They are not part of the string this returns.
     """
-    news_string = _scoring_news(ticker)
-    if news_string.strip():
+    raw = get_historical_context(ticker, days=90)
+    scored, squawk = _split_squawk(raw)
+    _stage_squawk(ticker, squawk)
+    if scored.strip():
         _note_news_ok()
-        return news_string
-    if get_historical_context(ticker, days=90).strip():
-        _note_news_ok()
-        return ""
+        return scored
     print(f"[{ticker}] 👷 No news in database. Running live yfinance fallback...")
     try:
         def _fetch_news():
@@ -595,7 +625,9 @@ def ensure_news_context(ticker, breaker=None):
             title, publisher = extract_article_info(article)
             if title and title != "Unknown Title":
                 save_headline(ticker, "Fallback", publisher, title)
-        news_string = _scoring_news(ticker)
+        raw = get_historical_context(ticker, days=90)
+        scored, squawk = _split_squawk(raw)
+        _stage_squawk(ticker, squawk)
         # A completed fetch is ok even when Yahoo returns no headlines.
         _note_news_ok()
         if breaker:
@@ -608,7 +640,7 @@ def ensure_news_context(ticker, breaker=None):
         print(f"❌ [{ticker}] yfinance news fallback error: {e}")
         if breaker:
             breaker.record_failure(f"news:{ticker}")
-    return news_string if news_string.strip() else "No recent headlines or historical news found."
+    return scored if scored.strip() else "No recent headlines or historical news found."
 
 
 # ==========================================

@@ -11,18 +11,23 @@ Discord is the durable store (Render deploys wipe the filesystem).
 
 from __future__ import annotations
 
-import os
 import sqlite3
-import subprocess
 from datetime import datetime, timezone
 from typing import Any
 
 import config
+import measurement_exclusions
 
 CONTRACT_MULTIPLIER = 100
 
 _NA = "n/a"
 _version_cache: str | None = None
+
+# Pinned to the Oct 2 trading tree. Bump only when scoring, sizing, exits,
+# the gate, the universe, cadence, or chain-load behavior changes.
+# Dashboard files and the Squawk shadow do not move it. Env and git HEAD
+# are ignored so a deploy checkout cannot undo the pin.
+TRADING_STAMP = "7a25760"
 
 # Chicago-session counters. Discord SESSION line is the durable copy.
 _session: dict[str, Any] = {
@@ -66,33 +71,11 @@ def reset_session_for_tests() -> None:
 
 
 def code_version() -> str:
-    """v + first 7 of the commit hash, read once per process at first call."""
+    """Pinned trading stamp. Not git HEAD and not an env override."""
     global _version_cache
     if _version_cache is not None:
         return _version_cache
-    raw = (
-        os.environ.get("RENDER_GIT_COMMIT")
-        or os.environ.get("GIT_COMMIT")
-        or os.environ.get("SOURCE_VERSION")
-        or ""
-    ).strip()
-    if len(raw) >= 7:
-        _version_cache = "v" + raw[:7]
-        return _version_cache
-    try:
-        out = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            stderr=subprocess.DEVNULL,
-            timeout=3,
-        )
-        text = out.decode("utf-8", errors="replace").strip()
-        if len(text) >= 7:
-            _version_cache = "v" + text[:7]
-            return _version_cache
-    except Exception:
-        pass
-    _version_cache = "vn/a"
+    _version_cache = "v" + TRADING_STAMP
     return _version_cache
 
 
@@ -545,7 +528,8 @@ def format_trade_line(
 ) -> str:
     """
     One pipe-delimited TRADE line. Missing fields write n/a so columns
-    never shift. 26 fields, fixed order.
+    never shift. 26 fields, fixed order. The four unmonitored Oct 5–6
+    lots append excluded_from_measurement=y. Other lines stay at 26.
     """
     close_dt = chicago_now(closed_at)
     close_date = close_dt.date().isoformat()
@@ -621,7 +605,11 @@ def format_trade_line(
         _fmt_float("dte_entry", dte, 1, signed=False),
         f"carried {_carried_flag(trade, close_date)}",
     ]
-    return "|".join(fields)
+    line = "|".join(fields)
+    trade_id = trade.get("trade_id") if isinstance(trade, dict) else None
+    if measurement_exclusions.is_excluded(trade_id):
+        line += "|excluded_from_measurement=y"
+    return line
 
 
 def format_session_line(

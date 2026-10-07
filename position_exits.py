@@ -29,6 +29,7 @@ from typing import Any
 
 import config
 import fill_accounting
+import measurement_exclusions
 import virtual_broker
 
 try:
@@ -1086,6 +1087,8 @@ def close_open_position(
         "ok": False,
     }
     sell: dict[str, Any] = {}
+    if measurement_exclusions.is_excluded(trade.get("trade_id")):
+        trade["excluded_from_measurement"] = "y"
     try:
         sell = virtual_broker.paper_sell(
             trade,

@@ -268,6 +268,39 @@ class OpsReadonlyTests(unittest.TestCase):
         self.assertIn("RESET_LEDGER_ON_BOOT=false", text)
         self.assertNotIn(SECRET, text)
         self.assertIn("A restart does not wipe the trade tables", text)
+        self.assertIn("Excluded from measurement (unmonitored Oct 5–6): 0", text)
+
+    def test_unmonitored_gap_lot_is_left_out_of_expectancy(self):
+        gap_id = "9d590ab8-05cf-481e-8989-d3b7fe4bb179"
+        gap = {
+            "trade_id": gap_id,
+            "quantity": 4,
+            "stop_loss": 1.22,
+            "excluded_from_measurement": "y",
+        }
+        with sqlite3.connect(self.news) as conn:
+            conn.execute(
+                """INSERT INTO trade_history
+                   (closed_at, ticker, direction, strike, expiration,
+                    entry_price, exit_price, pnl, contract_json, notes,
+                    pnl_mid, pnl_fill, entry_mid, entry_ask, exit_mid, exit_bid,
+                    fill_est)
+                   VALUES (?, 'TSLA', 'CALL', 377.5, '2026-10-05',
+                           1.53, 0.05, -592, ?, 'EXIT:EXPIRY_FLATTEN',
+                           -592, 5000, 1.53, 1.54, 0.05, 0.01, 0)""",
+                ("2026-10-07T14:00:00+00:00", json.dumps(gap)),
+            )
+            conn.execute(
+                """INSERT INTO position_marks
+                   (ts, trade_id, ticker, mark, pnl_pct)
+                   VALUES ('2026-10-02T19:50:00+00:00', ?, 'TSLA', 2.0, 30.0)""",
+                (gap_id,),
+            )
+        text = render_report(self.paths)
+        self.assertIn("Closed trades: 2", text)
+        self.assertIn("Excluded from measurement (unmonitored Oct 5–6): 1", text)
+        self.assertIn("value: +0.17R", text)
+        self.assertNotIn(gap_id, text)
 
     def test_dashboard_page_and_staleness(self):
         self.assertEqual(HOST, "127.0.0.1")

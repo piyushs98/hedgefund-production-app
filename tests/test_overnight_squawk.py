@@ -151,23 +151,14 @@ class SquawkContextTests(unittest.TestCase):
             )
             conn.commit()
 
-    def test_score_sees_this_session_and_keeps_the_old_row_out(self):
-        text = news_memory.get_historical_context(
-            "NVDA",
-            days=90,
-            squawk_since=self.since,
-            squawk_until=self.until,
-        )
+    def test_the_ninety_day_read_still_returns_stored_squawk_rows(self):
+        text = news_memory.get_historical_context("NVDA", days=90)
         self.assertIn("NVIDIA BEATS AND THE STOCK GAINS", text)
-        self.assertIn("NVIDIA GAINS INTO THE CLOSE", text)
+        self.assertIn("NVIDIA MISSES AND SHARES PLUNGE", text)
         self.assertIn("REUTERS NOTES A QUIET NVDA SESSION", text)
-        self.assertNotIn("NVIDIA MISSES AND SHARES PLUNGE", text)
-        self.assertNotIn("NVIDIA DROPS ON A LAWSUIT", text)
-        self.assertNotIn("FED WARNS", text)
-        self.assertNotIn("APPLE BEATS", text)
         _s, metrics, _reasons = score_sentiment(text)
         self.assertGreater(metrics["bullish_hits"], 0)
-        self.assertEqual(metrics["bearish_hits"], 0)
+        self.assertGreater(metrics["bearish_hits"], 0)
 
     def test_without_a_window_the_old_squawk_row_is_still_stored(self):
         text = news_memory.get_historical_context("NVDA", days=90)
@@ -202,30 +193,42 @@ class SquawkContextTests(unittest.TestCase):
 
 
 class EnsureNewsWindowTests(unittest.TestCase):
-    def test_an_empty_window_does_not_call_yahoo(self):
+    def test_squawk_only_book_still_calls_yahoo_and_stays_out_of_the_score(self):
         import master_bot
+        import squawk_shadow
 
-        def fake(ticker, days=90, **kwargs):
-            if kwargs.get("squawk_since"):
-                return ""
-            return "- [old] NVIDIA BEATS (First Squawk)"
+        start, end = night_mode.squawk_window(None, master_bot.NYSE_HOLIDAYS)
+        stamp = night_mode.sqlite_utc(start + (end - start) / 2)
+        line = f"- [{stamp}] NVIDIA BEATS AND THE STOCK GAINS (First Squawk)"
 
-        with mock.patch.object(master_bot, "get_historical_context", side_effect=fake), \
+        with mock.patch.object(master_bot, "get_historical_context", return_value=line), \
                 mock.patch.object(master_bot.yf, "Ticker") as ticker:
+            ticker.return_value.news = []
             text = master_bot.ensure_news_context("NVDA")
-        self.assertEqual(text, "")
-        ticker.assert_not_called()
+        self.assertEqual(text, "No recent headlines or historical news found.")
+        self.assertNotIn("NVIDIA BEATS", text)
+        ticker.assert_called()
+        staged = squawk_shadow.take("NVDA")
+        self.assertIn("NVIDIA BEATS", staged)
 
-    def test_an_in_window_line_is_what_the_score_receives(self):
+    def test_other_publishers_score_and_an_old_squawk_line_is_not_staged(self):
         import master_bot
+        import squawk_shadow
 
-        def fake(ticker, days=90, **kwargs):
-            self.assertIn("squawk_since", kwargs)
-            self.assertIn("squawk_until", kwargs)
-            return "- [now] NVIDIA BEATS (First Squawk)"
+        start, _end = night_mode.squawk_window(None, master_bot.NYSE_HOLIDAYS)
+        inside = night_mode.sqlite_utc(start + timedelta(hours=1))
+        text = "\n".join([
+            "- [2020-01-01 00:00:00] NVIDIA MISSES AND SHARES PLUNGE (First Squawk)",
+            f"- [{inside}] NVIDIA BEATS AND THE STOCK GAINS (First Squawk)",
+            "- [2026-10-01 12:00:00] REUTERS NOTES A QUIET NVDA SESSION (Reuters)",
+        ])
 
-        with mock.patch.object(master_bot, "get_historical_context", side_effect=fake), \
+        with mock.patch.object(master_bot, "get_historical_context", return_value=text), \
                 mock.patch.object(master_bot.yf, "Ticker") as ticker:
-            text = master_bot.ensure_news_context("NVDA")
-        self.assertIn("NVIDIA BEATS", text)
+            scored = master_bot.ensure_news_context("NVDA")
         ticker.assert_not_called()
+        self.assertIn("REUTERS NOTES", scored)
+        self.assertNotIn("NVIDIA", scored)
+        staged = squawk_shadow.take("NVDA")
+        self.assertIn("NVIDIA BEATS", staged)
+        self.assertNotIn("NVIDIA MISSES", staged)

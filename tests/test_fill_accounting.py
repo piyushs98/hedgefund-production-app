@@ -6,6 +6,7 @@ Accounting only: triggers still fire on mid.
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -406,6 +407,39 @@ class TestLedgerFillSeries(unittest.TestCase):
         trade_line = next(a for a in alerts if a.startswith("TRADE|"))
         self.assertIn("fill=est", trade_line)
 
+    def test_gap_lot_close_appends_the_exclusion_and_stores_it(self):
+        trade = {
+            "trade_id": "9d590ab8-05cf-481e-8989-d3b7fe4bb179",
+            "ticker": "TSLA",
+            "direction": "CALL",
+            "strike": 377.5,
+            "expiration": "2026-10-05",
+            "entry_price": 1.53,
+            "entry_ask": 1.54,
+            "last_bid": 0.01,
+            "stop_loss": 1.22,
+            "quantity": 4,
+            "entry_timestamp": "2026-10-02T19:40:29Z",
+        }
+        alerts = []
+        with mock.patch(
+            "broadcaster.send_discord_alert",
+            side_effect=lambda m: alerts.append(m) or True,
+        ):
+            with mock.patch("tracker_agent.remove_active_trade", return_value=True):
+                out = position_exits.close_open_position(trade, 0.05, "EXPIRY_FLATTEN")
+        self.assertTrue(out["ok"])
+        self.assertEqual(trade.get("excluded_from_measurement"), "y")
+        trade_line = next(a for a in alerts if a.startswith("TRADE|"))
+        self.assertEqual(len(trade_line.split("|")), fa.TRADE_FIELD_COUNT + 1)
+        self.assertTrue(trade_line.endswith("|excluded_from_measurement=y"))
+        with sqlite3.connect(self.db) as conn:
+            raw = conn.execute(
+                "SELECT contract_json FROM trade_history ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        self.assertIn("9d590ab8-05cf-481e-8989-d3b7fe4bb179", raw)
+        self.assertIn('"excluded_from_measurement": "y"', raw)
+
 
 class TestVersionStamp(unittest.TestCase):
     def test_boot_logs_carry_version(self):
@@ -423,6 +457,13 @@ class TestVersionStamp(unittest.TestCase):
         ver = fa.code_version()
         self.assertTrue(ver.startswith("v"))
         self.assertGreaterEqual(len(ver), 2)
+
+    def test_code_version_is_the_oct2_trading_stamp(self):
+        fa._version_cache = None
+        with mock.patch.dict(os.environ, {"GIT_COMMIT": "deadbeef1234567890", "RENDER_GIT_COMMIT": "cafebabe"}):
+            fa._version_cache = None
+            self.assertEqual(fa.code_version(), "v7a25760")
+        fa._version_cache = None
 
 
 class TestQuotePrecision(unittest.TestCase):

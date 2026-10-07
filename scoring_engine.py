@@ -36,6 +36,7 @@ import math
 from dataclasses import dataclass, field
 
 import config
+import squawk_shadow
 
 
 def _cfg_float(name: str, default: float) -> float:
@@ -635,6 +636,9 @@ def score_ticker(ticker, options_dict, pivot_data, headlines_text,
     if weights is not None:
         pass  # explicit ignore
 
+    # Take before any early return so a data-fail cannot leak onto the next ticker.
+    shadow_text = squawk_shadow.take(ticker)
+
     pivot_fail = _pivot_unusable(pivot_data)
     if pivot_fail:
         print(f"REJECT {ticker}:{pivot_fail}")
@@ -666,6 +670,15 @@ def score_ticker(ticker, options_dict, pivot_data, headlines_text,
     S, sm, sreasons = score_sentiment(
         headlines_text, macro_vector, futures_pct, direction_sign=direction_sign,
     )
+    # Shadow only. The logged delta is not added to S or to the gate.
+    squawk_s = 0.0
+    if (shadow_text or "").strip():
+        base = headlines_text or ""
+        combined = base + ("\n" if base.strip() else "") + shadow_text.strip()
+        s_with, _, _ = score_sentiment(
+            combined, macro_vector, futures_pct, direction_sign=direction_sign,
+        )
+        squawk_s = round(float(s_with) - float(S), 2)
 
     raw = T + S
     total = _clamp(raw, 0.0, 100.0)
@@ -714,6 +727,7 @@ def score_ticker(ticker, options_dict, pivot_data, headlines_text,
         "vol_mult": tm.get("vol_mult"),
         "T": round(T, 2),
         "S": round(S, 2),
+        "squawk_s": squawk_s,
         "liq_mult": liq_display,
         "liq_status": liq_status,
         "atm_n": lm.get("atm_contracts"),
@@ -761,6 +775,7 @@ def score_ticker(ticker, options_dict, pivot_data, headlines_text,
         f"dft={tm.get('drift_sub') if tm.get('drift_sub') is not None else 'n/a'} "
         f"d30={tm.get('drift_pct') if tm.get('drift_pct') is not None else 'n/a'} "
         f"vol={subscores['vol_mult']} T={subscores['T']} S={subscores['S']} "
+        f"squawk_s={subscores['squawk_s']:+.2f} "
         f"liq={liq_log} dATR={subscores['atr_distance']} "
         f"atm_n={atm_n if atm_n is not None else 'n/a'} "
         f"med_spr={med_s} usable={usable if usable is not None else 'n/a'} "
@@ -791,7 +806,7 @@ def apply_adversarial_penalty(card, penalty=15.0, reason=""):
 
 
 def format_subscore_bits(card) -> str:
-    """Compact piv=/mom=/vol=/T=/S=/liq=/dATR=/atm_n=/med_spr=/usable=."""
+    """Compact piv=/mom=/vol=/T=/S=/squawk_s=/liq=/dATR=/atm_n=/med_spr=/usable=."""
     sub = (card.metrics or {}).get("subscores") or {}
     tm = (card.metrics or {}).get("technical") or {}
     lm = (card.metrics or {}).get("liquidity") or {}
@@ -811,6 +826,14 @@ def format_subscore_bits(card) -> str:
     S = _g("S")
     if S is None:
         S = getattr(card, "sentiment_score", None)
+    raw_sq = sub.get("squawk_s")
+    if raw_sq is None:
+        sq_s = "+0.00"
+    else:
+        try:
+            sq_s = f"{float(raw_sq):+.2f}"
+        except (TypeError, ValueError):
+            sq_s = "+0.00"
     liq = _g("liq_mult")
     # Unknown liq is None in subscores — do not fall back to 0.0 card field
     d_atr = _g("atr_distance")
@@ -848,7 +871,7 @@ def format_subscore_bits(card) -> str:
     bits = (
         f"piv={_f(piv, 3)} mom={_f(mom, 3)} dft={_f(dft, 3)} "
         f"d30={_f(d30, 2)} vol={_f(vol, 2)} "
-        f"T={_f(T, 1)} S={_f(S, 1)} liq={_f(liq, 2)} dATR={_f(d_atr, 3)} "
+        f"T={_f(T, 1)} S={_f(S, 1)} squawk_s={sq_s} liq={_f(liq, 2)} dATR={_f(d_atr, 3)} "
         f"atm_n={_i(atm_n)} med_spr={med_s} usable={_i(usable)}"
     )
     br = sub.get("block_reason") or getattr(card, "block_reason", None)

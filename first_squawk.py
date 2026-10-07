@@ -5,9 +5,9 @@ timeline URL returns 429, so this reader does not call it. A non-200
 response is logged and dropped. Nothing is invented.
 
 A line that names one of the ten tickers is stored on that ticker. The
-scorer counts that row only for the session it belongs to. A Fed or macro
-line that names none of them is stored as FED and does not enter those
-ten scores.
+score does not count it. A shadow log records the S it would have added.
+A Fed or macro line that names none of them is stored as FED and does
+not enter those ten scores.
 """
 
 from __future__ import annotations

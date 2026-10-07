@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import measurement_exclusions
 from ops.store import connect_ro, table_columns, table_count, table_names
 
 CHICAGO = ZoneInfo("America/Chicago")
@@ -394,16 +395,29 @@ def max_drawdown(pnls: list[float], seed: float) -> tuple[float, float | None]:
     return worst, pct
 
 
+def _gap_excluded(trade: dict[str, Any]) -> bool:
+    """The four unmonitored lots, by trade id or the close flag."""
+    if measurement_exclusions.is_excluded(trade.get("trade_id")):
+        return True
+    meta = trade.get("meta")
+    if not isinstance(meta, dict):
+        return False
+    return str(meta.get("excluded_from_measurement") or "").lower() == "y"
+
+
 def summarize(news_path, hedge_path, open_debit: float = 0.0) -> dict[str, Any]:
     news = connect_ro(news_path)
     hedge = connect_ro(hedge_path)
     try:
-        trades = load_closed_trades(news) if news is not None else []
+        loaded = load_closed_trades(news) if news is not None else []
+        excluded = [t for t in loaded if _gap_excluded(t)]
+        trades = [t for t in loaded if not _gap_excluded(t)]
         marks = load_marks(news) if news is not None else []
         markers = load_open_markers(news) if news is not None else []
         ledger = load_ledger(news) if news is not None else None
         sessions = load_sessions(hedge)
-        joined_ids = {str(t.get("trade_id") or "") for t in trades if t.get("trade_id")}
+        joined_ids = {str(t.get("trade_id") or "") for t in loaded if t.get("trade_id")}
+        joined_ids.update(measurement_exclusions.EXCLUDED_TRADE_IDS)
         orphan_ids = sorted({
             str(m.get("trade_id") or "")
             for m in marks
@@ -448,6 +462,7 @@ def summarize(news_path, hedge_path, open_debit: float = 0.0) -> dict[str, Any]:
             "ledger": ledger,
             "sessions": sessions,
             "n_closed": len(trades),
+            "n_excluded": len(excluded),
             "n_with_r": len(r_vals),
             "n_missing_risk": len(trades) - len(r_vals),
             "expectancy_r": expectancy,

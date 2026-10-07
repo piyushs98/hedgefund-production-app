@@ -53,6 +53,8 @@ def render_report(paths=None) -> str:
     add("")
     add(f"Closed trades: {summary['n_closed']}  "
         f"(PAPER_BUY_OPEN markers excluded)")
+    add("Excluded from measurement (unmonitored Oct 5–6): "
+        f"{summary.get('n_excluded', 0)}")
     add(f"Trades with planned risk: {summary['n_with_r']}  "
         f"missing stop or risk: {summary['n_missing_risk']}")
     add(f"Fills tagged estimated (bid or ask fell back to mid): {summary['fill_est']}")
