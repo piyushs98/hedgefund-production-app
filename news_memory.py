@@ -6,6 +6,7 @@ import config
 
 # Shared with master_bot / pre_market / tracker — never hardcode a second path
 DB_PATH = config.NEWS_DB_PATH
+SQUAWK_PUBLISHER = "First Squawk"
 
 def init_db():
     """
@@ -105,14 +106,21 @@ def save_headline(ticker, sector, publisher, title, sentiment_score=None):
         print(f"[Memory Master] SQLite error saving headline: {e}")
     return success
 
-def get_historical_context(ticker, days=90):
+def get_historical_context(ticker, days=90, *, squawk_since=None, squawk_until=None):
     """
-    Queries the database and returns a formatted text summary of all news
+    Queries the database and returns a formatted text summary of news
     collected for that ticker over the last N days (defaulting to 90 days).
+
+    When both squawk bounds are set, a First Squawk row counts only from
+    squawk_since (inclusive) until squawk_until (exclusive). Both are UTC
+    strings in SQLite CURRENT_TIMESTAMP form. Other publishers stay on the
+    day window. The row itself is not deleted.
 
     Args:
         ticker (str): The stock ticker.
         days (int): Days range to retrieve.
+        squawk_since (str): UTC start of the session window.
+        squawk_until (str): UTC end of the session window.
 
     Returns:
         str: Clean bulleted list of headlines grouped chronologically.
@@ -122,16 +130,36 @@ def get_historical_context(ticker, days=90):
     
     # Calculate offset parameter
     time_offset = f"-{days} days"
+    windowed = bool(squawk_since and squawk_until)
     
     try:
         with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-            SELECT timestamp, publisher, title 
-            FROM headlines 
-            WHERE ticker = ? AND timestamp >= datetime('now', ?)
-            ORDER BY timestamp DESC
-            """, (ticker.upper(), time_offset))
+            if windowed:
+                cursor.execute("""
+                SELECT timestamp, publisher, title
+                FROM headlines
+                WHERE ticker = ?
+                AND (
+                    (IFNULL(publisher, '') != ? AND timestamp >= datetime('now', ?))
+                    OR (publisher = ? AND timestamp >= ? AND timestamp < ?)
+                )
+                ORDER BY timestamp DESC
+                """, (
+                    ticker.upper(),
+                    SQUAWK_PUBLISHER,
+                    time_offset,
+                    SQUAWK_PUBLISHER,
+                    squawk_since,
+                    squawk_until,
+                ))
+            else:
+                cursor.execute("""
+                SELECT timestamp, publisher, title 
+                FROM headlines 
+                WHERE ticker = ? AND timestamp >= datetime('now', ?)
+                ORDER BY timestamp DESC
+                """, (ticker.upper(), time_offset))
             rows = cursor.fetchall()
     except sqlite3.Error as e:
         print(f"[Memory Master] SQLite error fetching context: {e}")

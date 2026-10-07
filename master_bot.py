@@ -556,12 +556,31 @@ def _note_news_ok() -> None:
         pass
 
 
+def _scoring_news(ticker):
+    """90-day context, with First Squawk limited to this session's window."""
+    start, end = night_mode.squawk_window(None, NYSE_HOLIDAYS)
+    return get_historical_context(
+        ticker,
+        days=90,
+        squawk_since=night_mode.sqlite_utc(start),
+        squawk_until=night_mode.sqlite_utc(end),
+    )
+
+
 def ensure_news_context(ticker, breaker=None):
-    """DB-first news retrieval with the live yfinance cold-start fallback."""
-    news_string = get_historical_context(ticker, days=90)
+    """DB-first news for the score, with a live yfinance cold start.
+
+    A First Squawk row counts from the prior cash close until this session's
+    close. Other publishers stay on the 90-day read. When the session window
+    is empty and older rows are already stored, Yahoo is not called.
+    """
+    news_string = _scoring_news(ticker)
     if news_string.strip():
         _note_news_ok()
         return news_string
+    if get_historical_context(ticker, days=90).strip():
+        _note_news_ok()
+        return ""
     print(f"[{ticker}] 👷 No news in database. Running live yfinance fallback...")
     try:
         def _fetch_news():
@@ -576,7 +595,7 @@ def ensure_news_context(ticker, breaker=None):
             title, publisher = extract_article_info(article)
             if title and title != "Unknown Title":
                 save_headline(ticker, "Fallback", publisher, title)
-        news_string = get_historical_context(ticker, days=90)
+        news_string = _scoring_news(ticker)
         # A completed fetch is ok even when Yahoo returns no headlines.
         _note_news_ok()
         if breaker:
@@ -829,6 +848,15 @@ OUTPUT RULES (strict):
 # ==========================================
 # 🔁 SHARED PORTFOLIO SCAN  (was duplicated twice before)
 # ==========================================
+
+def pull_first_squawk() -> None:
+    """One public-page read. A failure does not retry and does not stop the loop."""
+    try:
+        from first_squawk import fetch_first_squawk
+        fetch_first_squawk()
+    except Exception as exc:
+        print(f"[Squawk] fetch failed: {exc}")
+
 
 def run_night_harvest():
     print("[System State] Triggering background scrapers...")
@@ -1606,6 +1634,7 @@ def run_macro_loop():
 
     morning_macro_context = ""
     last_briefing_date = None
+    squawk_brief_date = None
     last_midday_macro_date = None  # once/day 11:00 CDT isolation
     # exit_interval / full_scan_interval were resolved from config before
     # the boot banner. Same numbers feed [Cadence] and the exit-only line.
@@ -1653,12 +1682,14 @@ def run_macro_loop():
                 run_night_harvest()
                 time.sleep(2)
                 print("\n[System State] 📊 [Bypass Sim] PREP MEETING (Gemini once)...")
+                pull_first_squawk()
                 try:
                     morning_macro_context = generate_morning_briefing()
                 except Exception as err:
                     print(f"❌ [Bypass Sim] Briefing error: {err}")
                 time.sleep(2)
                 print("\n[System State] 📈 [Bypass Sim] 30-MIN SCAN (table schema)...")
+                pull_first_squawk()
                 if full_llm_intraday:
                     run_portfolio_scan(
                         morning_macro_context,
@@ -1722,6 +1753,7 @@ def run_macro_loop():
                         f"[System State] Night harvest recorded for {harvest_key} "
                         "(once per pre-market date)."
                     )
+                pull_first_squawk()
                 target = night_mode.next_premarket(now, NYSE_HOLIDAYS)
                 chunks = list(night_mode.iter_night_sleep_chunks(now, NYSE_HOLIDAYS))
                 if not chunks:
@@ -1731,17 +1763,25 @@ def run_macro_loop():
                     "[System State] Sleeping until pre-market "
                     f"{target.strftime('%Y-%m-%d %H:%M %Z')} "
                     f"({total / 3600:.2f}h). "
-                    "State checks are an hour apart, or the exact remainder "
-                    "when the pre-market is closer than that."
+                    "State checks are an hour apart. "
+                    "First Squawk is read between those checks, then once "
+                    "more before the morning brief. Yahoo is not called again."
                 )
-                for chunk in chunks:
-                    time.sleep(chunk)
+                night_mode.sleep_night_chunks(
+                    chunks,
+                    time.sleep,
+                    between=pull_first_squawk,
+                    after_each=note_macro_heartbeat,
+                )
                 continue
 
             elif is_prep_meeting:
                 print(f"\n[System State] 📊 PRE-MARKET PREP MEETING (EST {now.strftime('%H:%M:%S')})")
                 print("[System State] Gemini allowed: morning CoS briefing only.")
                 if last_briefing_date != now.date():
+                    if squawk_brief_date != now.date():
+                        pull_first_squawk()
+                        squawk_brief_date = now.date()
                     try:
                         morning_macro_context = generate_morning_briefing()
                         last_briefing_date = now.date()
@@ -1834,6 +1874,7 @@ def run_macro_loop():
                         "[System State] FULL SCAN (score/admit) — single Discord table; "
                         "no Midday Macro header on this payload."
                     )
+                    pull_first_squawk()
                     run_thirty_min_scan(
                         breaker,
                         morning_macro_context=morning_macro_context,

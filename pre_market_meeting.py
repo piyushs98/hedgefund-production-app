@@ -5,6 +5,7 @@ import traceback
 
 import broadcaster
 import llm_chain
+import night_mode
 
 # Gemini primary (free tier via llm_chain); DeepSeek only as failover backup.
 # Keys live in env / config — never hardcode.
@@ -31,11 +32,22 @@ def _sanitize_db_text(value) -> str:
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(value or "")).strip()
 
 
-def get_overnight_data(hours_ago=15):
+def _tape_predicate(hours_ago, since_utc):
+    """SQL fragment and its time parameter. since_utc wins when it is set."""
+    if since_utc:
+        return "timestamp >= ?", since_utc
+    return "timestamp >= datetime('now', ?)", f"-{int(hours_ago)} hours"
+
+
+def get_overnight_data(hours_ago=15, *, since_utc=None):
     """
     Query overnight headlines (news/futures) AND innovation_data (China macro,
-    gov policy, earnings scrapes) from the last N hours. Returns a single
-    labeled context string for Gemini / DeepSeek / fallback briefings.
+    gov policy, earnings scrapes). Returns one labeled context string.
+
+    since_utc is the prior cash close as UTC 'YYYY-MM-DD HH:MM:SS'. Rows from
+    that instant through now are this session's tape, including Friday's
+    close when the brief runs on Monday. hours_ago is the fallback when no
+    close is passed.
     """
     db_path = NEWS_DB_PATH
     if not os.path.exists(db_path):
@@ -44,18 +56,18 @@ def get_overnight_data(hours_ago=15):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    time_offset = f"-{hours_ago} hours"
+    where_sql, time_arg = _tape_predicate(hours_ago, since_utc)
     headline_rows = []
     innovation_rows = []
 
     try:
-        cursor.execute("""
+        cursor.execute(f"""
         SELECT timestamp, ticker, sector, publisher, title
         FROM headlines
-        WHERE timestamp >= datetime('now', ?)
+        WHERE {where_sql}
         ORDER BY timestamp DESC
         LIMIT ?
-        """, (time_offset, MAX_HEADLINE_ROWS))
+        """, (time_arg, MAX_HEADLINE_ROWS))
         headline_rows = cursor.fetchall()
     except sqlite3.Error as e:
         print(
@@ -65,13 +77,13 @@ def get_overnight_data(hours_ago=15):
         traceback.print_exc()
 
     try:
-        cursor.execute("""
+        cursor.execute(f"""
         SELECT timestamp, ticker, source_tag, content
         FROM innovation_data
-        WHERE timestamp >= datetime('now', ?)
+        WHERE {where_sql}
         ORDER BY timestamp DESC
         LIMIT ?
-        """, (time_offset, MAX_INNOVATION_ROWS))
+        """, (time_arg, MAX_INNOVATION_ROWS))
         innovation_rows = cursor.fetchall()
     except sqlite3.Error as e:
         print(
@@ -306,8 +318,12 @@ def generate_morning_briefing(api_key=None):
     _ = api_key  # legacy kwarg; llm_chain owns provider keys
     print("[Chief of Staff] 📋 CoS Agent (AI): Querying database for overnight data...")
 
-    # 1. Fetch overnight news and futures
-    overnight_context = get_overnight_data(hours_ago=15)
+    # 1. Fetch the tape since the prior cash close, not a flat 15 hours.
+    from master_bot import NYSE_HOLIDAYS
+    tape_start, _tape_end = night_mode.squawk_window(None, NYSE_HOLIDAYS)
+    since_utc = night_mode.sqlite_utc(tape_start)
+    print(f"[Chief of Staff] Overnight tape starts at prior cash close {since_utc} UTC")
+    overnight_context = get_overnight_data(since_utc=since_utc)
     print(
         f"[Chief of Staff] Overnight context: {len(overnight_context)} chars "
         f"from {NEWS_DB_PATH}"

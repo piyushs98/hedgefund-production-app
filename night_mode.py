@@ -19,6 +19,7 @@ import config
 
 PREMARKET_TIME = time(9, 15, 0)
 NIGHT_START = time(16, 0, 0)
+CASH_CLOSE = time(16, 0, 0)
 # State checks during the overnight wait are an hour apart. The last slice
 # may be shorter so a 09:13 wake still reaches 09:15 instead of overshooting
 # the open by a full hour. Never a 60-second poll.
@@ -91,6 +92,83 @@ def harvest_still_ahead(
     return clock >= NIGHT_START or clock < PREMARKET_TIME
 
 
+def _closed_days(holidays: set[str] | None) -> set[str]:
+    return {str(day) for day in (holidays or set())}
+
+
+def _is_trading_day(day, closed: set[str]) -> bool:
+    return day.weekday() <= 4 and day.isoformat() not in closed
+
+
+def _step_to_trading_day(day, closed: set[str], step: int):
+    cursor = day
+    for _ in range(14):
+        cursor = cursor + timedelta(days=step)
+        if _is_trading_day(cursor, closed):
+            return cursor
+    raise RuntimeError("no NYSE session within 14 days")
+
+
+def session_cash_close(
+    now: datetime | None = None,
+    holidays: set[str] | None = None,
+) -> datetime:
+    """16:00 ET that ends the session this timestamp feeds.
+
+    A clock at or after today's close, or on a closed day, belongs to the
+    next session. Monday morning therefore ends at Monday 16:00.
+    """
+    closed = _closed_days(holidays)
+    current = as_eastern(now)
+    day = current.date()
+    close_today = _EASTERN.localize(datetime.combine(day, CASH_CLOSE))
+    if _is_trading_day(day, closed) and current < close_today:
+        return close_today
+    nxt = _step_to_trading_day(day, closed, 1)
+    return _EASTERN.localize(datetime.combine(nxt, CASH_CLOSE))
+
+
+def squawk_window(
+    now: datetime | None = None,
+    holidays: set[str] | None = None,
+) -> tuple[datetime, datetime]:
+    """Inclusive start and exclusive end, both 16:00 ET.
+
+    Start is the previous cash close. End is the close of the session this
+    timestamp feeds. Friday 16:00 is the start for Monday morning, and for
+    a holiday Monday the start stays the last real close.
+    """
+    closed = _closed_days(holidays)
+    end = session_cash_close(now, closed)
+    start_day = _step_to_trading_day(end.date(), closed, -1)
+    start = _EASTERN.localize(datetime.combine(start_day, CASH_CLOSE))
+    return start, end
+
+
+def sqlite_utc(moment: datetime) -> str:
+    """UTC timestamp string that matches SQLite CURRENT_TIMESTAMP."""
+    if moment.tzinfo is None:
+        raise ValueError("sqlite_utc requires an aware datetime")
+    return moment.astimezone(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def sleep_night_chunks(chunks, sleep, between=None, after_each=None) -> None:
+    """Sleep each precomputed chunk.
+
+    ``between`` runs after every chunk except the last. The last chunk ends
+    at pre-market, and the prep meeting reads there. ``after_each`` runs
+    after every chunk, including the last. Neither callback may harvest
+    Yahoo or retry a failed page read.
+    """
+    last = len(chunks) - 1
+    for index, chunk in enumerate(chunks):
+        sleep(chunk)
+        if after_each is not None:
+            after_each()
+        if between is not None and index < last:
+            between()
+
+
 def iter_night_sleep_chunks(
     now: datetime | None = None,
     holidays: set[str] | None = None,
@@ -99,7 +177,8 @@ def iter_night_sleep_chunks(
 ):
     """Yield sleep lengths that end at the next pre-market.
 
-    Callers must not harvest between chunks. The chunk size is the minimum
+    Callers must not harvest between chunks. A single public-page read
+    between chunks is not a harvest. The chunk size is the minimum
     state-check gap, except the tail (or a pre-market that is already closer
     than that gap), which sleeps the exact remainder.
     """
