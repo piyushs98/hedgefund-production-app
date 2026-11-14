@@ -354,6 +354,8 @@ class TagTests(unittest.TestCase):
         self.assertIsNone(tag["event_id"])
         self.assertIsNone(tag["label"])
         self.assertTrue(tag["would_block"])
+        self.assertEqual(tag["next_event_name"], "Producer Price Index for October 2026")
+        self.assertEqual(tag["minutes_to_next_event"], 5)
 
 
 class ReactionStoreTests(unittest.TestCase):

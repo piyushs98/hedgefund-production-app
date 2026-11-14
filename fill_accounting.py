@@ -625,13 +625,18 @@ def format_session_line(
     open_value: float | None,
     bp: float | None = None,
     now: datetime | None = None,
+    snap: dict[str, Any] | None = None,
 ) -> str:
     """
     One pipe-delimited SESSION line at 14:45. 22 fields, fixed order.
     Columns 1–18 unchanged (bp is column 18). Columns 19–22 are feed status:
     chain, news, futures, earnings.
+
+    snap defaults to the in-process counters. A caller that rebuilt the
+    trade counts from the ledger may pass that dict. The default path
+    is the 14:45 line.
     """
-    snap = session_snapshot()
+    snap = session_snapshot() if snap is None else dict(snap)
     planned = _f(snap.get("planned_risk_closed"))
     fill = _f(snap.get("realized_fill")) or 0.0
     mid = _f(snap.get("realized_mid")) or 0.0

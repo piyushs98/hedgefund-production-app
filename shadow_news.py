@@ -220,6 +220,28 @@ def ensure_schema(db_path) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shadow_close_tags (
+                trade_id INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                ticker TEXT,
+                entry_at TEXT,
+                exit_at TEXT,
+                event_name TEXT,
+                release_at TEXT,
+                actual TEXT,
+                forecast TEXT,
+                prior TEXT,
+                surprise TEXT,
+                label TEXT,
+                reaction_spy REAL,
+                reaction_qqq REAL,
+                session_date TEXT NOT NULL,
+                PRIMARY KEY (trade_id, event_id)
+            )
+            """
+        )
         _ensure_column(conn, "shadow_items", "component", "TEXT")
         _ensure_column(conn, "calendar_events", "tier", "INTEGER")
         _ensure_column(conn, "calendar_events", "tz_source", "TEXT")

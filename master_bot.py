@@ -1784,6 +1784,16 @@ def run_macro_loop():
 
             if is_night_mode:
                 print(f"\n[System State] 🌙 NIGHT MODE (EST {now.strftime('%Y-%m-%d %H:%M:%S')})")
+                try:
+                    import shadow_reconcile
+                    shadow_reconcile.reconcile_session(
+                        now_cdt, holidays=NYSE_HOLIDAYS
+                    )
+                except Exception as reconcile_err:
+                    print(
+                        f"[reconcile] {type(reconcile_err).__name__}: "
+                        f"{reconcile_err}"
+                    )
                 harvest_key = night_mode.harvest_session_key(now, NYSE_HOLIDAYS)
                 if night_mode.already_harvested(harvest_key):
                     print(

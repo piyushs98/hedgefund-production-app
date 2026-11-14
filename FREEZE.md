@@ -193,3 +193,30 @@ whether that adjustment crosses 70. would_flip_80 is the same test at
 80. Core month-over-month records the same flags on its own fields.
 Tier 1 sets shadow would_block inside [release−30 min, release+15 min].
 Tier 2 does not. would_block is not a live gate.
+
+## SESSION_FINAL for the Nov 16-25 review
+
+Recorded 2026-11-14, after the isolated Monday rehearsal. Shadow records
+only. The score, the gate, size, stops, and exits are unchanged. The
+trading stamp stays `v91c6693`.
+
+The 14:45 SESSION line is unchanged. When the main loop enters night mode
+after the flatten window, a separate line is built with
+`fill_accounting.format_session_line` from that Chicago day's ledger,
+prefixed `SESSION_FINAL`, and stored in `session_lines` with kind
+`final`. It is also posted to Discord. For the test review, SESSION_FINAL
+supersedes SESSION when both exist.
+
+If positions are still open when night mode starts, the line is written
+anyway with `incomplete=1` and Discord gets
+`CRITICAL: SESSION_FINAL incomplete — open positions remain at night mode.`
+A later flat book updates that same row. A second call for a day that
+already has a complete final row writes nothing.
+
+A paper open on the 30-minute scan records a shadow open tag, including
+`next_event_name` and `minutes_to_next_event`. `would_block` is true when
+the entry time sits inside any Tier 1 window, including a release that
+has not printed yet. Each paper close that day gets a shadow close-tag
+row for every calendar event released between entry and exit, with parsed
+actual, forecast, prior, surprise, and SPY/QQQ reaction. A failure logs
+and sends one non-critical Discord note. It does not change the fill.

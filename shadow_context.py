@@ -4,8 +4,9 @@ context_adj is the points the admit line would move. It comes from the
 headline month-over-month print only. Core month-over-month is recorded
 beside it and is not added. would_flip tests a cross of 70.
 would_flip_80 tests a cross of 80. would_block is true only when the
-entry sits inside a tier-1 release window. Nothing here writes
-trade_history, the gate, or the score.
+entry sits inside a tier-1 release window, including a release still
+ahead of the entry. Nothing here writes trade_history, the gate, or
+the score.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import os
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import shadow_calendar
 import shadow_news
@@ -127,8 +129,9 @@ def _tier(event: dict) -> int | None:
 def would_block(entry_at: datetime | None, events: list[dict]) -> bool | None:
     """True inside [release−30, release+15] for a tier-1 release.
 
-    Tier 2 is searched and does not block. A missing entry time stays
-    null. This flag is not a live gate.
+    A release still in the future counts when the entry sits in that
+    window. Tier 2 is searched and does not block. A missing entry time
+    stays null. This flag is not a live gate.
     """
     if entry_at is None or entry_at.tzinfo is None:
         return None
@@ -151,6 +154,38 @@ def _parse(value) -> datetime | None:
     import first_squawk
 
     return first_squawk.parse_time(value)
+
+
+def _next_event(entry_at: datetime | None, events: list[dict]) -> tuple[str | None, int | float | None]:
+    """Soonest tier-1 release at or after the entry, and the minutes until it.
+
+    A release after the entry is included. Past releases are not the next
+    event. The name stays null when nothing is still ahead.
+    """
+    if entry_at is None or entry_at.tzinfo is None:
+        return None, None
+    moment = entry_at.astimezone(timezone.utc)
+    upcoming: list[tuple[datetime, dict]] = []
+    for event in events:
+        if _tier(event) != shadow_calendar.TIER_SEARCH_AND_BLOCK:
+            continue
+        release = event.get("release_at")
+        if not isinstance(release, datetime) or release.tzinfo is None:
+            continue
+        rel = release.astimezone(timezone.utc)
+        if rel < moment:
+            continue
+        upcoming.append((rel, event))
+    if not upcoming:
+        return None, None
+    upcoming.sort(key=lambda pair: (pair[0], str(pair[1].get("event_id") or "")))
+    rel, event = upcoming[0]
+    minutes = (rel - moment).total_seconds() / 60.0
+    shown: int | float = (
+        int(round(minutes)) if abs(minutes - round(minutes)) < 1e-6 else round(minutes, 1)
+    )
+    name = event.get("name")
+    return (str(name) if name else None), shown
 
 
 def _pick_event(entry_at: datetime, events: list[dict]) -> dict | None:
@@ -258,6 +293,7 @@ def tag_trade(
     fields = _print_fields(direction, family, headline, score)
     core_fields = _print_fields(direction, family, core, score) if core else None
     adj = fields["context_adj"]
+    next_name, minutes_to_next = _next_event(entry_at, events)
     return {
         "event_id": None if chosen is None else chosen.get("event_id"),
         "event_name": None if chosen is None else chosen.get("name"),
@@ -273,6 +309,8 @@ def tag_trade(
         "would_flip_80": fields["would_flip_80"],
         "core_mom": core_fields,
         "would_block": would_block(entry_at, events),
+        "next_event_name": next_name,
+        "minutes_to_next_event": minutes_to_next,
         "score": score,
         "score_plus_context": None if score is None or adj is None else float(score) + adj,
     }
@@ -363,5 +401,204 @@ def note_open(*, ticker, direction, score, entry_at, db_path=None) -> None:
         f"event={tag['event_id']} label={tag['label']} bias={tag['bias']} "
         f"context_adj={tag['context_adj']} would_flip={tag['would_flip']} "
         f"would_flip_80={tag['would_flip_80']} "
-        f"would_block={tag['would_block']}"
+        f"would_block={tag['would_block']} "
+        f"next_event_name={tag['next_event_name']} "
+        f"minutes_to_next_event={tag['minutes_to_next_event']}"
     )
+
+
+def _surprise_for(event_id: str, items: list[dict]) -> dict:
+    """Headline month-over-month print for one event. Missing fields stay null."""
+    rows = [item for item in items if item.get("event_id") == event_id]
+    if any(_component_of(item) for item in rows):
+        item = _pick_named(rows, "headline_mom")
+    else:
+        item = _pick_item(event_id, items)
+    gap, label = surprise_label(
+        item.get("actual") if item else None,
+        item.get("forecast") if item else None,
+    )
+    surprise = None if gap is None else f"{gap:g}"
+    return {
+        "actual": None if item is None else item.get("actual"),
+        "forecast": None if item is None else item.get("forecast"),
+        "prior": None if item is None else item.get("prior"),
+        "surprise": surprise,
+        "label": label,
+    }
+
+
+def _reaction_moves(conn) -> dict[tuple[str, str], float | None]:
+    """Last close minus first close for each event and symbol. Null stays null."""
+    names = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    if "reaction_bars" not in names:
+        return {}
+    grouped: dict[tuple[str, str], list[tuple[str, float]]] = {}
+    nulls: set[tuple[str, str]] = set()
+    for row in conn.execute(
+        "SELECT event_id, symbol, bar_at, close FROM reaction_bars ORDER BY bar_at"
+    ):
+        key = (str(row["event_id"]), str(row["symbol"]))
+        if row["close"] is None:
+            nulls.add(key)
+            continue
+        try:
+            grouped.setdefault(key, []).append((str(row["bar_at"]), float(row["close"])))
+        except (TypeError, ValueError):
+            nulls.add(key)
+    out: dict[tuple[str, str], float | None] = {}
+    for key, bars in grouped.items():
+        if len(bars) < 2:
+            out[key] = 0.0
+        else:
+            out[key] = round(bars[-1][1] - bars[0][1], 4)
+    for key in nulls:
+        out.setdefault(key, None)
+    return out
+
+
+def record_close_tags(session_day, db_path=None) -> list[dict]:
+    """One shadow row per closed trade and calendar event released while it was open.
+
+    A second call for the same trade and event updates that row. It does
+    not insert another. A failure is the caller's to catch.
+    """
+    import reliability
+
+    path = shadow_news._db_path(db_path)
+    if not reliability._writes_allowed(str(path)):
+        print("[Shadow] close tags skipped on the live database under test")
+        return []
+    shadow_news.ensure_schema(path)
+    day = session_day.isoformat() if hasattr(session_day, "isoformat") else str(session_day)
+    events, items = _load(path)
+    conn = shadow_news.connect(path)
+    written: list[dict] = []
+    try:
+        reactions = _reaction_moves(conn)
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "trade_history" not in tables:
+            return []
+        history = conn.execute(
+            """
+            SELECT id, closed_at, ticker, direction, strike, expiration, notes
+            FROM trade_history
+            """
+        ).fetchall()
+        opens = []
+        exits = []
+        for row in history:
+            moment = _parse(row["closed_at"])
+            if moment is None:
+                continue
+            local_day = moment.astimezone(timezone.utc).astimezone(
+                ZoneInfo("America/Chicago")
+            ).date().isoformat()
+            if local_day != day:
+                continue
+            notes = str(row["notes"] or "")
+            if notes == "PAPER_BUY_OPEN":
+                opens.append((moment, row))
+            elif notes.startswith("EXIT:"):
+                exits.append((moment, row))
+        for exit_at, row in exits:
+            entry_at = None
+            for opened_at, opened in opens:
+                if str(opened["ticker"] or "") != str(row["ticker"] or ""):
+                    continue
+                if opened["strike"] != row["strike"]:
+                    continue
+                if str(opened["expiration"] or "") != str(row["expiration"] or ""):
+                    continue
+                if opened_at <= exit_at and (entry_at is None or opened_at > entry_at):
+                    entry_at = opened_at
+            if entry_at is None:
+                entry_at = exit_at
+            for event in events:
+                release = event.get("release_at")
+                if not isinstance(release, datetime) or release.tzinfo is None:
+                    continue
+                rel = release.astimezone(timezone.utc)
+                if not (entry_at.astimezone(timezone.utc) <= rel <= exit_at.astimezone(timezone.utc)):
+                    continue
+                event_id = str(event.get("event_id") or "")
+                if not event_id:
+                    continue
+                fields = _surprise_for(event_id, items)
+                spy = reactions.get((event_id, "SPY"))
+                qqq = reactions.get((event_id, "QQQ"))
+                conn.execute(
+                    """
+                    INSERT INTO shadow_close_tags (
+                        trade_id, event_id, ticker, entry_at, exit_at,
+                        event_name, release_at, actual, forecast, prior,
+                        surprise, label, reaction_spy, reaction_qqq, session_date
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(trade_id, event_id) DO UPDATE SET
+                        ticker=excluded.ticker,
+                        entry_at=excluded.entry_at,
+                        exit_at=excluded.exit_at,
+                        event_name=excluded.event_name,
+                        release_at=excluded.release_at,
+                        actual=excluded.actual,
+                        forecast=excluded.forecast,
+                        prior=excluded.prior,
+                        surprise=excluded.surprise,
+                        label=excluded.label,
+                        reaction_spy=excluded.reaction_spy,
+                        reaction_qqq=excluded.reaction_qqq,
+                        session_date=excluded.session_date
+                    """,
+                    (
+                        int(row["id"]),
+                        event_id,
+                        row["ticker"],
+                        entry_at.astimezone(timezone.utc).isoformat(),
+                        exit_at.astimezone(timezone.utc).isoformat(),
+                        event.get("name"),
+                        rel.isoformat(),
+                        fields["actual"],
+                        fields["forecast"],
+                        fields["prior"],
+                        fields["surprise"],
+                        fields["label"],
+                        spy,
+                        qqq,
+                        day,
+                    ),
+                )
+                tag = {
+                    "trade_id": int(row["id"]),
+                    "ticker": row["ticker"],
+                    "event_id": event_id,
+                    "event_name": event.get("name"),
+                    "actual": fields["actual"],
+                    "forecast": fields["forecast"],
+                    "prior": fields["prior"],
+                    "surprise": fields["surprise"],
+                    "label": fields["label"],
+                    "reaction_spy": spy,
+                    "reaction_qqq": qqq,
+                }
+                written.append(tag)
+                print(
+                    f"[Shadow] close {tag['ticker']} trade={tag['trade_id']} "
+                    f"event={tag['event_id']} name={tag['event_name']} "
+                    f"actual={tag['actual']} forecast={tag['forecast']} "
+                    f"prior={tag['prior']} surprise={tag['surprise']} "
+                    f"label={tag['label']} "
+                    f"reaction_spy={tag['reaction_spy']} "
+                    f"reaction_qqq={tag['reaction_qqq']}"
+                )
+        conn.commit()
+    finally:
+        conn.close()
+    return written

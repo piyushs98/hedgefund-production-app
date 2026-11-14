@@ -19,6 +19,7 @@ import json
 import os
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, time, timezone
 from typing import Any
 
@@ -953,6 +954,31 @@ def _finish_market_pass(kind: str) -> None:
         print(f"[heartbeat] {kind} ping warn: {exc}")
 
 
+def _shadow_note_open(ticker: str, direction, score) -> None:
+    """Tag one paper open. A timeout or error does not change the fill."""
+    entry_at = datetime.now(timezone.utc)
+    pool = None
+    try:
+        def _run() -> None:
+            import shadow_context
+            shadow_context.note_open(
+                ticker=ticker,
+                direction=direction,
+                score=score,
+                entry_at=entry_at,
+            )
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        pool.submit(_run).result(timeout=5)
+    except FuturesTimeoutError:
+        print(f"[Shadow] context tag timed out for {ticker}")
+    except Exception as exc:
+        print(f"[Shadow] context tag failed: {type(exc).__name__}")
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+
 def run_thirty_min_scan(
     breaker: CircuitBreaker,
     *,
@@ -1379,6 +1405,11 @@ def run_thirty_min_scan(
                                 "gate_rank": getattr(gdec, "conviction_rank", None),
                                 "total_score": card.total_score,
                             })
+                            _shadow_note_open(
+                                ticker,
+                                contract.get("direction"),
+                                card.total_score,
+                            )
 
         snap = _card_snapshot(card, atr_abs=atr_abs)
         prev = (baseline.get("tickers") or {}).get(ticker)

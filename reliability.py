@@ -59,6 +59,26 @@ def _ensure(conn: sqlite3.Connection) -> None:
             stored_at TEXT NOT NULL
         )"""
     )
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(session_lines)")}
+    if "kind" not in cols:
+        conn.execute("ALTER TABLE session_lines RENAME TO session_lines_old")
+        conn.execute(
+            """CREATE TABLE session_lines (
+                session_date TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'session',
+                line TEXT NOT NULL,
+                stored_at TEXT NOT NULL,
+                incomplete INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (session_date, kind)
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO session_lines
+                   (session_date, kind, line, stored_at, incomplete)
+               SELECT session_date, 'session', line, stored_at, 0
+               FROM session_lines_old"""
+        )
+        conn.execute("DROP TABLE session_lines_old")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS discord_outbox (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -166,9 +186,10 @@ def persist_session_line(line: str) -> bool:
         with _connect(path) as conn:
             _ensure(conn)
             conn.execute(
-                """INSERT INTO session_lines (session_date, line, stored_at)
-                   VALUES (?, ?, ?)
-                   ON CONFLICT(session_date) DO UPDATE SET
+                """INSERT INTO session_lines
+                       (session_date, kind, line, stored_at, incomplete)
+                   VALUES (?, 'session', ?, ?, 0)
+                   ON CONFLICT(session_date, kind) DO UPDATE SET
                      line=excluded.line,
                      stored_at=excluded.stored_at""",
                 (day, text, datetime.now(timezone.utc).isoformat()),
@@ -176,6 +197,45 @@ def persist_session_line(line: str) -> bool:
         return True
     except Exception as exc:
         print(f"[session] persist failed: {exc}")
+        return False
+
+
+def persist_session_final(line: str, *, incomplete: bool = False) -> bool:
+    """Store SESSION_FINAL beside the 14:45 SESSION row. Does not replace it.
+
+    One row per Chicago day. A second call updates that row.
+    """
+    text = (line or "").strip()
+    parts = text.split("|")
+    if len(parts) < 3 or parts[0] != "SESSION_FINAL":
+        return False
+    day = parts[2].strip()
+    if not day:
+        return False
+    path = config.NEWS_DB_PATH
+    if not _writes_allowed(path):
+        return False
+    try:
+        with _connect(path) as conn:
+            _ensure(conn)
+            conn.execute(
+                """INSERT INTO session_lines
+                       (session_date, kind, line, stored_at, incomplete)
+                   VALUES (?, 'final', ?, ?, ?)
+                   ON CONFLICT(session_date, kind) DO UPDATE SET
+                     line=excluded.line,
+                     stored_at=excluded.stored_at,
+                     incomplete=excluded.incomplete""",
+                (
+                    day,
+                    text,
+                    datetime.now(timezone.utc).isoformat(),
+                    1 if incomplete else 0,
+                ),
+            )
+        return True
+    except Exception as exc:
+        print(f"[session] final persist failed: {exc}")
         return False
 
 
@@ -188,10 +248,18 @@ def session_line_exists(day: str) -> bool:
     except sqlite3.Error:
         return False
     try:
-        row = conn.execute(
-            "SELECT 1 FROM session_lines WHERE session_date=?",
-            (day,),
-        ).fetchone()
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(session_lines)")}
+        if "kind" in cols:
+            row = conn.execute(
+                """SELECT 1 FROM session_lines
+                   WHERE session_date=? AND kind='session'""",
+                (day,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT 1 FROM session_lines WHERE session_date=?",
+                (day,),
+            ).fetchone()
         return row is not None
     except sqlite3.Error:
         return False
