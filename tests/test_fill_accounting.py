@@ -538,7 +538,7 @@ class TestVersionStamp(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GIT_COMMIT": "deadbeef1234567890", "RENDER_GIT_COMMIT": "cafebabe"}):
             fa._version_cache = None
             self.assertEqual(fa.code_version(), "v" + fa.TRADING_STAMP)
-            self.assertEqual(fa.TRADING_STAMP, "ec40b2a")
+            self.assertEqual(fa.TRADING_STAMP, "91c6693")
             self.assertNotEqual(fa.code_version(), "vdeadbee")
         fa._version_cache = None
 

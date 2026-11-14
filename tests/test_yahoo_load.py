@@ -22,6 +22,14 @@ from data_engineer import (
 )
 
 
+def setUpModule():
+    mock.patch("shadow_news.note_yahoo_health").start()
+
+
+def tearDownModule():
+    mock.patch.stopall()
+
+
 def _frame(strike: float) -> pd.DataFrame:
     return pd.DataFrame(
         [

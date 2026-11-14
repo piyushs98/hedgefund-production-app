@@ -5,7 +5,9 @@ Runs inside the 30-minute scan. No tracker daemon, no Gemini, no new process.
 
   B1  Flatten every open position at EXIT_EOD_FLATTEN_CDT (default 14:45
       America/Chicago), any DTE. Early-close days flatten at 11:45 CT.
-      Nothing is carried overnight. CARRY_MIN_DTE is no longer an exit rule.
+      An unpriced lot is retried and, at 14:55 CT (11:55 on an early
+      close), closes EOD_FLATTEN_ESTIMATED. The day latches only when
+      nothing is open. CARRY_MIN_DTE is no longer an exit rule.
   B2  Expired contracts (expiration date strictly before the session date)
       settle at intrinsic value from the underlying close on the
       expiration date, reason EXPIRED. A missing close waits for the
@@ -48,6 +50,7 @@ _carry_review_dates: set[str] = set()
 _eod_book_dates: set[str] = set()
 # Set when the process finds an open book at boot. Cleared once that book is flat.
 _boot_flatten_open = False
+_boot_flatten_since: datetime | None = None
 
 
 def _parse_entry_time(trade: dict[str, Any]) -> datetime | None:
@@ -111,6 +114,79 @@ def is_eod_flatten_window(dt: datetime | None = None) -> bool:
     return tt >= boundary
 
 
+def _eod_boundary_time(now: datetime) -> time:
+    """14:45 CT, or 11:45 CT when the session is an early close."""
+    try:
+        import session_clock
+        if session_clock.is_early_close(now.date()):
+            return session_clock.EARLY_FLATTEN
+    except Exception:
+        pass
+    return time(
+        int(config.EXIT_EOD_FLATTEN_HOUR),
+        int(config.EXIT_EOD_FLATTEN_MINUTE),
+    )
+
+
+def _plus_minutes(boundary: time, minutes: int) -> time:
+    base = datetime(2000, 1, 1, boundary.hour, boundary.minute, boundary.second)
+    return (base + timedelta(minutes=minutes)).time()
+
+
+def _wall_time(now: datetime) -> time:
+    tt = now.time()
+    if getattr(tt, "tzinfo", None) is not None:
+        tt = tt.replace(tzinfo=None)
+    return tt
+
+
+def is_eod_force_deadline(dt: datetime | None = None) -> bool:
+    """True at/after 14:55 CT (11:55 CT on an early-close day)."""
+    now = _chicago_now(dt)
+    boundary = _plus_minutes(_eod_boundary_time(now), 10)
+    return _wall_time(now) >= boundary
+
+
+def seconds_until_force_deadline(dt: datetime | None = None) -> float:
+    """Seconds until the hard flat. Negative once that minute has started."""
+    now = _chicago_now(dt)
+    boundary = _plus_minutes(_eod_boundary_time(now), 10)
+    target = now.replace(
+        hour=boundary.hour,
+        minute=boundary.minute,
+        second=0,
+        microsecond=0,
+    )
+    return (target - now).total_seconds()
+
+
+def eod_quote_retry_sleep_s(
+    now: datetime | None = None,
+    *,
+    latched: bool = False,
+) -> float | None:
+    """Seconds until the next unpriced quote, or None to keep the normal chunk.
+
+    From the flatten bell until the book is flat the retry is 60s, shortened
+    so a pass starts on the 14:55 CT deadline (11:55 on an early close).
+    Before the bell this is None, and the 5-minute exit interval is unchanged.
+    A deadline that has already passed returns 60 so a failed close retries
+    instead of spinning.
+    """
+    if latched:
+        return None
+    moment = _chicago_now(now)
+    remain = seconds_until_force_deadline(moment)
+    due = is_eod_flatten_window(moment) or is_eod_force_deadline(moment)
+    if not due:
+        if 0 < remain < 60:
+            return remain
+        return None
+    if 0 < remain < 60:
+        return remain
+    return 60.0
+
+
 def is_zero_dte_flatten_window(dt: datetime | None = None) -> bool:
     """C-D: True at/after EXIT_ZERO_DTE_FLATTEN_CDT (default 13:00 America/Chicago)."""
     now = _chicago_now(dt)
@@ -136,11 +212,12 @@ def mark_eod_done(session_day: date | None = None) -> None:
 
 def reset_eod_flags_for_tests() -> None:
     """Test helper — clear in-process EOD / carry-review / BOOK day sets."""
-    global _boot_flatten_open
+    global _boot_flatten_open, _boot_flatten_since
     _eod_flatten_dates.clear()
     _carry_review_dates.clear()
     _eod_book_dates.clear()
     _boot_flatten_open = False
+    _boot_flatten_since = None
     try:
         virtual_broker.reset_book_for_tests()
     except Exception:
@@ -151,9 +228,11 @@ def note_open_book_at_boot() -> int:
     """If the book is open at process start, page once and arm a clean-mark close.
 
     Does not sell here. The first exit or scan pass that sees a two-sided
-    option quote closes the lot as BOOT_FLATTEN. A missing quote stays open.
+    option quote closes the lot as BOOT_FLATTEN. If no clean mid appears
+    within 30 minutes, the last good bid closes it with fill=est. The
+    14:55 CT hard deadline still applies.
     """
-    global _boot_flatten_open
+    global _boot_flatten_open, _boot_flatten_since
     try:
         from tracker_agent import load_active_trades
         trades = load_active_trades() or []
@@ -164,6 +243,7 @@ def note_open_book_at_boot() -> int:
     if not trades:
         return 0
     _boot_flatten_open = True
+    _boot_flatten_since = _chicago_now()
     labels = ", ".join(_fmt_contract_label(t) for t in trades[:8])
     msg = (
         f"🚨 **CRITICAL: OPEN AT BOOT** {len(trades)} position(s) "
@@ -494,6 +574,7 @@ def run_morning_carry_review(
                 trade["last_bid"] = mark_info.get("bid")
                 trade["last_ask"] = mark_info.get("ask")
                 trade["last_mark_at"] = datetime.now(timezone.utc).isoformat()
+                _note_live_bid(trade, mark_info)
                 try:
                     from tracker_agent import save_active_trade
                     save_active_trade(trade)
@@ -1290,9 +1371,15 @@ def close_open_position(
     exit_bid = _f(trade.get("last_bid"))
     if exit_bid is None:
         exit_bid = fill_accounting.extract_bid(trade)
+    estimated = (
+        str(reason) == "EOD_FLATTEN_ESTIMATED"
+        or bool(trade.pop("_estimated_fill", False))
+    )
     # Underlying fallback is an estimated premium, not a bid.
     if "UNDERLYING_" in str(reason):
         exit_bid = None
+    elif estimated:
+        exit_bid = float(exit_price)
     # Expiration settlement is the intrinsic value, including 0. The
     # stored last_bid is an old quote and is not the fill.
     expired = str(reason) == "EXPIRED"
@@ -1313,6 +1400,8 @@ def close_open_position(
         exit_bid=exit_bid,
         zero_bid_ok=expired,
     )
+    if estimated:
+        quotes["fill_est"] = True
     result: dict[str, Any] = {
         "ticker": ticker,
         "reason": reason,
@@ -1659,6 +1748,93 @@ def _alert_unprotected(trade: dict[str, Any], minutes: float) -> None:
         print(f"[Exits] UNPROTECTED Discord warn: {e}")
 
 
+def _stored_bid(trade: dict[str, Any], now: datetime) -> tuple[float | None, float | None]:
+    """Last recorded bid and its age in seconds. No timestamp means unknown."""
+    bid = _f(trade.get("last_bid"))
+    if bid is None or bid <= 0:
+        return None, None
+    seen = _parse_entry_time({"entry_timestamp": trade.get("last_bid_at")})
+    if seen is None:
+        return bid, None
+    age = (
+        now.astimezone(timezone.utc) - seen.astimezone(timezone.utc)
+    ).total_seconds()
+    return bid, age
+
+
+def _spot_age_text(trade: dict[str, Any], now: datetime, fresh: bool) -> str:
+    if fresh:
+        return "0s"
+    seen = _parse_entry_time({"entry_timestamp": trade.get("last_spot_at")})
+    if seen is None:
+        return "unknown"
+    age = (
+        now.astimezone(timezone.utc) - seen.astimezone(timezone.utc)
+    ).total_seconds()
+    return f"{int(age)}s"
+
+
+def eod_estimated_exit(
+    trade: dict[str, Any],
+    now: datetime,
+    spot: float | None,
+) -> tuple[float, str, str]:
+    """Unpriced 14:55 price. (1) recent bid, (2) delta×0.90, (3) intrinsic, floor 0.01."""
+    bid, age = _stored_bid(trade, now)
+    if bid is not None and age is not None and 0 <= age <= 15 * 60:
+        return max(0.01, round(bid, 4)), "last good bid", f"{int(age)}s"
+    px = _f(spot)
+    fresh = px is not None and px > 0
+    if not fresh:
+        px = _f(trade.get("last_spot"))
+    if px is not None and px > 0:
+        quote_age = _spot_age_text(trade, now, fresh)
+        est = estimate_premium_from_spot(trade, px)
+        if est is not None:
+            return max(0.01, round(est * 0.90, 4)), "delta x 0.90", quote_age
+        strike = _trade_strike(trade)
+        if strike is not None:
+            if "PUT" in _trade_direction(trade):
+                intrinsic = max(0.0, float(strike) - px)
+            else:
+                intrinsic = max(0.0, px - float(strike))
+            return max(0.01, round(intrinsic, 4)), "intrinsic", quote_age
+    return 0.01, "floor", "none"
+
+
+def _boot_bid_ready(now: datetime) -> bool:
+    if not _boot_flatten_open or _boot_flatten_since is None:
+        return False
+    since = _chicago_now(_boot_flatten_since)
+    return (now - since) >= timedelta(minutes=30)
+
+
+def _alert_eod_forced_close(
+    trade: dict[str, Any],
+    price: float,
+    rule: str,
+    quote_age: str,
+) -> None:
+    label = _fmt_contract_label(trade)
+    msg = (
+        f"🚨 **CRITICAL: EOD FORCED CLOSE** {label} "
+        f"price {price:.4f} rule {rule} quote_age {quote_age}"
+    )
+    print(f"[Exits] {msg}")
+    try:
+        import broadcaster
+        broadcaster.send_discord_alert(msg, critical=True)
+    except Exception as exc:
+        print(f"[Exits] EOD forced-close Discord warn: {exc}")
+
+
+def _note_live_bid(trade: dict[str, Any], mark_info: dict[str, Any]) -> None:
+    bid = _f(mark_info.get("bid"))
+    if bid is None or bid <= 0:
+        return
+    trade["last_bid_at"] = datetime.now(timezone.utc).isoformat()
+
+
 def run_scan_exits(
     open_trades: list[dict[str, Any]],
     scored_by_ticker: dict[str, dict[str, Any]],
@@ -1679,7 +1855,7 @@ def run_scan_exits(
     MARK_FAIL_ALERT_STREAK consecutive failures (default 2), and if zero
     marks while any positions are open.
     """
-    global _boot_flatten_open
+    global _boot_flatten_open, _boot_flatten_since
     summary: dict[str, Any] = {
         "closed": [],
         "marks_recorded": 0,
@@ -1719,6 +1895,24 @@ def run_scan_exits(
         ticker = str(trade["ticker"])
         summary["positions_checked"] += 1
         expired, intrinsic = settlement_for_expired(trade, sess)
+        if expired and intrinsic is None and is_eod_force_deadline(now):
+            # Official close is still missing at the hard flat. Do not use a
+            # stale option mark. Same estimated price as any other unpriced lot.
+            price, rule, quote_age = eod_estimated_exit(trade, now, None)
+            trade["_estimated_fill"] = True
+            _alert_eod_forced_close(trade, price, rule, quote_age)
+            closed = close_open_position(
+                trade, float(price), "EOD_FLATTEN_ESTIMATED"
+            )
+            if closed.get("ok") and closed.get("removed", True):
+                summary["closed"].append(closed)
+            else:
+                summary.setdefault("close_failed", []).append(ticker)
+                print(
+                    f"[Exits] {ticker} EOD_FLATTEN_ESTIMATED not booked "
+                    f"(ok={closed.get('ok')} removed={closed.get('removed')})"
+                )
+            continue
         if expired:
             if intrinsic is None:
                 summary.setdefault("expired_waiting", []).append(
@@ -1774,6 +1968,7 @@ def run_scan_exits(
                 trade["last_bid"] = mark_info.get("bid")
                 trade["last_ask"] = mark_info.get("ask")
                 trade["last_mark_at"] = datetime.now(timezone.utc).isoformat()
+                _note_live_bid(trade, mark_info)
             try:
                 from tracker_agent import save_active_trade
                 save_active_trade(trade)
@@ -1847,6 +2042,16 @@ def run_scan_exits(
             if clean is not None:
                 reason, exit_px = "BOOT_FLATTEN", clean
                 boot_close = True
+            elif _boot_bid_ready(now):
+                bid, age = _stored_bid(trade, now)
+                if bid is not None and age is not None and age >= 0:
+                    exit_px = max(0.01, round(bid, 4))
+                    reason = "BOOT_FLATTEN"
+                    trade["_estimated_fill"] = True
+                    boot_close = True
+                    _alert_eod_forced_close(
+                        trade, exit_px, "last good bid", f"{int(age)}s"
+                    )
         if not boot_close:
             reason, exit_px = evaluate_exit_reason_for_mark(
                 trade,
@@ -1868,6 +2073,21 @@ def run_scan_exits(
             )
             and exit_px is None
         )
+        # Hard flat. An unpriced lot closes here even when spot is missing.
+        # Stops and targets before this minute are unchanged.
+        if (
+            not boot_close
+            and mark is None
+            and is_eod_force_deadline(now)
+            and (forced_unresolved or reason is None)
+        ):
+            price, rule, quote_age = eod_estimated_exit(
+                trade, now, mark_info.get("spot")
+            )
+            reason, exit_px = "EOD_FLATTEN_ESTIMATED", price
+            trade["_estimated_fill"] = True
+            forced_unresolved = False
+            _alert_eod_forced_close(trade, price, rule, quote_age)
         if forced_unresolved or (reason is None and mark is None):
             u_reason, u_px = underlying_exit_reason(trade, mark_info.get("spot"))
             if u_reason and u_px is not None:
@@ -1940,15 +2160,6 @@ def run_scan_exits(
                 f"(ok={closed.get('ok')} removed={closed.get('removed')})"
             )
 
-    if do_eod and not summary.get("eod_unresolved"):
-        mark_eod_done(now.date())
-        summary["eod_triggered"] = True
-    elif do_eod and summary.get("eod_unresolved"):
-        print(
-            "[Exits] EOD flatten incomplete — day not latched; "
-            "unpriced lots stay open for the next pass"
-        )
-
     # Zero marks while book is open → fleet-wide CRITICAL
     if (
         summary["positions_checked"] > 0
@@ -1968,8 +2179,18 @@ def run_scan_exits(
         summary["open_after"] = len(load_active_trades())
     except Exception:
         summary["open_after"] = None
+    # Latch only when the book is empty. An unpriced lot keeps the day open.
+    if do_eod and summary.get("open_after") == 0:
+        mark_eod_done(now.date())
+        summary["eod_triggered"] = True
+    elif do_eod:
+        print(
+            "[Exits] EOD flatten incomplete — day not latched; "
+            "unpriced lots stay open for the next pass"
+        )
     if _boot_flatten_open and summary.get("open_after") == 0:
         _boot_flatten_open = False
+        _boot_flatten_since = None
 
     n_closed = len(summary["closed"])
     n_ts_skip = len(summary["time_stop_skipped"])

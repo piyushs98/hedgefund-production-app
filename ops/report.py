@@ -217,6 +217,24 @@ def render_report(paths=None) -> str:
     add("  Unhandled CRITICAL counts are not in these tables.")
     add("")
 
+    try:
+        from shadow_news import x_spend_lines
+        for line in x_spend_lines(paths.news_db):
+            add(line)
+    except Exception as spend_err:
+        add("X SPEND (this Chicago week; posts × $0.005)")
+        add(f"  not read ({type(spend_err).__name__})")
+        add("  estimated cost: $0.000000")
+    add("")
+    try:
+        from shadow_news import yahoo_week_lines
+        for line in yahoo_week_lines(paths.news_db):
+            add(line)
+    except Exception as yahoo_err:
+        add("YAHOO (this Chicago week)")
+        add(f"  not read ({type(yahoo_err).__name__})")
+    add("")
+
     add("DISK")
     add(f"  RESET_LEDGER_ON_BOOT={flag}")
     if str(flag).strip().lower() in ("1", "true", "yes", "on"):

@@ -71,6 +71,7 @@ _CRUMB_BACKOFF_CAP_S = 4 * 60 * 60
 _crumb_lock = threading.Lock()
 _crumb_backoff_until = 0.0  # time.monotonic()
 _crumb_backoff_exp = 0
+_crumb_429_hits = 0
 _original_session_request = SESSION.request
 
 # Minimum gap between real Yahoo HTTP sends. One clock for the process so a
@@ -82,10 +83,11 @@ _last_yahoo_send = 0.0
 
 
 def reset_crumb_backoff_for_tests() -> None:
-    global _crumb_backoff_until, _crumb_backoff_exp
+    global _crumb_backoff_until, _crumb_backoff_exp, _crumb_429_hits
     with _crumb_lock:
         _crumb_backoff_until = 0.0
         _crumb_backoff_exp = 0
+        _crumb_429_hits = 0
 
 
 def reset_request_pace_for_tests() -> None:
@@ -110,10 +112,17 @@ def crumb_backoff_remaining() -> float:
         return max(0.0, _crumb_backoff_until - time.monotonic())
 
 
+def crumb_429_hits() -> int:
+    """How many crumb 429s this process has seen, including suppressed ones."""
+    with _crumb_lock:
+        return _crumb_429_hits
+
+
 def note_crumb_429() -> float:
     """Record a getcrumb 429. Returns the new backoff length in seconds."""
-    global _crumb_backoff_until, _crumb_backoff_exp
+    global _crumb_backoff_until, _crumb_backoff_exp, _crumb_429_hits
     with _crumb_lock:
+        _crumb_429_hits += 1
         delay = min(
             _CRUMB_BACKOFF_CAP_S,
             _CRUMB_BACKOFF_BASE_S * (2 ** _crumb_backoff_exp),
@@ -169,9 +178,12 @@ def _note_crumb_response(url, response) -> None:
 
 
 def _request_with_crumb_backoff(method, url, *args, **kwargs):
+    global _crumb_429_hits
     url_text = url if isinstance(url, str) else str(url)
     if _is_crumb_url(url_text) and crumb_backoff_remaining() > 0:
         remaining = crumb_backoff_remaining()
+        with _crumb_lock:
+            _crumb_429_hits += 1
         print(
             f"[Yahoo] crumb fetch suppressed — backoff {remaining:.0f}s "
             "remaining (not retrying a 429)"

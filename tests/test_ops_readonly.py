@@ -134,7 +134,7 @@ class OpsReadonlyTests(unittest.TestCase):
                 "quantity": 2,
                 "stop_loss": 2.10,
                 "ticker": "GOOGL",
-                "version": "vec40b2a",
+                "version": "v91c6693",
                 "entry_timestamp": "2026-10-01T14:30:00+00:00",
             }
             lose = {
@@ -142,7 +142,7 @@ class OpsReadonlyTests(unittest.TestCase):
                 "quantity": 1,
                 "stop_loss": 1.60,
                 "ticker": "IWM",
-                "version": "vec40b2a",
+                "version": "v91c6693",
                 "entry_timestamp": "2026-10-01T16:30:00+00:00",
             }
             conn.execute(
@@ -374,7 +374,7 @@ class OpsReadonlyTests(unittest.TestCase):
         self.assertIn("Oct 2, version v7a25760, shown in its own section: 1", text)
         self.assertIn("OCT 2  (version v7a25760, not in the measured sample)", text)
         self.assertIn("expectancy: -1.20R", text)
-        self.assertIn("SCORE SPLIT  (vec40b2a; entry_score 80+ and 70-79)", text)
+        self.assertIn("SCORE SPLIT  (v91c6693; entry_score 80+ and 70-79)", text)
         self.assertIn("70-79", text)
         self.assertIn("v9c3cc4d  (closed sample, not in the measured sample)", text)
         self.assertIn("80+ CARRY SHADOW", text)
@@ -414,7 +414,7 @@ class OpsReadonlyTests(unittest.TestCase):
         self.assertIn("+$160.00", page)
         self.assertIn("+1.60%", page)
         self.assertIn(
-            "Measured: 2 trades on vec40b2a. "
+            "Measured: 2 trades on v91c6693. "
             "Excluded: Oct 2 (older version, 0 trades), "
             "unmonitored Oct 5-6 (0 lots).",
             page,

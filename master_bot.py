@@ -617,11 +617,11 @@ def flush_news_fallback_errors(where: str) -> None:
 
 
 def ensure_news_context(ticker, breaker=None):
-    """DB-first news for the score, with a live yfinance cold start.
+    """DB-first news for the score.
 
-    The returned string is the Oct 2 input: other publishers on the 90-day
-    read, then the same Yahoo fallback and placeholder when that read is
-    empty. First Squawk lines are stored and staged for the shadow log.
+    The returned string is the measured input: other publishers on the
+    90-day read. An empty read returns the placeholder and does not call
+    Yahoo. First Squawk lines are stored and staged for the shadow log.
     They are not part of the string this returns.
     """
     raw = get_historical_context(ticker, days=90)
@@ -630,36 +630,12 @@ def ensure_news_context(ticker, breaker=None):
     if scored.strip():
         _note_news_ok()
         return scored
-    print(f"[{ticker}] 👷 No news in database. Running live yfinance fallback...")
-    try:
-        def _fetch_news():
-            return yf.Ticker(ticker, session=SESSION).news
-
-        articles = _call_with_timeout(
-            _fetch_news,
-            timeout_s=API_CALL_TIMEOUT_S,
-            step=f"yfinance_news:{ticker}",
-        )
-        for article in articles or []:
-            title, publisher = extract_article_info(article)
-            if title and title != "Unknown Title":
-                save_headline(ticker, "Fallback", publisher, title)
-        raw = get_historical_context(ticker, days=90)
-        scored, squawk = _split_squawk(raw)
-        _stage_squawk(ticker, squawk)
-        # A completed fetch is ok even when Yahoo returns no headlines.
-        _note_news_ok()
-        if breaker:
-            breaker.record_success(f"news:{ticker}")
-    except MasterBotScanError as e:
-        _note_news_fallback(ticker, f"{e.step}: {e.message}")
-        if breaker:
-            breaker.record_failure(f"news:{ticker}")
-    except Exception as e:
-        _note_news_fallback(ticker, str(e))
-        if breaker:
-            breaker.record_failure(f"news:{ticker}")
-    return scored if scored.strip() else "No recent headlines or historical news found."
+    # Measurement sessions scored this sentence after the Yahoo news call
+    # failed. Do not call Yahoo. A live GraphQL headline would change S.
+    print(
+        f"[{ticker}] No news in database. Yahoo news fallback is not called."
+    )
+    return "No recent headlines or historical news found."
 
 
 # ==========================================
@@ -899,15 +875,6 @@ OUTPUT RULES (strict):
 # ==========================================
 # 🔁 SHARED PORTFOLIO SCAN  (was duplicated twice before)
 # ==========================================
-
-def pull_first_squawk() -> None:
-    """One public-page read. A failure does not retry and does not stop the loop."""
-    try:
-        from first_squawk import fetch_first_squawk
-        fetch_first_squawk()
-    except Exception as exc:
-        print(f"[Squawk] fetch failed: {exc}")
-
 
 def run_night_harvest():
     print("[System State] Triggering background scrapers...")
@@ -1515,6 +1482,19 @@ def run_portfolio_scan(
                                 "total_score": card.total_score,
                                 "action_flag": card.action_flag,
                             })
+                            try:
+                                import shadow_context
+                                shadow_context.note_open(
+                                    ticker=ticker,
+                                    direction=contract.get("direction"),
+                                    score=card.total_score,
+                                    entry_at=datetime.now(timezone.utc),
+                                )
+                            except Exception as tag_err:
+                                print(
+                                    f"[Shadow] context tag failed: "
+                                    f"{type(tag_err).__name__}"
+                                )
                 except Exception as persist_err:
                     # Never let state I/O kill the portfolio scan
                     print(f"[CEO] WARNING: active_trades persistence failed "
@@ -1688,7 +1668,6 @@ def run_macro_loop():
 
     morning_macro_context = ""
     last_briefing_date = None
-    squawk_brief_date = None
     last_midday_macro_date = None  # once/day 11:00 CDT isolation
     # exit_interval / full_scan_interval were resolved from config before
     # the boot banner. Same numbers feed [Cadence] and the exit-only line.
@@ -1728,6 +1707,13 @@ def run_macro_loop():
     CRITICAL_ERROR_BACKOFF_S = 60
     heartbeat_prep_date = None
 
+    if not BYPASS_MARKET_HOURS:
+        try:
+            import shadow_news
+            shadow_news.start_shadow_thread(NYSE_HOLIDAYS)
+        except Exception as shadow_err:
+            print(f"[Shadow] thread not started: {type(shadow_err).__name__}")
+
     while True:
         try:
             note_macro_heartbeat()
@@ -1742,14 +1728,12 @@ def run_macro_loop():
                 run_night_harvest()
                 time.sleep(2)
                 print("\n[System State] 📊 [Bypass Sim] PREP MEETING (Gemini once)...")
-                pull_first_squawk()
                 try:
                     morning_macro_context = generate_morning_briefing()
                 except Exception as err:
                     print(f"❌ [Bypass Sim] Briefing error: {err}")
                 time.sleep(2)
                 print("\n[System State] 📈 [Bypass Sim] 30-MIN SCAN (table schema)...")
-                pull_first_squawk()
                 if full_llm_intraday:
                     run_portfolio_scan(
                         morning_macro_context,
@@ -1813,7 +1797,6 @@ def run_macro_loop():
                         f"[System State] Night harvest recorded for {harvest_key} "
                         "(once per pre-market date)."
                     )
-                pull_first_squawk()
                 target = night_mode.next_premarket(now, NYSE_HOLIDAYS)
                 remain_h = max(
                     0.0,
@@ -1826,8 +1809,7 @@ def run_macro_loop():
                     "Each wait is at most 60s and checks the wall clock, "
                     "so a wake during the night is back on this target "
                     "within one minute. "
-                    "First Squawk is read at most once an hour, then once "
-                    "more before the morning brief. Yahoo is not called again."
+                    "Yahoo is not called again."
                 )
                 def _night_tick():
                     note_macro_heartbeat()
@@ -1842,7 +1824,6 @@ def run_macro_loop():
                     time.sleep,
                     holidays=NYSE_HOLIDAYS,
                     on_tick=_night_tick,
-                    on_hour=pull_first_squawk,
                 )
                 continue
 
@@ -1857,9 +1838,6 @@ def run_macro_loop():
                     heartbeat_prep_date = now_cdt.date()
                 print("[System State] Gemini allowed: morning CoS briefing only.")
                 if last_briefing_date != now.date():
-                    if squawk_brief_date != now.date():
-                        pull_first_squawk()
-                        squawk_brief_date = now.date()
                     try:
                         morning_macro_context = generate_morning_briefing()
                         last_briefing_date = now.date()
@@ -1957,7 +1935,6 @@ def run_macro_loop():
                         "[System State] FULL SCAN (score/admit) — single Discord table; "
                         "no Midday Macro header on this payload."
                     )
-                    pull_first_squawk()
                     run_thirty_min_scan(
                         breaker,
                         morning_macro_context=morning_macro_context,
@@ -1976,7 +1953,25 @@ def run_macro_loop():
                     f"(exit tick; full scan every {full_scan_interval // 60}m)..."
                 )
                 for _ in range(max(1, sleep_secs // 60)):
-                    time.sleep(60)
+                    # Before 14:45 the chunk stays 60s inside the 5-minute
+                    # exit interval. From the flatten bell, an unpriced quote
+                    # is retried every 60s and the sleep lands on 14:55 CT.
+                    chunk = 60.0
+                    try:
+                        import position_exits as _pex_sleep
+                        woke0 = datetime.now(cdt_tz) if cdt_tz else datetime.now(est_tz)
+                        retry = _pex_sleep.eod_quote_retry_sleep_s(
+                            woke0,
+                            latched=_pex_sleep.eod_already_done(
+                                woke0.date() if hasattr(woke0, "date") else None
+                            ),
+                        )
+                        if retry is not None:
+                            chunk = float(retry)
+                    except Exception:
+                        chunk = 60.0
+                    if chunk > 0:
+                        time.sleep(chunk)
                     # Wake early into the 11:00 CDT window so macro isn't missed
                     woke = datetime.now(cdt_tz) if cdt_tz else datetime.now(est_tz)
                     if (

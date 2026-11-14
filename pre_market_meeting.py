@@ -382,6 +382,15 @@ def generate_morning_briefing(api_key=None):
                 1,
             )
 
+    # Appended after the model text so the brief cannot paraphrase it.
+    try:
+        import shadow_news
+        shadow_line = shadow_news.brief_line()
+        if shadow_line:
+            briefing_text = (briefing_text or "").rstrip() + "\n\n" + shadow_line
+    except Exception as shadow_err:
+        print(f"[Chief of Staff] shadow brief line skipped: {type(shadow_err).__name__}")
+
     # 2. Broadcast to Discord (never raises; returns False on webhook failure)
     print("[Chief of Staff] 📋 CoS Agent (AI): Broadcasting morning briefing to Discord...")
     broadcaster.send_discord_alert(briefing_text)

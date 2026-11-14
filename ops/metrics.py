@@ -26,7 +26,7 @@ MULTIPLIER = 100
 # Headline figures use this stamp and drop excluded_from_measurement=y.
 # Oct 2 posted v7a25760. v9c3cc4d closed on 2026-11-13 and is its own section.
 # MEASURED_VERSION matches fill_accounting.TRADING_STAMP. Set with the pin.
-MEASURED_VERSION = "vec40b2a"
+MEASURED_VERSION = "v91c6693"
 PRIOR_MEASURED_VERSION = "v9c3cc4d"
 OCT2_VERSION = "v7a25760"
 REGIME_MOVE = 0.005

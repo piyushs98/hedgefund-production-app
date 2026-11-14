@@ -7,7 +7,7 @@ gunicorn==23.0.0
 requests==2.32.3
 
 # Market data (master_bot.py, data_engineer.py, tracker_agent.py, …)
-yfinance
+yfinance==1.8.0
 pandas==2.2.3
 pytz==2025.2
 

@@ -13,10 +13,10 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
-    <string>/Users/markanthiny/Desktop/hedgefund-production-app/run_detached.sh</string>
+    <string>/Users/markanthiny/hedgefund-production-app/run_detached.sh</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/markanthiny/Desktop/hedgefund-production-app</string>
+  <string>/Users/markanthiny/hedgefund-production-app</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -26,9 +26,9 @@
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>
-  <string>/Users/markanthiny/Desktop/hedgefund-production-app/logs/launchd-stdout.log</string>
+  <string>/Users/markanthiny/hedgefund-production-app/logs/launchd-stdout.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/markanthiny/Desktop/hedgefund-production-app/logs/launchd-stderr.log</string>
+  <string>/Users/markanthiny/hedgefund-production-app/logs/launchd-stderr.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PYTHONUNBUFFERED</key>

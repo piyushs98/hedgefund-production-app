@@ -41,6 +41,8 @@ is the durable store. Reconstruct from TRADE and SESSION lines.
 | 2026-10-06 | Freeze exception 9, directed by the operator: a single night read can miss a headline that scrolls off the public page. The night wait reads that same page between the hour sleeps (one GET, no retry, no Yahoo) and once more before the morning brief, only on the morning the brief is generated. The brief's tape starts at the prior cash close (Friday 16:00 ET when the next session is Monday) instead of a flat 15 hours. Rows stay in the database. FED rows still do not enter the ten scores. Other publishers stay on the 90-day read. A book whose only new rows are First Squawk still takes the Yahoo news fallback, the same path an empty book took on Oct 2. No lexicon change. No sizing, stop, exit, universe, or cadence change. The scoring formula is unchanged. Exception 10 is what the score does with those rows. |
 | 2026-10-06 | Freeze exception 10, directed by the operator: First Squawk stays stored, and each scan logs the S those lines would have added (`squawk_s=` on the score line and the Discord telemetry bits). That contribution is 0 in the score, so it cannot move S or change who clears 70. The trading stamp was pinned at `v7a25760` (the Oct 2 session) and no longer follows git HEAD, `GIT_COMMIT`, or `RENDER_GIT_COMMIT`. Exception 11 moves that pin. The four lots left unmarked through Oct 5 and Oct 6 append `excluded_from_measurement=y` on their TRADE lines and are left out of ops.report. No sizing, stop, exit, universe, or cadence change. The scoring formula is unchanged. |
 | 2026-10-06 | Freeze exception 11, directed by the operator, before the session count. Three record and schedule bugs, and one exit rule for contracts that have already expired. (1) The session criticals counter incremented on any Discord message containing the word CRITICAL, including the morning brief headers, so every session failed the go/no-go bar of zero unhandled CRITICALs. The count now increments only when a send is an explicit CRITICAL alert (`critical=True`): mark failure, UNRESOLVED, UNPROTECTED, earnings-blackout pages, account-size mismatch, durable-write failure, LLM dual-fail, the macro-loop error page, no-market-data, scan-discord failure, and score-data outage. The brief, TRADE lines, and local prints do not count. Oct 2's posted SESSION line still says `criticals 1`. Under this rule that session's count is 0: the log's only CRITICAL text is a local earnings print that was not delivered, and the brief was a normal send. (2) A contract whose expiration date is strictly before the session date has no quote. Exception 5 left that flatten open and paged UNRESOLVED, which holds a gate slot. It now settles at intrinsic value from the underlying's official close on the expiration date: call max(0, close − strike), put max(0, strike − close), per share. Reason is exactly `EXPIRED` (carry review does not prefix `CARRY_`). The lot is removed and the slot frees. A stale option mark is not the fill, including a last bid from an earlier session. Out-of-the-money intrinsic 0 still closes and is not tagged fill=est. If that daily close cannot be fetched, the lot stays open, no price is invented, and UNRESOLVED is not paged; the next exit pass tries once more, through the paced Yahoo client, and a crumb backoff is not retried. The four gap lots stay excluded by id. A later expired lot uses the same settlement and is not excluded unless its id is one of those four. This is the exit-rule change that moves the trading stamp from `v7a25760` to `v9c3cc4d`. Score, size, stops, the gate, the universe, and cadence are unchanged. Non-expired exits are unchanged. (3) The overnight wait slept a precomputed stack of hour-long chunks. macOS sleep froze that timer, so a 07:50 wake resumed the remainder and could miss the open. The live night wait now sleeps at most 60 seconds and compares the wall clock to the next 09:15 ET each time. A wake at 07:50 is back on that target within one leftover chunk. First Squawk is still read once on night entry, at most once per wall-clock hour (one catch-up after a multi-hour jump, not once per missed hour), and not after the target. The precomputed hour schedule is unchanged. This wait does not score, size, exit, or gate. |
+| 2026-11-14 | Freeze exception 12, directed by the operator: a shadow news store. Fed `press_all.xml` and BLS `bls_latest.rss` are polled every 5 minutes from 07:00 through 15:00 CT on trading days. Treasury is not polled. The press page timed out and there is no press-release feed, so that source stores nothing and writes no health row. The public-page First Squawk parser is deleted. A `calendar_events` row, empty until Step 2, triggers one X API v2 recent-search call (`GET /2/tweets/search/recent`, bearer `X_BEARER_TOKEN`) at release + 3 minutes by default. The query is `from:FirstSquawk (<keywords>) -is:retweet`. The X window is release − 1 minute through release + 5 minutes by default, with per-event overrides (Warsh +30), and one retry runs at release + 8 minutes when the call returns nothing. The 13:35 CT press-conference call applies only to FOMC decision days, not minutes. HTTP 429 or a spend-cap error is recorded and X is not called again until the next event. Actual, forecast, and prior are copied only from the post text and tagged `firstsquawk`. `source_health` logs posts returned and an estimated cost of posts × $0.005. A missing token records `disabled: no token`. `python -m first_squawk` lists the last 10 posts and is not run by the bot. The 08:15 brief gains one health line and that day's events in ET and CT. The Friday report gains that Chicago week's estimated X spend and the live Yahoo chain/quote failure count. Live fetches log `source_health` source `yahoo`. A calendar event fetches Yahoo `^TNX` once, from 30 minutes before the release through 15 minutes after, and logs source `yahoo_shadow`. A failed yield fetch stores NULL. On 2026-11-13 the 1-minute last close and the daily close were both 5.154, so a print of 4.25 is 4.25 percent. The scorer does not read these tables. Old headline rows stay. No scoring, sizing, stop, exit, universe, cadence, or stamp change. The process restarts onto this shadow code and stamp `v91c6693`. |
+| 2026-11-14 | Freeze exception 13, directed by the operator, safety fix before the Nov 16 session. An unpriced position could stay open past 14:45 CT because EOD flatten required a mark and did not latch the day. From 14:45 an unpriced contract quote is retried every 60s. At 14:55 CT (11:55 CT on an early close) any position still unpriced closes `EOD_FLATTEN_ESTIMATED`, `fill_est`, at the last good bid from the last 15 minutes, else the linear-delta estimate from the latest spot times 0.90, else intrinsic from that spot, floor 0.01. Discord sends `CRITICAL: EOD FORCED CLOSE` with ticker, contract, price, rule, and quote age. The day latches only when the open count is 0. A book open at boot still closes at the first clean mid; if none appears within 30 minutes it closes at the last good bid with the same alert and `fill_est`. The 14:55 deadline applies to that book, including an expired contract whose official close is still missing. Stops, targets, scoring, gating, and sizing before 14:45 are unchanged. The trading stamp moves from `vec40b2a` to `v91c6693`. yfinance stays 1.8.0 and is pinned, with pandas==2.2.3 and requests==2.32.3. The live Yahoo news fallback no longer calls Yahoo; an empty headline book still scores the sentence "No recent headlines or historical news found." |
 
 ## Pre-registered decisions for session 30
 
@@ -99,28 +101,35 @@ go/no-go decision uses these 27 sessions.
 The v9c3cc4d sample stays closed at 27 sessions. One new pin, `vec40b2a`,
 is the first 7 hex of the sha256 of config.py, position_exits.py,
 scoring_engine.py, signal_gate.py, strike_selector.py, and
-virtual_broker.py after this change. The digest moved because the exit
-rule and the admit cutoff moved. Scoring, sizing, the stop and target
-formulas, the universe, and the gate threshold, persistence, cooldown,
-and caps are unchanged. `CARRY_MIN_DTE` stays 2 in config and is no
-longer an exit rule. Reliability ships in the same pin because this is
+virtual_broker.py after the admit-cutoff change. The digest moved because
+the exit rule and the admit cutoff moved. Scoring, sizing, the stop and
+target formulas, the universe, and the gate threshold, persistence,
+cooldown, and caps are unchanged. `CARRY_MIN_DTE` stays 2 in config and is
+no longer an exit rule. Reliability ships in the same pin because this is
 one trading version. The new measured sample starts empty. v9c3cc4d is
 its own section in ops.report. The day-block seed stays `0x9C3CC4D`.
+Exception 13 moves the live pin from `vec40b2a` to `v91c6693`.
 
 What this pin does:
 
-- Every open position flattens at 14:45 America/Chicago, any DTE. The
-  production scan does not run the morning carry review.
+- Every open position starts flattening at 14:45 America/Chicago, any
+  DTE. The production scan does not run the morning carry review.
 - A position found open at boot pages CRITICAL and closes at the first
-  clean mark (bid and ask both above 0). Inside the flatten window the
-  reason is EOD_FLATTEN. Outside it the reason is BOOT_FLATTEN. A missing
-  mark stays open. No price is invented.
+  clean mark (bid and ask both above 0) before the hard deadline.
+  Outside the flatten window the reason is BOOT_FLATTEN. If no clean mid
+  appears within 30 minutes of boot, it closes at the last good bid,
+  `fill_est`, and pages `CRITICAL: EOD FORCED CLOSE`. From 14:45 an
+  unpriced contract is retried every 60 seconds. At 14:55 CT (11:55 CT
+  on an early close) a position that still has no price closes
+  `EOD_FLATTEN_ESTIMATED`, `fill_est`. The day latches only when the
+  open count is 0.
 - The 13:45 CT scan is the last scan that can admit. Later scans still
   run exits and log scores. New admits are `BLOCK late_session`. The
   cutoff is 14:15 America/Chicago, so the 13:45 slot still admits.
 - 2026-11-27 and 2026-12-24 are early closes (cash close 12:00 CT). They
   are not holidays. No new entries those days (`BLOCK early_close`).
-  Anything open flattens at 11:45 CT. 2026-11-26 is already in
+  Anything open starts flattening at 11:45 CT and is closed by 11:55 CT.
+  2026-11-26 is already in
   `NYSE_HOLIDAYS`. A flat book on an early-close day still emits SESSION,
   so a shortened day is not another missing SESSION line.
 - An 80+ name flattened at 14:45 is tracked the next session as a log-only
@@ -166,3 +175,21 @@ do not change the live config.
   14:45, no new trades after -3R on the day, halt at -15%.
 
 Phase 1 is text only. Those limits are not live knobs.
+
+## shadow hypotheses, pre-registered 2026-11-14
+
+Recorded 2026-11-14, before the Nov 16 session. Shadow only. This rule
+does not change the live score, the gate, size, or exits.
+
+For an inflation release (CPI, PPI, PCE/personal income, import prices),
+compare actual to forecast on headline month-over-month and, separately,
+on core month-over-month. actual > forecast is bearish: context_adj is
+−8 for a CALL and +8 for a PUT. actual < forecast is bullish: +8 for a
+CALL and −8 for a PUT. actual == forecast is 0. A missing actual or
+forecast stays null, and that print is not labeled in line. The two
+series are not summed. The top-level context_adj, would_flip, and
+would_flip_80 come from headline month-over-month. would_flip tests
+whether that adjustment crosses 70. would_flip_80 is the same test at
+80. Core month-over-month records the same flags on its own fields.
+Tier 1 sets shadow would_block inside [release−30 min, release+15 min].
+Tier 2 does not. would_block is not a live gate.

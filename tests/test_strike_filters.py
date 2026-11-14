@@ -14,6 +14,14 @@ ET = ZoneInfo("America/New_York")
 CDT = ZoneInfo("America/Chicago")
 
 
+def setUpModule():
+    mock.patch("shadow_news.note_yahoo_health").start()
+
+
+def tearDownModule():
+    mock.patch.stopall()
+
+
 class TestHonestDte(unittest.TestCase):
     def test_0dte_no_floor_at_one(self):
         # 09:32 CDT = 10:32 ET → remaining ~0.84 of RTH

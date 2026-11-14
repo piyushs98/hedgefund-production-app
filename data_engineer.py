@@ -1,10 +1,11 @@
 import os
 import json
 import threading
+import time
 from datetime import datetime
 
 import yfinance as yf
-from yf_client import SESSION
+from yf_client import SESSION, crumb_429_hits
 
 try:
     import config as _cfg
@@ -99,7 +100,81 @@ def _note_chain_ok() -> None:
         pass
 
 
+class _YahooHealth:
+    """Log one live chain or quote fetch. The write cannot change the result."""
+
+    def __init__(self, kind: str, symbol) -> None:
+        self.kind = kind
+        self.symbol = str(symbol or "")
+        self.started = time.perf_counter()
+        self.hits = crumb_429_hits()
+        self.status = "fail"
+        self.http_status = None
+        self.rows = 0
+        self.detail = ""
+
+    def __enter__(self):
+        return self
+
+    def observe(self, raw: str) -> None:
+        try:
+            body = json.loads(raw)
+        except Exception:
+            self.detail = "not json"
+            return
+        err = body.get("error")
+        if err:
+            self.detail = str(err)[:160]
+            if "429" in self.detail:
+                self.http_status = 429
+            return
+        rows = 0
+        for chain in (body.get("chains") or {}).values():
+            if not isinstance(chain, dict):
+                continue
+            rows += len(chain.get("calls") or [])
+            rows += len(chain.get("puts") or [])
+        self.status = "ok"
+        self.rows = rows
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            self.status = "fail"
+            self.http_status = None
+            self.detail = exc_type.__name__
+        self._write()
+        return False
+
+    def _write(self) -> None:
+        latency_ms = int((time.perf_counter() - self.started) * 1000)
+        crumb = "yes" if crumb_429_hits() > self.hits else "no"
+        detail = f"{self.symbol} {self.kind}"
+        if self.detail:
+            detail = f"{detail} {self.detail}"
+        detail = f"{detail} crumb429={crumb}"
+        try:
+            import shadow_news
+            shadow_news.note_yahoo_health(
+                kind=self.kind,
+                symbol=self.symbol,
+                status=self.status,
+                http_status=self.http_status,
+                rows=self.rows,
+                latency_ms=latency_ms,
+                detail=detail[:240],
+            )
+        except Exception:
+            return
+
+
 def fetch_options_data(ticker_symbol):
+    with _YahooHealth("chain", ticker_symbol) as health:
+        raw = _fetch_options_data(ticker_symbol)
+        health.observe(raw)
+        return raw
+
+
+def _fetch_options_data(ticker_symbol):
     """
     Fetch option chains for strike selection.
 
@@ -232,6 +307,18 @@ def _spot_or_na(stock) -> float | str:
 
 
 def fetch_contract_quote(
+    ticker_symbol: str,
+    expiration: str,
+    strike: float | int,
+    direction: str = "CALL",
+) -> str:
+    with _YahooHealth("quote", ticker_symbol) as health:
+        raw = _fetch_contract_quote(ticker_symbol, expiration, strike, direction)
+        health.observe(raw)
+        return raw
+
+
+def _fetch_contract_quote(
     ticker_symbol: str,
     expiration: str,
     strike: float | int,

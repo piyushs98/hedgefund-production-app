@@ -29,7 +29,7 @@ _version_cache: str | None = None
 # This pin is the digest after flatten-all, the 13:45 cutoff, and the
 # early-close days. Dashboard files and the Squawk shadow do not move it.
 # Env and git HEAD are ignored.
-TRADING_STAMP = "ec40b2a"
+TRADING_STAMP = "91c6693"
 
 # Chicago-session counters. Discord SESSION line is the durable copy.
 _session: dict[str, Any] = {

@@ -274,7 +274,7 @@ class SquawkContextTests(unittest.TestCase):
 
 
 class EnsureNewsWindowTests(unittest.TestCase):
-    def test_squawk_only_book_still_calls_yahoo_and_stays_out_of_the_score(self):
+    def test_squawk_only_book_does_not_call_yahoo_and_stays_out_of_the_score(self):
         import master_bot
         import squawk_shadow
 
@@ -288,7 +288,7 @@ class EnsureNewsWindowTests(unittest.TestCase):
             text = master_bot.ensure_news_context("NVDA")
         self.assertEqual(text, "No recent headlines or historical news found.")
         self.assertNotIn("NVIDIA BEATS", text)
-        ticker.assert_called()
+        ticker.assert_not_called()
         staged = squawk_shadow.take("NVDA")
         self.assertIn("NVIDIA BEATS", staged)
 
