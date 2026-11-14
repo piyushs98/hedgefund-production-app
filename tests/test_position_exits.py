@@ -242,8 +242,8 @@ class TestExitRules(unittest.TestCase):
                         )
         self.assertEqual(close.call_args[0][2], "BREAKEVEN_LOCK")
 
-    def test_eod_flattens_short_dated_only(self):
-        """CARRY_MIN_DTE=2: cal_dte 1 flattens; cal_dte>=2 may carry."""
+    def test_eod_flattens_every_open_dte(self):
+        """14:45 flattens every open contract. DTE does not keep a lot overnight."""
         short = self._trade(expiration="2026-08-06", trade_id="short")  # cal_dte=1 on Aug 5
         long = self._trade(
             expiration="2026-08-12",
@@ -294,10 +294,11 @@ class TestExitRules(unittest.TestCase):
                                 now_cdt=datetime(2026, 8, 5, 14, 50, 0),
                             )
         self.assertTrue(summary["eod_triggered"])
-        # Only short-dated closed
-        self.assertEqual(close.call_count, 1)
-        self.assertEqual(close.call_args[0][2], "EOD_FLATTEN")
-        self.assertEqual(close.call_args[0][0].get("trade_id"), "short")
+        self.assertEqual(close.call_count, 2)
+        reasons = [call.args[2] for call in close.call_args_list]
+        ids = [call.args[0].get("trade_id") for call in close.call_args_list]
+        self.assertEqual(reasons, ["EOD_FLATTEN", "EOD_FLATTEN"])
+        self.assertEqual(ids, ["short", "long"])
 
     def test_time_stop_skipped_logged_when_score_exempt(self):
         from datetime import timezone as _tz, timedelta

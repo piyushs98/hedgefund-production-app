@@ -597,6 +597,25 @@ def _stage_squawk(ticker: str, squawk_text: str) -> None:
     squawk_shadow.stage(ticker, "\n".join(kept))
 
 
+_news_fallback_notes: list[str] = []
+
+
+def _note_news_fallback(ticker: str, detail: str) -> None:
+    _news_fallback_notes.append(f"{ticker}: {detail}")
+
+
+def flush_news_fallback_errors(where: str) -> None:
+    """One line for the whole pass. The score string is unchanged."""
+    notes = list(_news_fallback_notes)
+    _news_fallback_notes.clear()
+    if not notes:
+        return
+    print(
+        f"[news] yfinance fallback failed for {len(notes)} ticker(s) "
+        f"during {where}; first: {notes[0]}"
+    )
+
+
 def ensure_news_context(ticker, breaker=None):
     """DB-first news for the score, with a live yfinance cold start.
 
@@ -633,11 +652,11 @@ def ensure_news_context(ticker, breaker=None):
         if breaker:
             breaker.record_success(f"news:{ticker}")
     except MasterBotScanError as e:
-        print(f"❌ [{ticker}] yfinance news fallback {e.step}: {e.message}")
+        _note_news_fallback(ticker, f"{e.step}: {e.message}")
         if breaker:
             breaker.record_failure(f"news:{ticker}")
     except Exception as e:
-        print(f"❌ [{ticker}] yfinance news fallback error: {e}")
+        _note_news_fallback(ticker, str(e))
         if breaker:
             breaker.record_failure(f"news:{ticker}")
     return scored if scored.strip() else "No recent headlines or historical news found."
@@ -910,6 +929,7 @@ def run_night_harvest():
             print(f"[System] synthetic innovation purge warn: {purge_err}")
     except Exception as err:
         print(f"❌ Scraper error in night harvest: {err}")
+    flush_news_fallback_errors("night harvest")
     try:
         import earnings_blackout
         earnings_blackout.log_config(alert=True)
@@ -1002,7 +1022,8 @@ def run_portfolio_scan(
         result["aborted"] = True
         return result
 
-    scan_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    import session_clock
+    scan_id = f"{session_clock.chicago_stamp()}-{uuid.uuid4().hex[:6]}"
     result["scan_id"] = scan_id
     futures_pct = get_latest_futures_pct("ES=F")
     print(f"\n🚀 PORTFOLIO SCAN {scan_id} | tickers={universe} | "
@@ -1534,6 +1555,7 @@ def run_portfolio_scan(
         )
     else:
         print(f"\n✅ PORTFOLIO SCAN {scan_id} COMPLETED.")
+    flush_news_fallback_errors("portfolio scan")
     return result
 
 
@@ -1630,13 +1652,13 @@ def run_macro_loop():
     except Exception as purge_err:
         print(f"[System] synthetic innovation purge warn: {purge_err}")
     print(
-        f"[SessionCutoffs] EXIT_EOD_FLATTEN_CDT="
+        f"[SessionCutoffs] EXIT_EOD_FLATTEN="
         f"{config.EXIT_EOD_FLATTEN_HOUR:02d}:{config.EXIT_EOD_FLATTEN_MINUTE:02d} "
-        f"CARRY_MIN_DTE={config.CARRY_MIN_DTE} "
-        f"(EOD flattens only cal_dte < CARRY_MIN_DTE; multi-day may overnight) "
-        f"FIRST_FULL_SCAN_CDT="
+        f"America/Chicago flatten=all (no overnight; early close 11:45 CT) "
+        f"last_admit=13:45 "
+        f"FIRST_FULL_SCAN="
         f"{config.FIRST_FULL_SCAN_HOUR:02d}:{config.FIRST_FULL_SCAN_MINUTE:02d} "
-        f"(08:30 CDT is exit/carry only; chains empty at ET open)"
+        f"(08:30 CT is exit-only; chains empty at the ET open)"
     )
     # Log-only path inventory (Stage 1). No writes, no restore.
     try:
@@ -1684,7 +1706,7 @@ def run_macro_loop():
         except Exception:
             boot_ver = "vn/a"
         boot_msg = (
-            f"🟢 **BOT UP** {boot_ver} {boot_clock} CDT | webhook={hook} | "
+            f"🟢 **BOT UP** {boot_ver} {boot_clock} CT | webhook={hook} | "
             f"score=T+S | spread_cap={getattr(config, 'MAX_CONTRACT_SPREAD_PCT', 8)}%"
         )
         print(f"[System] {boot_msg}")
@@ -1698,7 +1720,13 @@ def run_macro_loop():
             )
     except Exception as boot_err:
         print(f"[System] boot Discord ping raised: {boot_err}")
+    try:
+        import position_exits
+        position_exits.note_open_book_at_boot()
+    except Exception as boot_book_err:
+        print(f"[boot] open-book check failed: {boot_book_err}")
     CRITICAL_ERROR_BACKOFF_S = 60
+    heartbeat_prep_date = None
 
     while True:
         try:
@@ -1801,17 +1829,32 @@ def run_macro_loop():
                     "First Squawk is read at most once an hour, then once "
                     "more before the morning brief. Yahoo is not called again."
                 )
+                def _night_tick():
+                    note_macro_heartbeat()
+                    try:
+                        import reliability
+                        reliability.flush_discord_outbox()
+                    except Exception as flush_err:
+                        print(f"[discord] night flush warn: {flush_err}")
+
                 night_mode.sleep_until_premarket(
                     now,
                     time.sleep,
                     holidays=NYSE_HOLIDAYS,
-                    on_tick=note_macro_heartbeat,
+                    on_tick=_night_tick,
                     on_hour=pull_first_squawk,
                 )
                 continue
 
             elif is_prep_meeting:
                 print(f"\n[System State] 📊 PRE-MARKET PREP MEETING (EST {now.strftime('%H:%M:%S')})")
+                if heartbeat_prep_date != now_cdt.date():
+                    try:
+                        import reliability
+                        reliability.ping_heartbeat("prep")
+                    except Exception as ping_err:
+                        print(f"[heartbeat] prep ping warn: {ping_err}")
+                    heartbeat_prep_date = now_cdt.date()
                 print("[System State] Gemini allowed: morning CoS briefing only.")
                 if last_briefing_date != now.date():
                     if squawk_brief_date != now.date():
@@ -1831,8 +1874,13 @@ def run_macro_loop():
             elif is_trading_mode:
                 print(
                     f"\n[System State] 📈 ACTIVE TRADING MODE "
-                    f"(EST {now.strftime('%H:%M:%S')} | CDT {cdt_clock_str(now_cdt)})"
+                    f"(EST {now.strftime('%H:%M:%S')} | CT {cdt_clock_str(now_cdt)})"
                 )
+                try:
+                    import reliability
+                    reliability.warn_if_on_battery(now_cdt.date())
+                except Exception as power_err:
+                    print(f"[power] check warn: {power_err}")
                 if not morning_macro_context:
                     try:
                         bl = load_baseline()
@@ -1862,7 +1910,7 @@ def run_macro_loop():
                 ):
                     print(
                         f"[System State] 📊 MIDDAY MACRO WINDOW "
-                        f"(CDT {cdt_clock_str(now_cdt)}) — DeepSeek primary, isolated payload"
+                        f"(CT {cdt_clock_str(now_cdt)}) — DeepSeek primary, isolated payload"
                     )
                     try:
                         bl = load_baseline()
@@ -1937,7 +1985,7 @@ def run_macro_loop():
                     ):
                         print(
                             f"[System State] Waking early for 11:00 CDT macro "
-                            f"(CDT {cdt_clock_str(woke)})"
+                            f"(CT {cdt_clock_str(woke)})"
                         )
                         break
                     # Wake early for Stage 4 EOD / 0DTE flatten windows
@@ -1951,7 +1999,7 @@ def run_macro_loop():
                         ):
                             print(
                                 f"[System State] Waking early for EOD flatten "
-                                f"(CDT {cdt_clock_str(woke)})"
+                                f"(CT {cdt_clock_str(woke)})"
                             )
                             break
                         if _pex.is_zero_dte_flatten_window(woke):
@@ -1969,7 +2017,7 @@ def run_macro_loop():
                                     if exp and str(exp)[:10] == str(sess):
                                         print(
                                             f"[System State] Waking early for 0DTE flatten "
-                                            f"(CDT {cdt_clock_str(woke)})"
+                                            f"(CT {cdt_clock_str(woke)})"
                                         )
                                         raise StopIteration
                             except StopIteration:

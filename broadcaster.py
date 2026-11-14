@@ -140,12 +140,14 @@ def send_discord_alert(message, critical=False):
 
         chunks = _chunk_message(str(message))
         ok = True
+        failed = []
         for i, chunk in enumerate(chunks, 1):
             if len(chunks) > 1:
                 print(f"[Broadcaster] Sending chunk {i}/{len(chunks)} "
                       f"({len(chunk)} chars)...")
             if not _post_chunk(chunk):
                 ok = False
+                failed.append(chunk)
             if i < len(chunks):
                 time.sleep(0.6)                    # gentle pacing between chunks
         if ok:
@@ -153,8 +155,14 @@ def send_discord_alert(message, critical=False):
         else:
             print(
                 "[Broadcaster] ERROR: Delivery finished with errors after retries. "
-                "Alert retained in process logs only."
+                "Undelivered chunks are queued."
             )
+            if WEBHOOK_URL and failed:
+                try:
+                    import reliability
+                    reliability.enqueue_discord(failed, critical=bool(critical))
+                except Exception as queue_err:
+                    print(f"[Broadcaster] outbox insert failed: {queue_err}")
         return ok
     except Exception as e:
         # Final never-raise envelope for Master Bot immortal contract.
@@ -163,6 +171,14 @@ def send_discord_alert(message, critical=False):
             print(str(message)[:2000])
         except Exception:
             pass
+        if WEBHOOK_URL and message and str(message).strip():
+            try:
+                import reliability
+                reliability.enqueue_discord(
+                    [str(message)[:MAX_CHUNK]], critical=bool(critical)
+                )
+            except Exception as queue_err:
+                print(f"[Broadcaster] outbox insert failed: {queue_err}")
         return False
 
 

@@ -104,6 +104,18 @@ def _chicago_now():
     return datetime.now(pytz.timezone("America/Chicago"))
 
 
+def _as_chicago(dt=None):
+    """America/Chicago. A naive datetime is Chicago wall time, not UTC."""
+    if dt is None:
+        return _chicago_now()
+    if pytz is None:
+        return dt
+    tz = pytz.timezone("America/Chicago")
+    if dt.tzinfo is None:
+        return tz.localize(dt)
+    return dt.astimezone(tz)
+
+
 # One NO MARKET DATA page per Chicago session. A failed Discord send stays
 # pending so the next pass, including a breaker-open return, can retry.
 _market_data_alerted_date: str | None = None
@@ -168,14 +180,12 @@ def _edt_now():
 
 
 def cdt_clock_str(dt=None) -> str:
-    dt = dt or _chicago_now()
-    return dt.strftime("%H:%M")
+    return _as_chicago(dt).strftime("%H:%M")
 
 
 def is_midday_macro_window(dt=None) -> bool:
     """True during 11:00–11:44 America/Chicago (11:00 AM CDT target window)."""
-    dt = dt or _chicago_now()
-    tt = dt.time()
+    tt = _as_chicago(dt).time()
     # Drop tzinfo if present so we can compare to naive time() bounds
     if getattr(tt, "tzinfo", None) is not None:
         tt = tt.replace(tzinfo=None)
@@ -186,12 +196,11 @@ def is_full_scan_window(dt=None) -> bool:
     """
     True at/after FIRST_FULL_SCAN_CDT (default 08:45 America/Chicago).
 
-    The 08:30 CDT tick is the ET cash open; Yahoo option chains are not
+    The 08:30 CT tick is the ET cash open; Yahoo option chains are not
     populated yet and a full universe scan prints no_liq_data on all 10
-    names. Carry review + exits still run on that tick via exit-only.
+    names. Exits still run on that tick via exit-only.
     """
-    dt = dt or _chicago_now()
-    tt = dt.time()
+    tt = _as_chicago(dt).time()
     if getattr(tt, "tzinfo", None) is not None:
         tt = tt.replace(tzinfo=None)
     boundary = time(
@@ -540,7 +549,7 @@ def format_thirty_min_scan_discord(
     """
     clock = clock_cdt or cdt_clock_str()
     lines = [
-        f"📊 **30-MIN SCAN [{clock} CDT]**",
+        f"📊 **30-MIN SCAN [{clock} CT]**",
         "",
         "| Ticker | Status | Contract | Qty | Entry | SL | TP |",
         "|---|---|---|---|---|---|---|",
@@ -815,7 +824,7 @@ def _note_scan_discord_result(
     )
     msg = (
         f"🚨 **CRITICAL: SCAN DISCORD FAILED**\n"
-        f"30-MIN SCAN `{scan_id}` at {clock} CDT did **not** post.\n"
+        f"30-MIN SCAN `{scan_id}` at {clock} CT did **not** post.\n"
         f"{why}.\n"
         f"Admits this scan: **{n_admits}**. "
         f"Consecutive post failures: **{n}**.\n"
@@ -916,6 +925,34 @@ def score_tickers_for_book(
     return scored
 
 
+def _begin_market_pass() -> None:
+    """Resend queued Discord before the pass. A failure does not stop it."""
+    try:
+        import reliability
+        reliability.flush_discord_outbox()
+    except Exception as exc:
+        print(f"[discord] outbox flush warn: {exc}")
+
+
+def _finish_market_pass(kind: str) -> None:
+    """One news line, shadow marks, and the dead-man ping. Fail-open."""
+    try:
+        from master_bot import flush_news_fallback_errors
+        flush_news_fallback_errors(kind)
+    except Exception as exc:
+        print(f"[news] flush warn: {exc}")
+    try:
+        import carry_shadow
+        carry_shadow.advance()
+    except Exception as exc:
+        print(f"[shadow] advance warn: {exc}")
+    try:
+        import reliability
+        reliability.ping_heartbeat(kind)
+    except Exception as exc:
+        print(f"[heartbeat] {kind} ping warn: {exc}")
+
+
 def run_thirty_min_scan(
     breaker: CircuitBreaker,
     *,
@@ -943,7 +980,9 @@ def run_thirty_min_scan(
     )
 
     universe = list(tickers) if tickers is not None else list(TICKERS)
-    scan_id = f"scan-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    _begin_market_pass()
+    import session_clock
+    scan_id = f"scan-{session_clock.chicago_stamp()}-{uuid.uuid4().hex[:6]}"
     try:
         import fill_accounting as _fa
         _fa.note_scan()
@@ -964,6 +1003,7 @@ def run_thirty_min_scan(
         result["aborted"] = True
         result["circuit_breaker_open"] = True
         _retry_pending_market_data_alert()
+        _finish_market_pass("scan")
         return result
 
     today = _edt_now().strftime("%Y-%m-%d")
@@ -982,14 +1022,14 @@ def run_thirty_min_scan(
     futures_pct = get_latest_futures_pct("ES=F")
     clock = cdt_clock_str()
     print(
-        f"\n🚀 30-MIN SCAN {scan_id} | {clock} CDT | tickers={len(universe)} | "
+        f"\n🚀 30-MIN SCAN {scan_id} | {clock} CT | tickers={len(universe)} | "
         f"open_baseline={open_baseline} | ES=F {futures_pct}% | "
         f"score=T+S thr={config.EXECUTE_THRESHOLD}"
     )
     # Heartbeat BEFORE the Yahoo loop so a hung chain fetch cannot look like a dead bot.
     try:
         start_ok = broadcaster.send_discord_alert(
-            f"📡 **SCAN START** [{clock} CDT] `{scan_id}` | n={len(universe)}"
+            f"📡 **SCAN START** [{clock} CT] `{scan_id}` | n={len(universe)}"
         )
         print(f"[scan] start ping delivered={start_ok}")
     except Exception as start_err:
@@ -1112,12 +1152,10 @@ def run_thirty_min_scan(
             import time as _time
             _time.sleep(inter_ticker_sleep)
 
-    # ---- Stage 4: carry review (first scan of day) + exits, then gate sync ----
-    # Order is intentional: mark/close carried book BEFORE admits so
-    # sync_open_from_book sees the true open set (no double-admit on carry).
-    # Reuses phase-1 options_dict / scores — no extra yfinance when open ⊆ universe.
+    # ---- Stage 4: exits, then gate sync ----
+    # Overnight carry is retired. Mark and close the open book before admits
+    # so the gate sees the book after exits. Same options_dict, no extra fetch.
     exit_summary: dict[str, Any] = {}
-    carry_summary: dict[str, Any] = {}
     try:
         import position_exits
         from tracker_agent import load_active_trades as _load_open
@@ -1125,46 +1163,10 @@ def run_thirty_min_scan(
         open_before_exits = _load_open()
         now_cdt = _chicago_now()
 
-        # Morning carry review once/day before any new entries this session
-        if open_before_exits and not position_exits.carry_review_already_done(
-            now_cdt.date()
-        ):
-            print(
-                f"[scan] CARRY REVIEW: {len(open_before_exits)} open position(s) "
-                f"vs today's pivot/score"
-            )
-            carry_summary = position_exits.run_morning_carry_review(
-                open_before_exits,
-                scored,
-                scan_id=scan_id,
-                now_cdt=now_cdt,
-            )
-            result["carry_review"] = {
-                "ran": carry_summary.get("ran"),
-                "held": carry_summary.get("held"),
-                "closed": [
-                    {
-                        "ticker": c.get("ticker"),
-                        "reason": c.get("reason"),
-                        "exit_price": c.get("exit_price"),
-                        "pnl": c.get("pnl"),
-                    }
-                    for c in (carry_summary.get("closed") or [])
-                ],
-                "lines": carry_summary.get("lines"),
-            }
-            # Reload book after carry closes
-            open_before_exits = _load_open()
-        elif not open_before_exits and not position_exits.carry_review_already_done(
-            now_cdt.date()
-        ):
-            # No open book — still mark review done so we don't re-check all day
-            position_exits.mark_carry_review_done(now_cdt.date())
-
         if open_before_exits:
             print(
                 f"[scan] Stage 4 exits: evaluating {len(open_before_exits)} open "
-                f"position(s) (selective EOD/expiry/SL/TP + marks)"
+                f"position(s) (flatten-all EOD/expiry/SL/TP + marks)"
             )
             exit_summary = position_exits.run_scan_exits(
                 open_before_exits,
@@ -1247,10 +1249,6 @@ def run_thirty_min_scan(
         for c in (exit_summary.get("closed") or [])
         if c.get("ticker")
     }
-    # Carry-review closes also count
-    for c in (carry_summary.get("closed") or []):
-        if c.get("ticker"):
-            closed_this_scan.add(str(c["ticker"]).upper().strip())
     closed_this_scan.discard("")
 
     now_utc = datetime.now(timezone.utc)
@@ -1542,6 +1540,7 @@ def run_thirty_min_scan(
         gate_summary=gate_summary,
     )
     print(f"✅ 30-MIN SCAN {scan_id} complete | discord={ok} | telemetry={len(bullets)}")
+    _finish_market_pass("scan")
     return result
 
 
@@ -1578,7 +1577,9 @@ def run_exit_only_pass(
     from tracker_agent import load_active_trades
     import position_exits
 
-    scan_id = f"exit-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    _begin_market_pass()
+    import session_clock
+    scan_id = f"exit-{session_clock.chicago_stamp()}-{uuid.uuid4().hex[:6]}"
     clock = cdt_clock_str()
     result: dict[str, Any] = {
         "scan_id": scan_id,
@@ -1604,6 +1605,7 @@ def run_exit_only_pass(
             if not open_trades:
                 result["aborted"] = True
                 _emit_eod_book_into(result)
+                _finish_market_pass("exit")
                 return result
             scored_spot: dict[str, dict] = {}
             for t in open_trades:
@@ -1647,7 +1649,7 @@ def run_exit_only_pass(
                         for c in exit_summary["closed"]
                     ]
                     broadcaster.send_discord_alert(
-                        f"📉 **EXIT PASS [{clock} CDT]**\n" + "\n".join(lines)
+                        f"📉 **EXIT PASS [{clock} CT]**\n" + "\n".join(lines)
                     )
                 except Exception as disc_err:
                     print(f"[exit-pass] Discord warn: {disc_err}")
@@ -1657,6 +1659,7 @@ def run_exit_only_pass(
             print(f"[exit-pass] breaker-open underlying pass failed: {e}")
             result["aborted"] = True
         _emit_eod_book_into(result)
+        _finish_market_pass("exit")
         return result
 
     try:
@@ -1664,76 +1667,20 @@ def run_exit_only_pass(
     except Exception as e:
         print(f"[exit-pass] load_active_trades failed: {e}")
         result["error"] = str(e)
+        _finish_market_pass("exit")
         return result
 
     result["open_before"] = len(open_trades)
     if not open_trades:
-        try:
-            import position_exits as _pex
-            now_c = _chicago_now()
-            if not _pex.carry_review_already_done(now_c.date()):
-                _pex.mark_carry_review_done(now_c.date())
-        except Exception:
-            pass
-        print(f"[exit-pass] {clock} CDT — no open positions; skip mark fetches.")
+        print(f"[exit-pass] {clock} CT — no open positions; skip mark fetches.")
         _emit_eod_book_into(result)
+        _finish_market_pass("exit")
         return result
 
     print(
-        f"\n⏱️ EXIT-ONLY PASS {scan_id} | {clock} CDT | "
+        f"\n⏱️ EXIT-ONLY PASS {scan_id} | {clock} CT | "
         f"{len(open_trades)} open position(s) | single-contract quotes"
     )
-
-    # Morning carry review on the 08:30 tick (full scan is deferred to 08:45).
-    # Score OPEN names only — do not Discord a 10-row no_liq_data table.
-    try:
-        import position_exits as _pex
-        now_c = _chicago_now()
-        if not _pex.carry_review_already_done(now_c.date()):
-            open_tickers = []
-            seen_t = set()
-            for t in open_trades:
-                tk = str((t or {}).get("ticker") or "").upper().strip()
-                if tk and tk not in seen_t:
-                    seen_t.add(tk)
-                    open_tickers.append(tk)
-            scored_carry = score_tickers_for_book(
-                open_tickers, breaker, inter_ticker_sleep=inter_ticker_sleep
-            )
-            print(
-                f"[exit-pass] CARRY REVIEW: {len(open_trades)} open "
-                f"vs today's pivot/score (no admits)"
-            )
-            carry_summary = _pex.run_morning_carry_review(
-                open_trades,
-                scored_carry,
-                scan_id=scan_id,
-                now_cdt=now_c,
-            )
-            result["carry_review"] = {
-                "ran": carry_summary.get("ran"),
-                "held": carry_summary.get("held"),
-                "closed": [
-                    {
-                        "ticker": c.get("ticker"),
-                        "reason": c.get("reason"),
-                        "exit_price": c.get("exit_price"),
-                        "pnl": c.get("pnl"),
-                    }
-                    for c in (carry_summary.get("closed") or [])
-                ],
-                "lines": carry_summary.get("lines"),
-            }
-            open_trades = load_active_trades()
-            result["open_before"] = len(open_trades)
-            if not open_trades:
-                print(
-                    f"[exit-pass] {clock} CDT — book flat after carry review."
-                )
-                _emit_eod_book_into(result)
-                return result
-    except Exception as carry_err:
-        print(f"[exit-pass] carry review warn: {carry_err}")
 
     # Key quotes by trade identity so multi-leg same ticker (if any) stays correct.
     # lookup in run_scan_exits is by ticker — one options_dict per ticker is enough
@@ -1861,7 +1808,7 @@ def run_exit_only_pass(
         result["open_after"] = exit_summary.get("open_after")
         # Always log one-line mark health (also printed inside run_scan_exits)
         print(
-            f"[exit-pass] {clock} CDT marks checked="
+            f"[exit-pass] {clock} CT marks checked="
             f"{exit_summary.get('positions_checked')} "
             f"ok={exit_summary.get('marks_ok')} "
             f"failed={exit_summary.get('marks_failed')}"
@@ -1873,7 +1820,7 @@ def run_exit_only_pass(
                     for c in exit_summary["closed"]
                 ]
                 broadcaster.send_discord_alert(
-                    f"📉 **EXIT PASS [{clock} CDT]**\n" + "\n".join(lines)
+                    f"📉 **EXIT PASS [{clock} CT]**\n" + "\n".join(lines)
                 )
             except Exception as disc_err:
                 print(f"[exit-pass] Discord warn: {disc_err}")
@@ -1896,6 +1843,7 @@ def run_exit_only_pass(
         f"✅ EXIT-ONLY {scan_id} complete | closed={len(result.get('closed') or [])} "
         f"open {result.get('open_before')}→{result.get('open_after')}"
     )
+    _finish_market_pass("exit")
     return result
 
 

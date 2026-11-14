@@ -25,10 +25,11 @@ _version_cache: str | None = None
 
 # First 7 hex of the trading-module hash. Bump only when scoring, sizing,
 # exits, the gate, the universe, cadence, or chain-load behavior changes.
-# v7a25760 is the Oct 2 tree. This pin moved for the expired-contract
-# settlement (freeze exception 11). Dashboard files and the Squawk shadow
-# do not move it. Env and git HEAD are ignored.
-TRADING_STAMP = "9c3cc4d"
+# v7a25760 is the Oct 2 tree. v9c3cc4d is the closed 27-session sample.
+# This pin is the digest after flatten-all, the 13:45 cutoff, and the
+# early-close days. Dashboard files and the Squawk shadow do not move it.
+# Env and git HEAD are ignored.
+TRADING_STAMP = "ec40b2a"
 
 # Chicago-session counters. Discord SESSION line is the durable copy.
 _session: dict[str, Any] = {

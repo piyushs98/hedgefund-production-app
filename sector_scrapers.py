@@ -49,6 +49,12 @@ def extract_article_info(article):
         
     return title or "Unknown Title", publisher or "Unknown Publisher"
 
+def _flush_scrape_errors(label: str, errors: list[str]) -> None:
+    if not errors:
+        return
+    print(f"[Employee] {label}: {len(errors)} error(s); first: {errors[0]}")
+
+
 def scrape_tech_sector():
     """
     Employee Tier - Tech Scraper:
@@ -58,6 +64,7 @@ def scrape_tech_sector():
     print("[Employee] Tech Scraper: Scanning tech sector news...")
     
     count = 0
+    errors: list[str] = []
     for i, ticker in enumerate(tickers):
         if _crumb_blocked("tech news"):
             break
@@ -72,10 +79,10 @@ def scrape_tech_sector():
                         if saved:
                             count += 1
         except Exception as e:
-            print(f"❌ [Employee] Tech Scraper: Error scraping {ticker} ({e})")
+            errors.append(f"{ticker} ({e})")
         if i < len(tickers) - 1:
             time.sleep(TICKER_PACING_SECONDS)
-            
+    _flush_scrape_errors("Tech Scraper", errors)
     print(f"[Employee] Tech Scraper: Saved {count} new tech headlines.")
 
 def scrape_macro_finance():
@@ -87,6 +94,7 @@ def scrape_macro_finance():
     print("[Employee] Macro Scraper: Scanning macroeconomic index news...")
     
     count = 0
+    errors = []
     for i, ticker in enumerate(tickers):
         if _crumb_blocked("macro news"):
             break
@@ -101,10 +109,11 @@ def scrape_macro_finance():
                         if saved:
                             count += 1
         except Exception as e:
-            print(f"❌ [Employee] Macro Scraper: Error scraping {ticker} ({e})")
+            errors.append(f"{ticker} ({e})")
         if i < len(tickers) - 1:
             time.sleep(TICKER_PACING_SECONDS)
             
+    _flush_scrape_errors("Macro Scraper", errors)
     print(f"[Employee] Macro Scraper: Saved {count} new macro headlines.")
 
 def scrape_politics_government():
@@ -118,6 +127,7 @@ def scrape_politics_government():
     keywords = ["fed", "federal reserve", "powell", "yellen", "tariff", "policy", "rate", "inflation", "economic", "treasury", "government", "white house", "congress"]
     
     count = 0
+    errors = []
     for i, source in enumerate(source_tickers):
         if _crumb_blocked("politics news"):
             break
@@ -136,10 +146,11 @@ def scrape_politics_government():
                             if saved:
                                 count += 1
         except Exception as e:
-            print(f"❌ [Employee] Politics Scraper: Error scraping macro source {source} ({e})")
+            errors.append(f"{source} ({e})")
         if i < len(source_tickers) - 1:
             time.sleep(TICKER_PACING_SECONDS)
             
+    _flush_scrape_errors("Politics Scraper", errors)
     print(f"[Employee] Politics Scraper: Saved {count} new economic policy headlines.")
 
 def fetch_overnight_futures():
@@ -156,6 +167,7 @@ def fetch_overnight_futures():
     }
     
     count = 0
+    errors = []
     futures_items = [(symbol, futures[symbol]) for symbol in FUTURES_SYMBOLS]
     for i, (symbol, name) in enumerate(futures_items):
         if _crumb_blocked("overnight futures"):
@@ -214,10 +226,11 @@ def fetch_overnight_futures():
                 count += 1
                 print(f"[Employee] Futures Scraper: Saved {name} pre-market headline.")
         except Exception as e:
-            print(f"❌ [Employee] Futures Scraper: Error scraping {symbol} ({e})")
+            errors.append(f"{symbol} ({e})")
         if i < len(futures_items) - 1:
             time.sleep(TICKER_PACING_SECONDS)
             
+    _flush_scrape_errors("Futures Scraper", errors)
     print(f"[Employee] Futures Scraper: Saved {count} futures data points.")
 
 

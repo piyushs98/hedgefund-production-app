@@ -16,14 +16,14 @@ from ops.store import connect_ro, newest_bot_log, read_text, table_names
 SCAN_RE = re.compile(
     r"(?:30-MIN SCAN|PORTFOLIO SCAN)\s+"
     r"((?:scan|exit)-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-[0-9a-f]+)"
-    r"(?:\s+\|\s+(\d{2}):(\d{2})\s+CDT)?"
+    r"(?:\s+\|\s+(\d{2}):(\d{2})\s+(?:CDT|CT))?"
 )
 EXIT_RE = re.compile(
     r"(?:EXIT-ONLY PASS|EXIT-ONLY)\s+"
     r"(exit-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-[0-9a-f]+)"
-    r"(?:\s+\|\s+(\d{2}):(\d{2})\s+CDT)?"
+    r"(?:\s+\|\s+(\d{2}):(\d{2})\s+(?:CDT|CT))?"
 )
-EXIT_IDLE_RE = re.compile(r"\[exit-pass\]\s+(\d{2}):(\d{2})\s+CDT")
+EXIT_IDLE_RE = re.compile(r"\[exit-pass\]\s+(\d{2}):(\d{2})\s+(?:CDT|CT)")
 VERSION_RE = re.compile(r"\bv([0-9a-f]{7})\b")
 GATE_RE = re.compile(r"^.*\bGATE \[.*$", re.MULTILINE)
 BANNER_RE = re.compile(r"----- (\d{4}-\d{2}-\d{2}) ")

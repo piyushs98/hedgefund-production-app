@@ -3,8 +3,9 @@ position_exits.py — Deterministic scan-path exits (Stage 4 B1–B5 + C-D + car
 
 Runs inside the 30-minute scan. No tracker daemon, no Gemini, no new process.
 
-  B1  Selective EOD flatten at EXIT_EOD_FLATTEN_CDT (default 14:45 CDT):
-      only calendar_dte < CARRY_MIN_DTE (default 2) — multi-day may overnight
+  B1  Flatten every open position at EXIT_EOD_FLATTEN_CDT (default 14:45
+      America/Chicago), any DTE. Early-close days flatten at 11:45 CT.
+      Nothing is carried overnight. CARRY_MIN_DTE is no longer an exit rule.
   B2  Expired contracts (expiration date strictly before the session date)
       settle at intrinsic value from the underlying close on the
       expiration date, reason EXPIRED. A missing close waits for the
@@ -17,7 +18,7 @@ Runs inside the 30-minute scan. No tracker daemon, no Gemini, no new process.
       >= EXECUTE_THRESHOLD (70) — carry review and every exit pass, P&L ignored
   Earnings flatten: open lot whose expiry spans a print, once the session
       is inside the blackout window (EARNINGS_FLATTEN_SPANNING, default on)
-  Carry morning re-eval once/day before admits (score/pivot/mark + Discord)
+  Carry morning re-eval remains callable for tests. The scan path does not run it.
 
 Every close: virtual_broker.paper_sell → tracker_agent.remove_active_trade
 (which calls signal_gate.on_close so the concurrent slot frees).
@@ -45,6 +46,8 @@ except ImportError:  # pragma: no cover
 _eod_flatten_dates: set[str] = set()
 _carry_review_dates: set[str] = set()
 _eod_book_dates: set[str] = set()
+# Set when the process finds an open book at boot. Cleared once that book is flat.
+_boot_flatten_open = False
 
 
 def _parse_entry_time(trade: dict[str, Any]) -> datetime | None:
@@ -86,15 +89,25 @@ def _et_session_date(dt: datetime | None = None) -> date:
 
 
 def is_eod_flatten_window(dt: datetime | None = None) -> bool:
-    """True when America/Chicago clock is at or after configured EOD flatten time."""
+    """True at/after the Chicago flatten. Early-close days use 11:45 CT."""
     now = _chicago_now(dt)
     tt = now.time()
     if getattr(tt, "tzinfo", None) is not None:
         tt = tt.replace(tzinfo=None)
-    boundary = time(
-        int(config.EXIT_EOD_FLATTEN_HOUR),
-        int(config.EXIT_EOD_FLATTEN_MINUTE),
-    )
+    try:
+        import session_clock
+        if session_clock.is_early_close(now.date()):
+            boundary = session_clock.EARLY_FLATTEN
+        else:
+            boundary = time(
+                int(config.EXIT_EOD_FLATTEN_HOUR),
+                int(config.EXIT_EOD_FLATTEN_MINUTE),
+            )
+    except Exception:
+        boundary = time(
+            int(config.EXIT_EOD_FLATTEN_HOUR),
+            int(config.EXIT_EOD_FLATTEN_MINUTE),
+        )
     return tt >= boundary
 
 
@@ -123,13 +136,57 @@ def mark_eod_done(session_day: date | None = None) -> None:
 
 def reset_eod_flags_for_tests() -> None:
     """Test helper — clear in-process EOD / carry-review / BOOK day sets."""
+    global _boot_flatten_open
     _eod_flatten_dates.clear()
     _carry_review_dates.clear()
     _eod_book_dates.clear()
+    _boot_flatten_open = False
     try:
         virtual_broker.reset_book_for_tests()
     except Exception:
         pass
+
+
+def note_open_book_at_boot() -> int:
+    """If the book is open at process start, page once and arm a clean-mark close.
+
+    Does not sell here. The first exit or scan pass that sees a two-sided
+    option quote closes the lot as BOOT_FLATTEN. A missing quote stays open.
+    """
+    global _boot_flatten_open
+    try:
+        from tracker_agent import load_active_trades
+        trades = load_active_trades() or []
+    except Exception as exc:
+        print(f"[boot] open-book read failed: {exc}")
+        return 0
+    trades = [t for t in trades if isinstance(t, dict) and t.get("ticker")]
+    if not trades:
+        return 0
+    _boot_flatten_open = True
+    labels = ", ".join(_fmt_contract_label(t) for t in trades[:8])
+    msg = (
+        f"🚨 **CRITICAL: OPEN AT BOOT** {len(trades)} position(s) "
+        f"will close at the first clean option mark. {labels}"
+    )
+    print(f"[boot] {msg}")
+    try:
+        import broadcaster
+        broadcaster.send_discord_alert(msg, critical=True)
+    except Exception as exc:
+        print(f"[boot] CRITICAL send failed: {exc}")
+    return len(trades)
+
+
+def _clean_option_mid(mark_info: dict[str, Any] | None) -> float | None:
+    """Mid only when both bid and ask are live. Last-price is not a clean mark."""
+    if not isinstance(mark_info, dict):
+        return None
+    bid = _f(mark_info.get("bid"))
+    ask = _f(mark_info.get("ask"))
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        return None
+    return round((bid + ask) / 2.0, 4)
 
 
 def eod_book_already_done(session_day: date | None = None) -> bool:
@@ -176,6 +233,23 @@ def maybe_emit_eod_book(now_cdt: datetime | None = None) -> str | None:
     print(f"[Exits] {line}")
     if session_line:
         print(f"[Exits] {session_line}")
+    day = now.date().isoformat()
+    stored = False
+    if session_line:
+        try:
+            import reliability
+            if reliability.session_line_exists(day):
+                stored = True
+            else:
+                stored = bool(reliability.persist_session_line(session_line))
+        except Exception as exc:
+            print(f"[Exits] SESSION persist failed: {exc}")
+            stored = False
+        if not stored:
+            print(
+                f"[Exits] SESSION for {day} not in the database — will retry"
+            )
+            return None
     try:
         import broadcaster
         payload = line if not session_line else f"{line}\n{session_line}"
@@ -184,13 +258,10 @@ def maybe_emit_eod_book(now_cdt: datetime | None = None) -> str | None:
         print(f"[Exits] BOOK Discord warn: {e}")
         delivered = False
     if not delivered:
-        # Leave the day unlatched so the next pass retries. A failed send
-        # must not be the only copy of the session record.
         print(
-            f"[Exits] BOOK/SESSION for {now.date().isoformat()} "
-            "not delivered — will retry"
+            f"[Exits] BOOK/SESSION for {day} not delivered — queued, "
+            "the database row stands"
         )
-        return None
     mark_eod_book_done(now.date())
     return line
 
@@ -243,19 +314,17 @@ def evaluate_exit_reason_for_mark(
     options_dict: dict[str, Any] | None = None,
 ) -> tuple[str | None, float | None]:
     """
-    Shared exit decision for scan exits and morning carry review.
+    Shared exit decision for scan exits.
 
-    EOD is selective: only cal_dte < CARRY_MIN_DTE is forced flat.
-    Morning carry review typically sets include_time_stop=False.
+    EOD flattens every open contract, any DTE. CARRY_MIN_DTE is not consulted.
+    Morning carry review, if a test calls it, sets include_time_stop=False.
     THESIS_VOID fires after SL/TP (so a hit target still banks) and
     before B5 path rules. It requires a clean score and two consecutive
     clean prints below THESIS_EXIT_SCORE. SL/TP/expiry always run.
     """
     entry = _entry_premium(trade)
     exp_d = _parse_exp_date(_trade_expiration(trade))
-    cal_dte = (exp_d - sess).days if exp_d is not None else None
     is_0dte = exp_d is not None and exp_d == sess
-    carry_min = _carry_min_dte()
 
     # An expired contract settles at intrinsic from the underlying close
     # on the expiration date. A stale option mark is not that fill.
@@ -263,9 +332,9 @@ def evaluate_exit_reason_for_mark(
         return "EXPIRED", None
 
     # Forced flatten needs the contract's own mark. A missing quote is an
-    # unresolved settlement — entry premium is not a fill.
+    # unresolved settlement — entry premium is not a fill. Every DTE flattens.
     kind = None
-    if do_eod and cal_dte is not None and cal_dte < carry_min:
+    if do_eod:
         kind = "EOD_FLATTEN"
     elif is_0dte and is_zero_dte_flatten_window(now):
         kind = "ZERO_DTE_FLATTEN"
@@ -1610,6 +1679,7 @@ def run_scan_exits(
     MARK_FAIL_ALERT_STREAK consecutive failures (default 2), and if zero
     marks while any positions are open.
     """
+    global _boot_flatten_open
     summary: dict[str, Any] = {
         "closed": [],
         "marks_recorded": 0,
@@ -1766,20 +1836,29 @@ def run_scan_exits(
                 except Exception:
                     pass
 
-        # B1 selective EOD (cal_dte < CARRY_MIN_DTE only), C-D 0DTE, B2–B5
-        # TIME_STOP uses live_score or last_live_score; exempt if >= TIME_STOP_SCORE_EXEMPT
+        # B1 flatten-all at the Chicago EOD clock, C-D 0DTE, B2–B5.
+        # A book found open at boot closes on the first two-sided quote
+        # outside that window. TIME_STOP still exempts a live score >= 80.
         trade.pop("_time_stop_skip_log", None)
-        reason, exit_px = evaluate_exit_reason_for_mark(
-            trade,
-            mark,
-            sess=sess,
-            now=now,
-            include_time_stop=True,
-            do_eod=do_eod,
-            live_score=live_score,
-            card=card,
-            options_dict=options_dict,
-        )
+        boot_close = False
+        reason, exit_px = None, None
+        if _boot_flatten_open and not do_eod:
+            clean = _clean_option_mid(mark_info)
+            if clean is not None:
+                reason, exit_px = "BOOT_FLATTEN", clean
+                boot_close = True
+        if not boot_close:
+            reason, exit_px = evaluate_exit_reason_for_mark(
+                trade,
+                mark,
+                sess=sess,
+                now=now,
+                include_time_stop=True,
+                do_eod=do_eod,
+                live_score=live_score,
+                card=card,
+                options_dict=options_dict,
+            )
         forced_unresolved = (
             reason in (
                 "EOD_FLATTEN",
@@ -1848,6 +1927,12 @@ def run_scan_exits(
             closed["underlying_line"] = line
         if closed.get("ok") and closed.get("removed", True):
             summary["closed"].append(closed)
+            if reason == "EOD_FLATTEN":
+                try:
+                    import carry_shadow
+                    carry_shadow.record_flatten(trade, closed, now.date())
+                except Exception as shadow_err:
+                    print(f"[shadow] record warn {ticker}: {shadow_err}")
         else:
             summary.setdefault("close_failed", []).append(ticker)
             print(
@@ -1861,7 +1946,7 @@ def run_scan_exits(
     elif do_eod and summary.get("eod_unresolved"):
         print(
             "[Exits] EOD flatten incomplete — day not latched; "
-            "unpriced short-dated lots stay open for the next pass"
+            "unpriced lots stay open for the next pass"
         )
 
     # Zero marks while book is open → fleet-wide CRITICAL
@@ -1883,6 +1968,8 @@ def run_scan_exits(
         summary["open_after"] = len(load_active_trades())
     except Exception:
         summary["open_after"] = None
+    if _boot_flatten_open and summary.get("open_after") == 0:
+        _boot_flatten_open = False
 
     n_closed = len(summary["closed"])
     n_ts_skip = len(summary["time_stop_skipped"])
@@ -1891,8 +1978,7 @@ def run_scan_exits(
         f"[Exits] marks: checked={summary['positions_checked']} "
         f"ok={summary['marks_ok']} failed={summary['marks_failed']} "
         f"closed={n_closed} time_stop_skipped={n_ts_skip} "
-        f"eod={summary['eod_triggered']} "
-        f"carry_min_dte={_carry_min_dte()} "
+        f"eod={summary['eod_triggered']} flatten=all "
         f"open {summary['open_before']}→{summary['open_after']}"
     )
     print(mark_line)

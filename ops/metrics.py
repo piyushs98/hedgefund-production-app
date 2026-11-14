@@ -8,9 +8,12 @@ because that is what the stop is measured from.
 from __future__ import annotations
 
 import json
+import random
 import sqlite3
+import statistics
 from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -19,6 +22,16 @@ from ops.store import connect_ro, table_columns, table_count, table_names
 
 CHICAGO = ZoneInfo("America/Chicago")
 MULTIPLIER = 100
+
+# Headline figures use this stamp and drop excluded_from_measurement=y.
+# Oct 2 posted v7a25760. v9c3cc4d closed on 2026-11-13 and is its own section.
+# MEASURED_VERSION matches fill_accounting.TRADING_STAMP. Set with the pin.
+MEASURED_VERSION = "vec40b2a"
+PRIOR_MEASURED_VERSION = "v9c3cc4d"
+OCT2_VERSION = "v7a25760"
+REGIME_MOVE = 0.005
+BOOTSTRAP_DRAWS = 10000
+BOOTSTRAP_SEED = 0x9C3CC4D
 
 # Pre-registered bars. Printed beside the sample. Not a live knob.
 BARS = {
@@ -204,6 +217,12 @@ def load_closed_trades(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             "fill_est": bool(row.get("fill_est")),
             "trade_id": str(meta.get("trade_id") or "") or None,
             "meta": meta,
+            "entry_score": _f(meta.get("entry_score")),
+            "version": str(meta.get("version") or "") or None,
+            "carried": _carried_flag(
+                meta.get("entry_timestamp") or meta.get("entry_time"),
+                chicago_date(row.get("closed_at")),
+            ),
         })
     closed.sort(key=lambda t: (str(t.get("closed_at") or ""), t.get("id") or 0))
     return closed
@@ -321,11 +340,13 @@ def load_sessions(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def mfe_capture(trades: list[dict[str, Any]], marks: list[dict[str, Any]]) -> dict[str, Any]:
-    """Mean of fill P&L / peak mid excursion, for trades whose peak is > 0.
+    """Sum of fill P&L over sum of peak dollars, plus the median trade ratio.
 
     Peak uses position_marks.pnl_pct (percent of entry) and the close mid
     print, matching the MFE on the TRADE line. Marks are mid. Fill P&L is
-    the ask/bid series. Trades with no positive peak are left out of the mean.
+    the ask/bid series. Trades with no positive peak stay out of both figures.
+    The ratio is one number for the whole set. The median is the middle
+    per-trade ratio (the average of the two middle ratios when the count is even).
     """
     by_id: dict[str, list[float]] = defaultdict(list)
     for mark in marks:
@@ -333,7 +354,9 @@ def mfe_capture(trades: list[dict[str, Any]], marks: list[dict[str, Any]]) -> di
         pct = _f(mark.get("pnl_pct"))
         if tid and pct is not None:
             by_id[tid].append(pct)
-    captures = []
+    ratios = []
+    pnl_sum = 0.0
+    peak_sum = 0.0
     missing = 0
     nonpositive = 0
     for trade in trades:
@@ -354,13 +377,19 @@ def mfe_capture(trades: list[dict[str, Any]], marks: list[dict[str, Any]]) -> di
         if mfe_dollars <= 1e-9 or pnl_fill is None:
             missing += 1
             continue
-        captures.append(pnl_fill / mfe_dollars)
-    mean = sum(captures) / len(captures) if captures else None
+        ratios.append(pnl_fill / mfe_dollars)
+        pnl_sum += float(pnl_fill)
+        peak_sum += mfe_dollars
+    ratio = (pnl_sum / peak_sum) if peak_sum > 1e-9 else None
+    median = statistics.median(ratios) if ratios else None
     return {
-        "mean": mean,
-        "n": len(captures),
+        "ratio": ratio,
+        "median": median,
+        "n": len(ratios),
         "missing": missing,
         "nonpositive": nonpositive,
+        "pnl_fill": pnl_sum if ratios else None,
+        "peak_dollars": peak_sum if ratios else None,
     }
 
 
@@ -405,13 +434,483 @@ def _gap_excluded(trade: dict[str, Any]) -> bool:
     return str(meta.get("excluded_from_measurement") or "").lower() == "y"
 
 
-def summarize(news_path, hedge_path, open_debit: float = 0.0) -> dict[str, Any]:
+def _carried_flag(entry_raw: Any, close_day) -> str | None:
+    entry_day = chicago_date(entry_raw)
+    if entry_day is None or close_day is None:
+        return None
+    return "y" if entry_day != close_day else "n"
+
+
+def _cp(direction: Any) -> str:
+    text = str(direction or "").upper()
+    if "PUT" in text or text == "P":
+        return "P"
+    if "CALL" in text or text == "C":
+        return "C"
+    return ""
+
+
+def _strike_key(val: Any) -> str:
+    number = _f(val)
+    if number is None:
+        return str(val or "")
+    if abs(number - round(number)) < 1e-9:
+        return str(int(round(number)))
+    return f"{number:g}"
+
+
+def _hhmm_chicago(raw: Any) -> str | None:
+    dt = parse_dt(raw)
+    if dt is None:
+        return None
+    return dt.astimezone(CHICAGO).strftime("%H:%M")
+
+
+def _minute_distance(left: str | None, right: str | None) -> int:
+    def mins(text: str | None) -> int | None:
+        if not text or ":" not in text:
+            return None
+        hour, minute = text.split(":", 1)
+        try:
+            return int(hour) * 60 + int(minute)
+        except ValueError:
+            return None
+    a = mins(left)
+    b = mins(right)
+    if a is None or b is None:
+        return 10_000
+    return abs(a - b)
+
+
+def _trade_match_key(trade: dict[str, Any]) -> tuple:
+    day = trade.get("session_date")
+    return (
+        day.isoformat() if day is not None else "",
+        str(trade.get("ticker") or ""),
+        _cp(trade.get("direction")),
+        _strike_key(trade.get("strike")),
+        str(trade.get("expiration") or "")[:10],
+        str(int(trade.get("qty") or 0)),
+        str(trade.get("reason") or ""),
+    )
+
+
+def _read_trade_stamps(logs_dir) -> list[dict[str, Any]]:
+    """Posted TRADE lines. Read-only. Version lives on the line, not in SQLite."""
+    path = Path(logs_dir) if logs_dir else None
+    if path is None or not path.is_dir():
+        return []
+    stamps = []
+    seen = set()
+    for file in sorted(path.glob("bot-*.log")):
+        try:
+            handle = file.open(errors="replace")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                idx = line.find("TRADE|")
+                if idx < 0:
+                    continue
+                parts = line[idx:].strip().split("|")
+                if len(parts) < 15 or parts[0] != "TRADE":
+                    continue
+                qty_raw = parts[7]
+                if qty_raw.startswith("qty"):
+                    qty_raw = qty_raw[3:]
+                qty_num = _f(qty_raw)
+                qty_key = str(int(qty_num)) if qty_num is not None else qty_raw
+                stamp = {
+                    "version": parts[1],
+                    "exit_hhmm": parts[11],
+                    "excluded": any(
+                        piece.strip() == "excluded_from_measurement=y" for piece in parts
+                    ),
+                    "key": (
+                        parts[2],
+                        parts[3],
+                        parts[4],
+                        _strike_key(parts[5]),
+                        parts[6][:10],
+                        qty_key,
+                        parts[14],
+                    ),
+                }
+                identity = (stamp["version"], stamp["key"], stamp["exit_hhmm"], stamp["excluded"])
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                stamps.append(stamp)
+    return stamps
+
+
+def attach_trade_stamps(trades: list[dict[str, Any]], logs_dir) -> dict[str, int]:
+    """Copy version from the posted TRADE line onto the matching closed row."""
+    stamps = _read_trade_stamps(logs_dir)
+    buckets: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
+    for stamp in stamps:
+        buckets[stamp["key"]].append(stamp)
+    used: set[int] = set()
+    matched = 0
+    for trade in trades:
+        choices = [
+            stamp for stamp in buckets.get(_trade_match_key(trade), [])
+            if id(stamp) not in used
+        ]
+        if not choices:
+            continue
+        target = _hhmm_chicago(trade.get("closed_at"))
+        choices.sort(key=lambda stamp: _minute_distance(target, stamp["exit_hhmm"]))
+        best = choices[0]
+        used.add(id(best))
+        trade["version"] = best["version"]
+        if best["excluded"]:
+            meta = trade.get("meta")
+            if isinstance(meta, dict):
+                meta["excluded_from_measurement"] = "y"
+        matched += 1
+    return {
+        "matched": matched,
+        "stamp_rows": len(stamps),
+        "unmatched_stamps": len(stamps) - matched,
+    }
+
+
+def _session_row(parts: list[str]) -> dict[str, Any] | None:
+    if len(parts) < 15 or parts[0] != "SESSION":
+        return None
+    return {
+        "version": parts[1],
+        "date": parts[2],
+        "spy_open": _field_number(parts[13]),
+        "spy_close": _field_number(parts[14]),
+    }
+
+
+def load_session_lines(logs_dir, news: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
+    """SESSION lines from the log, plus any database row the log does not have.
+
+    The database row is written whether or not Discord accepts the line.
+    A date already parsed from the log is left as the log recorded it.
+    """
+    path = Path(logs_dir) if logs_dir else None
+    by_date: dict[str, dict[str, Any]] = {}
+    if path is not None and path.is_dir():
+        for file in sorted(path.glob("bot-*.log")):
+            try:
+                handle = file.open(errors="replace")
+            except OSError:
+                continue
+            with handle:
+                for line in handle:
+                    idx = line.find("SESSION|")
+                    if idx < 0:
+                        continue
+                    parts = line[idx:].strip().split("|")
+                    row = _session_row(parts)
+                    if row is None:
+                        continue
+                    by_date[row["date"]] = row
+    if news is not None and "session_lines" in table_names(news):
+        for stored in _select(news, "session_lines", ["session_date", "line"]):
+            text = str(stored.get("line") or "")
+            row = _session_row(text.split("|"))
+            if row is None or row["date"] in by_date:
+                continue
+            by_date[row["date"]] = row
+    return [by_date[day] for day in sorted(by_date)]
+
+
+def _field_number(raw: str) -> float | None:
+    bits = str(raw).split()
+    if len(bits) < 2:
+        return None
+    return _f(bits[-1])
+
+
+def classify_regime(spy_open: float | None, spy_close: float | None) -> str | None:
+    """|change| >= 0.5% is trend up or trend down. Otherwise chop."""
+    if spy_open is None or spy_close is None or spy_open <= 0:
+        return None
+    change = (spy_close - spy_open) / spy_open
+    if change >= REGIME_MOVE:
+        return "trend_up"
+    if change <= -REGIME_MOVE:
+        return "trend_down"
+    return "chop"
+
+
+def _hold_bucket(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    r_vals = [t["r_fill"] for t in trades if t.get("r_fill") is not None]
+    return {
+        "n": len(trades),
+        "n_r": len(r_vals),
+        "pnl_fill": sum((t.get("pnl_fill") or 0.0) for t in trades),
+        "mean_r": (sum(r_vals) / len(r_vals)) if r_vals else None,
+    }
+
+
+def hold_split(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    groups: dict[str, list[dict[str, Any]]] = {
+        "same_day": [],
+        "carried": [],
+        "unknown": [],
+    }
+    for trade in trades:
+        flag = trade.get("carried")
+        if flag == "y":
+            groups["carried"].append(trade)
+        elif flag == "n":
+            groups["same_day"].append(trade)
+        else:
+            groups["unknown"].append(trade)
+    return {name: _hold_bucket(rows) for name, rows in groups.items()}
+
+
+def regime_table(
+    sessions: list[dict[str, Any]], trades: list[dict[str, Any]], version: str
+) -> dict[str, Any]:
+    """Class measured SESSION lines and attach that day's closed-trade P&L."""
+    posted = {}
+    for row in sessions:
+        if row.get("version") != version:
+            continue
+        posted[row["date"]] = row
+    classes = {"trend_up": [], "trend_down": [], "chop": []}
+    changes = {}
+    for day in sorted(posted):
+        row = posted[day]
+        label = classify_regime(row.get("spy_open"), row.get("spy_close"))
+        if label is None:
+            continue
+        classes[label].append(day)
+        op = row.get("spy_open")
+        cl = row.get("spy_close")
+        changes[day] = (cl - op) / op if op else None
+    by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for trade in trades:
+        day = trade.get("session_date")
+        if day is not None:
+            by_day[day.isoformat()].append(trade)
+
+    def pack(dates: list[str]) -> dict[str, Any]:
+        rows = [trade for day in dates for trade in by_day.get(day, [])]
+        bucket = _hold_bucket(rows)
+        bucket["sessions"] = len(dates)
+        bucket["dates"] = [
+            {"date": day, "change": changes.get(day)} for day in dates
+        ]
+        return bucket
+
+    classed = set(posted)
+    missing = sorted(day for day in by_day if day not in classed)
+    table = {name: pack(dates) for name, dates in classes.items()}
+    table["no_session_line"] = pack(missing)
+    return table
+
+
+def daily_pnls(trades: list[dict[str, Any]]) -> list[float]:
+    by_day: dict[Any, float] = defaultdict(float)
+    for trade in trades:
+        day = trade.get("session_date")
+        if day is None:
+            continue
+        by_day[day] += trade.get("pnl_fill") or 0.0
+    return [by_day[day] for day in sorted(by_day)]
+
+
+def day_block_expectancy(
+    trades: list[dict[str, Any]],
+    *,
+    draws: int = BOOTSTRAP_DRAWS,
+    seed: int = BOOTSTRAP_SEED,
+) -> dict[str, Any] | None:
+    """90% interval for mean R. Resample close-dates, then pool the trades.
+
+    The point expectancy is the mean R of every trade. A resample draws the
+    session count with replacement and takes the mean R of the trades on
+    the drawn dates, so a day with more trades keeps more weight.
+    """
+    blocks: dict[Any, list[float]] = defaultdict(list)
+    for trade in trades:
+        day = trade.get("session_date")
+        r_fill = trade.get("r_fill")
+        if day is None or r_fill is None:
+            continue
+        blocks[day].append(r_fill)
+    days = [blocks[day] for day in sorted(blocks)]
+    if not days:
+        return None
+    rng = random.Random(seed)
+    n_days = len(days)
+    stats = []
+    for _ in range(draws):
+        picked = [days[rng.randrange(n_days)] for _ in range(n_days)]
+        values = [r for block in picked for r in block]
+        if values:
+            stats.append(sum(values) / len(values))
+    if not stats:
+        return None
+    cuts = statistics.quantiles(stats, n=20, method="inclusive")
+    return {
+        "low": cuts[0],
+        "high": cuts[-1],
+        "draws": draws,
+        "seed": seed,
+        "sessions": n_days,
+        "trades": sum(len(block) for block in days),
+    }
+
+
+def score_groups(trades: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """all, 80+, and 70–79. A missing score is counted and left out of both buckets."""
+    hi: list[dict[str, Any]] = []
+    mid: list[dict[str, Any]] = []
+    other: list[dict[str, Any]] = []
+    for trade in trades:
+        score = trade.get("entry_score")
+        if score is None:
+            other.append(trade)
+        elif score >= 80:
+            hi.append(trade)
+        elif score >= 70:
+            mid.append(trade)
+        else:
+            other.append(trade)
+    return {"all": list(trades), "80+": hi, "70-79": mid, "other": other}
+
+
+def headline_metrics(
+    trades: list[dict[str, Any]],
+    session_lines: list[dict[str, Any]],
+    marks: list[dict[str, Any]],
+    seed: float | None,
+    version: str,
+) -> dict[str, Any]:
+    """The report headlines for one set of closes. Seed is the account seed."""
+    r_vals = [t["r_fill"] for t in trades if t.get("r_fill") is not None]
+    pf = profit_factor(trades)
+    gross_wins = sum(t["pnl_fill"] for t in trades if (t.get("pnl_fill") or 0) > 0)
+    gross_losses = sum(-(t["pnl_fill"] or 0) for t in trades if (t.get("pnl_fill") or 0) < 0)
+    fill_sum = sum(t["pnl_fill"] or 0.0 for t in trades)
+    mid_sum = sum(t["pnl_mid"] or 0.0 for t in trades)
+    dd_dollars, dd_pct = (None, None)
+    dd_daily_dollars, dd_daily_pct = (None, None)
+    if trades and seed is not None and seed > 0:
+        dd_dollars, dd_pct = max_drawdown(
+            [t["pnl_fill"] or 0.0 for t in trades], seed
+        )
+        dd_daily_dollars, dd_daily_pct = max_drawdown(daily_pnls(trades), seed)
+    spreads = [t["entry_spread_pct"] for t in trades if t.get("entry_spread_pct") is not None]
+    stops = [t["stop_slippage_pct"] for t in trades if t.get("stop_slippage_pct") is not None]
+    by_reason: dict[str, dict[str, float]] = {}
+    for trade in trades:
+        bucket = by_reason.setdefault(
+            trade["reason"], {"n": 0, "pnl_fill": 0.0, "r_sum": 0.0, "r_n": 0}
+        )
+        bucket["n"] += 1
+        bucket["pnl_fill"] += trade["pnl_fill"] or 0.0
+        if trade.get("r_fill") is not None:
+            bucket["r_sum"] += trade["r_fill"]
+            bucket["r_n"] += 1
+    return {
+        "n": len(trades),
+        "n_with_r": len(r_vals),
+        "n_missing_risk": len(trades) - len(r_vals),
+        "expectancy_r": (sum(r_vals) / len(r_vals)) if r_vals else None,
+        "expectancy_ci": day_block_expectancy(trades),
+        "profit_factor": pf,
+        "gross_wins": gross_wins,
+        "gross_losses": gross_losses,
+        "no_losses": gross_losses <= 1e-9,
+        "max_dd_dollars": dd_dollars,
+        "max_dd_pct": dd_pct,
+        "max_dd_daily_dollars": dd_daily_dollars,
+        "max_dd_daily_pct": dd_daily_pct,
+        "mfe": mfe_capture(trades, marks),
+        "entry_spread_pct": (sum(spreads) / len(spreads)) if spreads else None,
+        "n_entry_spread": len(spreads),
+        "stop_slippage_pct": (sum(stops) / len(stops)) if stops else None,
+        "n_stop_slippage": len(stops),
+        "fill_est": sum(1 for t in trades if t.get("fill_est")),
+        "realized_fill": fill_sum,
+        "realized_mid": mid_sum,
+        "spread_cost": mid_sum - fill_sum,
+        "by_reason": by_reason,
+        "regimes": regime_table(session_lines, trades, version),
+        "hold": hold_split(trades),
+    }
+
+
+def _buckets_for(
+    trades: list[dict[str, Any]],
+    session_lines: list[dict[str, Any]],
+    marks: list[dict[str, Any]],
+    seed: float | None,
+    version: str,
+) -> dict[str, Any]:
+    groups = score_groups(trades)
+    out = {
+        key: headline_metrics(groups[key], session_lines, marks, seed, version)
+        for key in ("all", "80+", "70-79")
+    }
+    out["unscored"] = len(groups["other"])
+    return out
+
+
+def load_carry_shadow(conn: sqlite3.Connection | None) -> list[dict[str, Any]]:
+    if conn is None or "carry_shadow" not in table_names(conn):
+        return []
+    return _select(
+        conn,
+        "carry_shadow",
+        [
+            "ticker", "entry_score", "flatten_on", "next_session", "status",
+            "flatten_pnl", "flatten_r", "shadow_reason", "shadow_pnl", "shadow_r",
+        ],
+    )
+
+
+def _sample_side(trades: list[dict[str, Any]], sessions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Oct 2 headline. The session line supplies spy_open and spy_close."""
+    bucket = _hold_bucket(trades)
+    row = next((s for s in sessions if s.get("version") == OCT2_VERSION), None)
+    change = None
+    label = None
+    if row is not None:
+        label = classify_regime(row.get("spy_open"), row.get("spy_close"))
+        opened = row.get("spy_open")
+        closed = row.get("spy_close")
+        if opened:
+            change = (closed - opened) / opened
+    bucket["spy_open"] = None if row is None else row.get("spy_open")
+    bucket["spy_close"] = None if row is None else row.get("spy_close")
+    bucket["change"] = change
+    bucket["regime"] = label
+    bucket["date"] = None if row is None else row.get("date")
+    return bucket
+
+
+def summarize(news_path, hedge_path, open_debit: float = 0.0, logs_dir=None) -> dict[str, Any]:
     news = connect_ro(news_path)
     hedge = connect_ro(hedge_path)
     try:
         loaded = load_closed_trades(news) if news is not None else []
+        stamps = attach_trade_stamps(loaded, logs_dir)
+        session_lines = load_session_lines(logs_dir, news)
         excluded = [t for t in loaded if _gap_excluded(t)]
-        trades = [t for t in loaded if not _gap_excluded(t)]
+        kept = [t for t in loaded if not _gap_excluded(t)]
+        trades = [t for t in kept if t.get("version") == MEASURED_VERSION]
+        if PRIOR_MEASURED_VERSION == MEASURED_VERSION:
+            prior = []
+        else:
+            prior = [t for t in kept if t.get("version") == PRIOR_MEASURED_VERSION]
+        oct2 = [t for t in kept if t.get("version") == OCT2_VERSION]
+        other = [
+            t for t in kept
+            if t.get("version") not in (None, "", MEASURED_VERSION, OCT2_VERSION)
+        ]
+        unstamped = [t for t in kept if not t.get("version")]
         marks = load_marks(news) if news is not None else []
         markers = load_open_markers(news) if news is not None else []
         ledger = load_ledger(news) if news is not None else None
@@ -439,10 +938,12 @@ def summarize(news_path, hedge_path, open_debit: float = 0.0) -> dict[str, Any]:
         if bp is not None:
             seed = bp - realized_mid_ledger + float(open_debit)
         dd_dollars, dd_pct = (None, None)
+        dd_daily_dollars, dd_daily_pct = (None, None)
         if seed is not None and seed > 0:
             dd_dollars, dd_pct = max_drawdown(
                 [t["pnl_fill"] or 0.0 for t in trades], seed
             )
+            dd_daily_dollars, dd_daily_pct = max_drawdown(daily_pnls(trades), seed)
         spreads = [t["entry_spread_pct"] for t in trades if t.get("entry_spread_pct") is not None]
         stops = [t["stop_slippage_pct"] for t in trades if t.get("stop_slippage_pct") is not None]
         by_reason: dict[str, dict[str, float]] = {}
@@ -472,8 +973,26 @@ def summarize(news_path, hedge_path, open_debit: float = 0.0) -> dict[str, Any]:
             "no_losses": gross_losses <= 1e-9,
             "max_dd_dollars": dd_dollars,
             "max_dd_pct": dd_pct,
+            "max_dd_daily_dollars": dd_daily_dollars,
+            "max_dd_daily_pct": dd_daily_pct,
             "seed": seed,
             "mfe": mfe,
+            "expectancy_ci": day_block_expectancy(trades),
+            "regimes": regime_table(session_lines, trades, MEASURED_VERSION),
+            "hold": hold_split(trades),
+            "buckets": _buckets_for(trades, session_lines, marks, seed, MEASURED_VERSION),
+            "prior_version": PRIOR_MEASURED_VERSION,
+            "n_prior": len(prior),
+            "prior_buckets": _buckets_for(
+                prior, session_lines, marks, seed, PRIOR_MEASURED_VERSION
+            ),
+            "carry_shadow": load_carry_shadow(news),
+            "n_oct2": len(oct2),
+            "oct2": _sample_side(oct2, session_lines),
+            "n_unstamped": len(unstamped),
+            "n_other": len(other),
+            "other_versions": sorted({str(t.get("version")) for t in other}),
+            "stamps": stamps,
             "entry_spread_pct": (sum(spreads) / len(spreads)) if spreads else None,
             "n_entry_spread": len(spreads),
             "stop_slippage_pct": (sum(stops) / len(stops)) if stops else None,

@@ -283,20 +283,27 @@ class TestEodDeliveryAndFlatBook(unittest.TestCase):
         self.cfg_patch.stop()
         self.tmp.cleanup()
 
-    def test_failed_discord_does_not_latch_the_day(self):
+    def test_failed_discord_still_stores_the_session_line(self):
         when = datetime(2026, 8, 20, 14, 45, 0)
         with mock.patch("tracker_agent.load_active_trades", return_value=[]):
             with mock.patch("broadcaster.send_discord_alert", return_value=False):
-                missed = position_exits.maybe_emit_eod_book(when)
-            self.assertIsNone(missed)
-            self.assertFalse(position_exits.eod_book_already_done(date(2026, 8, 20)))
-            with mock.patch("broadcaster.send_discord_alert", return_value=True):
-                sent = position_exits.maybe_emit_eod_book(when)
+                stored = position_exits.maybe_emit_eod_book(when)
+            self.assertIsNotNone(stored)
+            self.assertTrue(position_exits.eod_book_already_done(date(2026, 8, 20)))
+            import sqlite3
+            with sqlite3.connect(self.db) as conn:
+                row = conn.execute(
+                    "SELECT line FROM session_lines WHERE session_date=?",
+                    ("2026-08-20",),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertTrue(str(row[0]).startswith("SESSION|"))
+            with mock.patch("broadcaster.send_discord_alert", return_value=True) as again_send:
                 again = position_exits.maybe_emit_eod_book(
                     datetime(2026, 8, 20, 14, 50, 0)
                 )
-        self.assertIsNotNone(sent)
         self.assertIsNone(again)
+        again_send.assert_not_called()
 
     def test_flat_exit_pass_asks_for_the_book_line(self):
         from midday_delta import run_exit_only_pass

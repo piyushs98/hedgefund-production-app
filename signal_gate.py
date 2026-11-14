@@ -405,6 +405,26 @@ class SignalGate:
         # Rank by conviction (score DESC), stable tie-break by ticker name
         eligible.sort(key=lambda x: (-x[2], x[0]))
 
+        # Scores and streaks above already ran. Late session and early-close
+        # days admit nothing. The block is not a prefilter, so streaks stay.
+        try:
+            import session_clock
+            admit_block = session_clock.admit_block(now)
+        except Exception:
+            admit_block = None
+        if admit_block:
+            if not eligible:
+                print(f"[Gate] admits closed: {admit_block}")
+            for ticker, direction, score, _pre in eligible:
+                decisions[ticker] = GateDecision(
+                    ticker=ticker,
+                    admit=False,
+                    reason=admit_block,
+                    score=score,
+                    direction=direction,
+                )
+            eligible = []
+
         for rank, (ticker, direction, score, _pre) in enumerate(eligible, start=1):
             dec = self._try_admit(
                 ticker, direction, score, now, closed_this_scan=closed_set
@@ -465,6 +485,8 @@ class SignalGate:
 
 def _compact_reason(reason: str) -> str:
     r = (reason or "").lower().strip()
+    if r in ("late_session", "early_close"):
+        return r
     # Exact data-failure tags from scorer block_reason (must stay distinct)
     if r in (
         "no_liq_data",
