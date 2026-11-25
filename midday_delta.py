@@ -952,6 +952,13 @@ def _finish_market_pass(kind: str) -> None:
         reliability.ping_heartbeat(kind)
     except Exception as exc:
         print(f"[heartbeat] {kind} ping warn: {exc}")
+    try:
+        import reliability
+        if kind == "exit":
+            reliability.note_exit_pass(_as_chicago())
+        reliability.seal_ledger()
+    except Exception as exc:
+        print(f"[session] {kind} mark failed: {exc}")
 
 
 def _shadow_note_open(ticker: str, direction, score) -> None:
@@ -1181,6 +1188,12 @@ def run_thirty_min_scan(
     # ---- Stage 4: exits, then gate sync ----
     # Overnight carry is retired. Mark and close the open book before admits
     # so the gate sees the book after exits. Same options_dict, no extra fetch.
+    # This is an exit pass for the clean-session gap, including a flat book.
+    try:
+        import reliability
+        reliability.note_exit_pass(_as_chicago())
+    except Exception as mark_err:
+        print(f"[session] scan exit mark failed: {mark_err}")
     exit_summary: dict[str, Any] = {}
     try:
         import position_exits
@@ -1571,6 +1584,11 @@ def run_thirty_min_scan(
         gate_summary=gate_summary,
     )
     print(f"✅ 30-MIN SCAN {scan_id} complete | discord={ok} | telemetry={len(bullets)}")
+    try:
+        import reliability
+        reliability.note_completed_scan(_as_chicago(), chains_fetched, len(universe))
+    except Exception as mark_err:
+        print(f"[session] scan mark failed: {mark_err}")
     _finish_market_pass("scan")
     return result
 

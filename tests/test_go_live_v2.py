@@ -464,8 +464,14 @@ class TestReliability(unittest.TestCase):
                 reliability.flush_discord_outbox()
         self.assertEqual(fa._session["criticals"], 1)
         with sqlite3.connect(self.db) as conn:
-            left = conn.execute("SELECT COUNT(*) FROM discord_outbox").fetchone()[0]
-        self.assertEqual(left, 0)
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM discord_outbox WHERE delivered_at IS NULL"
+            ).fetchone()[0]
+            stamped = conn.execute(
+                "SELECT delivered_at FROM discord_outbox"
+            ).fetchone()[0]
+        self.assertEqual(pending, 0)
+        self.assertTrue(stamped)
         fa.reset_session_for_tests()
 
     def test_criticals_leave_ahead_of_older_messages(self):
@@ -493,6 +499,46 @@ class TestReliability(unittest.TestCase):
                 )
             ]
         self.assertEqual(left, ["CRITICAL: mark failed", "ordinary scan note"])
+
+    def test_confirmed_row_keeps_delivered_at_and_is_not_resent(self):
+        import reliability
+
+        reliability.enqueue_discord(["CRITICAL: mark failed"], critical=True)
+        calls = []
+
+        def _post(url, json=None, timeout=None):
+            calls.append(json["content"])
+            return mock.Mock(status_code=204)
+
+        with mock.patch.dict(os.environ, {"DISCORD_WEBHOOK": "https://example.invalid/hook"}):
+            with mock.patch("requests.post", side_effect=_post):
+                reliability.flush_discord_outbox()
+                reliability.flush_discord_outbox()
+        self.assertEqual(calls, ["CRITICAL: mark failed"])
+        with sqlite3.connect(self.db) as conn:
+            row = conn.execute(
+                "SELECT critical, delivered_at FROM discord_outbox"
+            ).fetchone()
+        self.assertEqual(row[0], 1)
+        self.assertTrue(row[1])
+
+    def test_immediate_critical_records_delivered_at(self):
+        import broadcaster
+
+        with mock.patch.object(broadcaster, "WEBHOOK_URL", "https://example.invalid/hook"):
+            with mock.patch.object(broadcaster, "_post_chunk", return_value=True):
+                ok = broadcaster.send_discord_alert("CRITICAL: desk", critical=True)
+                ordinary = broadcaster.send_discord_alert("scan note", critical=False)
+        self.assertTrue(ok)
+        self.assertTrue(ordinary)
+        with sqlite3.connect(self.db) as conn:
+            rows = conn.execute(
+                "SELECT body, critical, delivered_at FROM discord_outbox"
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "CRITICAL: desk")
+        self.assertEqual(rows[0][1], 1)
+        self.assertTrue(rows[0][2])
 
     def test_battery_warning_is_once_per_session_and_not_critical(self):
         import reliability

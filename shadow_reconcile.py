@@ -9,6 +9,7 @@ score, the gate, a fill, or the 14:45 line.
 Trade counts and realized dollars come from that day's ledger.
 Scans, the SPY range, the critical count, and the feed tokens stay on
 the in-process snapshot because the ledger does not store them.
+The line ends with CLEAN yes, or CLEAN no and the failed clauses.
 Equity, buying power, open value, and peak deployed are the broker
 figures at reconciliation time.
 """
@@ -130,11 +131,13 @@ def _write(now, day: date) -> None:
     final = "SESSION_FINAL|" + line[len("SESSION|"):]
     if incomplete:
         final += "|incomplete=1"
+    final += "|" + reliability.clean_field(day)
     # Tags first. A stored complete row would skip a later retry, so a
     # tag failure must happen before that row exists.
     shadow_context.record_close_tags(day)
     if not reliability.persist_session_final(final, incomplete=incomplete):
         raise RuntimeError("SESSION_FINAL was not stored")
+    reliability.seal_ledger()
     print(f"[reconcile] {final}")
     _post(final, incomplete)
 

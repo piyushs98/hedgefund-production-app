@@ -152,6 +152,12 @@ def send_discord_alert(message, critical=False):
                 time.sleep(0.6)                    # gentle pacing between chunks
         if ok:
             print("[Broadcaster] Delivery complete.")
+            if critical:
+                try:
+                    import reliability
+                    reliability.note_delivered_critical(str(message))
+                except Exception as stamp_err:
+                    print(f"[Broadcaster] delivered stamp failed: {stamp_err}")
         else:
             print(
                 "[Broadcaster] ERROR: Delivery finished with errors after retries. "
