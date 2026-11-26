@@ -22,9 +22,11 @@ live SESSION already stored in the database.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -142,6 +144,46 @@ NETWORK_BLOCKED: list[str] = []
 DISCORD_PATH = ""
 LOG_PATH = ""
 SNAPSHOT: dict = {}
+CHAOS = None
+
+
+class Chaos:
+    """One fault window on a fresh copy of the session. None on the base run."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.high_slots = None
+        self.yahoo_down: list[tuple[time, time]] = []
+        self.yahoo_429: list[tuple[time, time]] = []
+        self.discord_down: list[tuple[time, time]] = []
+        self.discord_500: list[tuple[time, time]] = []
+        self.heartbeat_down: list[tuple[time, time]] = []
+        self.dark: list[tuple[time, time]] = []
+        self.spot_drop_after: time | None = None
+        self.crash_at: time | None = None
+        self.stop_at: time | None = None
+        self.keep_running_at_night = False
+        self.real_discord = False
+        self.start: datetime | None = None
+        self.delivered: list[str] = []
+
+
+def _local_time(moment: datetime) -> time:
+    return moment.astimezone(CHICAGO).time().replace(tzinfo=None)
+
+
+def _in_windows(moment: datetime, windows: list[tuple[time, time]]) -> bool:
+    if not windows:
+        return False
+    local = _local_time(moment)
+    return any(start <= local < end for start, end in windows)
+
+
+def _past(moment: datetime, mark: time | None) -> bool:
+    if mark is None:
+        return False
+    local = _local_time(moment)
+    return local >= mark
 
 
 def _copy_db(src: Path, dst: Path) -> None:
@@ -342,6 +384,10 @@ def _install_clock() -> None:
             CLOCK.note()
             if CLOCK.shadow:
                 _shadow_tick()
+            if CHAOS is not None and (
+                _past(CLOCK.ct, CHAOS.crash_at) or _past(CLOCK.ct, CHAOS.stop_at)
+            ):
+                raise SystemExit(0)
 
     def fake_monotonic() -> float:
         return CLOCK.mono
@@ -368,10 +414,34 @@ def _slot(moment: datetime) -> tuple[int, int]:
 
 
 def _high(ticker: str, moment: datetime) -> bool:
-    return _slot(moment) in HIGH_SLOTS.get(ticker, set())
+    """Keep a chaos position's score above the time-stop exempt line.
+
+    Full scans are the only prints that store last_live_score. The
+    rehearsal clock also inserts one at 11:30. A name held only on the
+    half-hour would print under 80 there and time-stop while the
+    scenario still needs it open. Exit minutes are included for the
+    same reason. The base day is unchanged.
+    """
+    if CHAOS is not None and CHAOS.name == "g1":
+        local = _local_time(moment)
+        if ticker == "SPY" and local < time(11, 0):
+            return True
+        if ticker == "QQQ" and time(10, 15) <= local < time(11, 0):
+            return True
+        return False
+    if CHAOS is not None and CHAOS.name == "j":
+        if ticker == "SPY" and _local_time(moment) < time(14, 40):
+            return True
+        return False
+    slots = HIGH_SLOTS if CHAOS is None or CHAOS.high_slots is None else CHAOS.high_slots
+    return _slot(moment) in slots.get(ticker, set())
 
 
 def _quote_style(ticker: str, moment: datetime) -> str:
+    if CHAOS is not None:
+        if _in_windows(moment, CHAOS.dark):
+            return "dark"
+        return "live"
     local = moment.astimezone(CHICAGO).time().replace(tzinfo=None)
     if ticker == "SPY" and local >= time(10, 0):
         return "stop"
@@ -445,6 +515,12 @@ def _serve_chain(ticker: str, base: dict) -> dict:
     except (TypeError, ValueError):
         return raw
     raw["current_price"] = round(spot_f, 2)
+    if (
+        CHAOS is not None
+        and CHAOS.spot_drop_after is not None
+        and _past(CLOCK.ct, CHAOS.spot_drop_after)
+    ):
+        raw["current_price"] = round(spot_f * 0.5, 2)
     _plant_contract(raw, spot_f)
     _paint_quotes(raw, _quote_style(str(ticker).upper(), CLOCK.ct))
     return raw
@@ -478,18 +554,40 @@ def _install_market(base: dict) -> None:
     import yfinance as yf
     import yf_client
 
+    def _yahoo_payload(ticker: str):
+        if CHAOS is not None and _in_windows(CLOCK.ct, CHAOS.yahoo_down):
+            return json.dumps({"error": "network down"})
+        if CHAOS is not None and _in_windows(CLOCK.ct, CHAOS.yahoo_429):
+            import yf_client
+            if yf_client.crumb_backoff_remaining() <= 0:
+                yf_client.note_crumb_429()
+            return json.dumps({"error": "HTTP 429"})
+        if CHAOS is not None and not _in_windows(CLOCK.ct, CHAOS.yahoo_429):
+            import yf_client
+            if yf_client.crumb_backoff_remaining() > 0:
+                yf_client.note_crumb_ok()
+        return json.dumps(_serve_chain(ticker, base))
+
     def options(ticker):
-        return json.dumps(_serve_chain(str(ticker).upper(), base))
+        return _yahoo_payload(str(ticker).upper())
 
     def quote(ticker, expiration, strike, direction="CALL"):
         return options(ticker)
 
     def spot(ticker):
+        if CHAOS is not None and (
+            _in_windows(CLOCK.ct, CHAOS.yahoo_down)
+            or _in_windows(CLOCK.ct, CHAOS.yahoo_429)
+        ):
+            return None
         raw = base.get(str(ticker).upper()) or {}
         try:
-            return round(float(raw.get("current_price")), 2)
+            px = round(float(raw.get("current_price")), 2)
         except (TypeError, ValueError):
             return None
+        if CHAOS is not None and _past(CLOCK.ct, CHAOS.spot_drop_after):
+            return round(px * 0.5, 2)
+        return px
 
     def pivot(ticker):
         px = spot(ticker)
@@ -571,8 +669,11 @@ def _install_io() -> None:
             "Monday 2026-11-16 paper session."
         )
 
-    broadcaster.send_discord_alert = send
-    broadcaster.WEBHOOK_URL = ""
+    if CHAOS is not None and CHAOS.real_discord:
+        _install_discord_transport()
+    else:
+        broadcaster.send_discord_alert = send
+        broadcaster.WEBHOOK_URL = ""
     first_squawk.search_recent = search
     llm_chain.generate_text = no_model
 
@@ -721,7 +822,8 @@ def _arm_night_stop() -> None:
         try:
             return real(now, holidays=holidays, **kwargs)
         finally:
-            CLOCK.stop_now = True
+            if CHAOS is None or not CHAOS.keep_running_at_night:
+                CLOCK.stop_now = True
             print(
                 f"[rehearsal] night reconciliation returned at "
                 f"{CLOCK.ct.strftime('%H:%M:%S')} CT",
@@ -1232,30 +1334,449 @@ def _import_lazy_clocks() -> None:
     import virtual_broker  # noqa: F401
 
 
-def main() -> int:
-    global DISCORD_PATH, LOG_PATH
-    os.chdir(ROOT)
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
-    tmp = Path(tempfile.mkdtemp(prefix="rehearsal-"))
-    DISCORD_PATH = str(tmp / "discord.txt")
-    LOG_PATH = str(tmp / "loop.log")
-    print(f"[rehearsal] temp {tmp}", file=sys.stderr)
-    news, _hedge = _prepare_env(tmp)
+def _install_discord_transport() -> None:
+    """Real sender. The rehearsal host answers 204, 500, or a dead network."""
+    import requests
+    import broadcaster
 
+    broadcaster.WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK", "")
+
+    class _Resp:
+        def __init__(self, code: int, text: str = "") -> None:
+            self.status_code = code
+            self.text = text
+
+        def json(self) -> dict:
+            return {}
+
+    def post(url, *args, **kwargs):
+        target = str(url)
+        if "rehearsal.local/discord" not in target:
+            NETWORK_BLOCKED.append(f"POST {target}"[:180])
+            raise RuntimeError("rehearsal: network is closed")
+        if CHAOS is not None and _in_windows(CLOCK.ct, CHAOS.discord_down):
+            raise requests.ConnectionError("rehearsal: discord unreachable")
+        if CHAOS is not None and _in_windows(CLOCK.ct, CHAOS.discord_500):
+            return _Resp(500, "server error")
+        payload = kwargs.get("json") or {}
+        body = str(payload.get("content") or "") if isinstance(payload, dict) else ""
+        if CHAOS is not None:
+            CHAOS.delivered.append(body)
+        return _Resp(204, "")
+
+    def get(url, *args, **kwargs):
+        target = str(url)
+        if "rehearsal.local/heartbeat" not in target:
+            NETWORK_BLOCKED.append(f"GET {target}"[:180])
+            raise RuntimeError("rehearsal: network is closed")
+        if CHAOS is not None and _in_windows(CLOCK.ct, CHAOS.heartbeat_down):
+            raise requests.ConnectionError("rehearsal: heartbeat unreachable")
+        return _Resp(200, "ok")
+
+    requests.post = post
+    requests.get = get
+
+
+def _arm_chaos_env() -> None:
+    if CHAOS is None or not CHAOS.real_discord:
+        return
+    os.environ["DISCORD_WEBHOOK"] = "http://rehearsal.local/discord"
+    os.environ["HEARTBEAT_URL"] = "http://rehearsal.local/heartbeat"
+
+
+def _point_env(state: Path) -> Path:
+    news = state / "news_room.db"
+    os.environ["NEWS_DB_PATH"] = str(news)
+    os.environ["HEDGE_DB_PATH"] = str(state / "hedge_fund.db")
+    os.environ["ACTIVE_TRADES_PATH"] = str(state / "active_trades.json")
+    os.environ["SESSION_BASELINE_PATH"] = str(state / "session_baseline.json")
+    os.environ["X_BEARER_TOKEN"] = "rehearsal"
+    os.environ["GEMINI_API_KEY"] = "rehearsal"
+    os.environ["RESET_LEDGER_ON_BOOT"] = "false"
+    os.environ.pop("FULL_LLM_INTRADAY", None)
+    os.environ.pop("BYPASS_MARKET_HOURS", None)
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    return news
+
+
+def _half_hour_slots(start_min: int, end_min: int) -> set[tuple[int, int]]:
+    slots = set()
+    minute = start_min
+    while minute <= end_min:
+        slots.add((minute // 60, minute % 60))
+        minute += 30
+    return slots
+
+
+def _chaos_for(name: str) -> Chaos | None:
+    if name in ("", "base"):
+        return None
+    if name == "f":
+        chaos = Chaos("f")
+        chaos.high_slots = {"SPY": {(8, 45), (9, 15)}}
+        window = (time(10, 10), time(13, 0))
+        chaos.yahoo_down = [window]
+        chaos.discord_down = [window]
+        chaos.heartbeat_down = [window]
+        chaos.dark = [(time(13, 0), time(16, 0))]
+        chaos.spot_drop_after = time(13, 0)
+        chaos.real_discord = True
+        return chaos
+    if name == "g1":
+        chaos = Chaos("g1")
+        chaos.high_slots = {
+            "SPY": {(8, 45), (9, 15), (9, 45), (10, 15), (10, 45)},
+            "QQQ": {(10, 15), (10, 45)},
+        }
+        chaos.crash_at = time(11, 0)
+        return chaos
+    if name == "g2":
+        chaos = Chaos("g2")
+        chaos.high_slots = {}
+        chaos.start = datetime(2026, 11, 16, 11, 5, tzinfo=CHICAGO)
+        return chaos
+    if name == "h":
+        chaos = Chaos("h")
+        chaos.high_slots = {"SPY": {(8, 45), (9, 15)}}
+        chaos.dark = [(time(10, 0), time(10, 30))]
+        chaos.discord_500 = [(time(10, 0), time(10, 30))]
+        chaos.real_discord = True
+        return chaos
+    if name == "i":
+        chaos = Chaos("i")
+        chaos.high_slots = {"SPY": {(8, 45), (9, 15), (9, 45), (10, 15), (10, 45)}}
+        chaos.yahoo_429 = [(time(10, 0), time(10, 20))]
+        return chaos
+    if name == "j":
+        chaos = Chaos("j")
+        chaos.high_slots = {"SPY": _half_hour_slots(8 * 60 + 45, 14 * 60 + 15)}
+        window = (time(14, 40), time(15, 10))
+        chaos.yahoo_down = [window]
+        chaos.discord_down = [window]
+        chaos.heartbeat_down = [window]
+        chaos.real_discord = True
+        chaos.keep_running_at_night = True
+        chaos.stop_at = time(15, 15)
+        return chaos
+    raise SystemExit(f"unknown scenario {name}")
+
+
+def _rows(news: Path, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
+    conn = sqlite3.connect(f"file:{news}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return list(conn.execute(sql, args))
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def _trade_rows(news: Path) -> list[dict]:
+    cols = {row[1] for row in _rows(news, "PRAGMA table_info(trade_history)")}
+    if "ticker" not in cols or "notes" not in cols:
+        return []
+    closed = "closed_at" if "closed_at" in cols else "''"
+    out = []
+    for row in _rows(news, f"SELECT ticker, notes, {closed} AS closed_at FROM trade_history"):
+        when = _ct(row["closed_at"])
+        if not when.startswith(SESSION_DAY.isoformat()):
+            continue
+        out.append({"ticker": row["ticker"], "notes": str(row["notes"] or ""), "when": when})
+    return out
+
+
+def _final_text(news: Path) -> str:
+    """This session's SESSION_FINAL. The copy still holds earlier days."""
+    rows = _rows(
+        news,
+        """SELECT line FROM session_lines
+           WHERE session_date=? AND line LIKE 'SESSION_FINAL|%'""",
+        (SESSION_DAY.isoformat(),),
+    )
+    if not rows:
+        return ""
+    return str(rows[-1]["line"] or "")
+
+
+def _clean_clause(final_text: str) -> str:
+    mark = final_text.rfind("|CLEAN ")
+    if mark < 0:
+        return ""
+    return final_text[mark + 1:]
+
+
+def _scan_marks(news: Path) -> list[tuple[str, int]]:
+    out = []
+    for row in _rows(
+        news,
+        """SELECT at_ct, fetched FROM session_marks
+           WHERE session_date=? AND kind='scan' ORDER BY at_ct""",
+        (SESSION_DAY.isoformat(),),
+    ):
+        when = _ct(row["at_ct"])
+        try:
+            fetched = int(row["fetched"])
+        except (TypeError, ValueError):
+            fetched = -1
+        out.append((when, fetched))
+    return out
+
+
+def _critical_rows(news: Path) -> list[dict]:
+    out = []
+    day = SESSION_DAY.isoformat()
+    for row in _rows(
+        news,
+        """SELECT body, created_at, delivered_at FROM discord_outbox
+           WHERE critical=1 ORDER BY id"""
+    ):
+        created = _ct(row["created_at"])
+        if not created.startswith(day):
+            continue
+        out.append({
+            "body": str(row["body"] or ""),
+            "created": created,
+            "delivered": _ct(row["delivered_at"]),
+        })
+    return out
+
+
+def _opens_in(rows: list[dict], start: str, end: str) -> list[str]:
+    found = []
+    for row in rows:
+        if "PAPER_BUY_OPEN" not in row["notes"]:
+            continue
+        clock = row["when"][11:16]
+        if start <= clock < end:
+            found.append(f"{row['ticker']} {clock}")
+    return found
+
+
+def _grade_f(news: Path, log_text: str) -> tuple[bool, str]:
+    rows = _trade_rows(news)
+    late = _opens_in(rows, "10:10", "13:00")
+    underlying = [row for row in rows if "UNDERLYING_STOP" in row["notes"]]
+    criticals = _critical_rows(news)
+    failed = [row for row in criticals if "MARK FAILED" in row["body"]]
+    naked = [row for row in criticals if "UNPROTECTED" in row["body"]]
+    undelivered = [row for row in criticals if not row["delivered"]]
+    clean = _clean_clause(_final_text(news))
+    recovered = [when for when, fetched in _scan_marks(news) if when[11:16] >= "13:00" and fetched == 10]
+    reasons = []
+    if late:
+        reasons.append(f"entries during the outage: {late}")
+    if not underlying:
+        reasons.append("no UNDERLYING_STOP close")
+    if not failed:
+        reasons.append("no MARK FAILED critical")
+    if not naked:
+        reasons.append("no UNPROTECTED critical")
+    if undelivered:
+        reasons.append(f"{len(undelivered)} criticals still missing delivered_at")
+    if not clean.startswith("CLEAN no"):
+        reasons.append(f"CLEAN field is {clean or '(missing)'}")
+    elif "scan 0/10" not in clean and "scans " not in clean and "gap " not in clean:
+        reasons.append(f"CLEAN reason does not name the missed scans: {clean}")
+    if "undelivered CRITICAL" in clean:
+        reasons.append(f"CLEAN still names an undelivered critical: {clean}")
+    if not recovered:
+        reasons.append("no completed full scan with 10 tickers after 13:00")
+    if "ping failed" not in log_text:
+        reasons.append("heartbeat did not fail during the outage")
+    if "Traceback" in log_text:
+        reasons.append("the loop traceback'd")
+    evidence = (
+        f"{clean or 'CLEAN missing'}; "
+        f"MARK FAILED x{len(failed)} delivered; UNPROTECTED x{len(naked)}; "
+        f"UNDERLYING_STOP x{len(underlying)}; "
+        f"recovery scans {recovered[:3]}"
+    )
+    return not reasons, evidence if not reasons else evidence + " | " + "; ".join(reasons)
+
+
+def _grade_g1(state: Path, log_text: str) -> tuple[bool, str]:
+    import tracker_agent
+    trades = tracker_agent.load_active_trades(state / "active_trades.json")
+    names = sorted({str(trade.get("ticker") or "").upper() for trade in trades})
+    reasons = []
+    if names != ["QQQ", "SPY"]:
+        reasons.append(f"open at the crash: {names or 'none'}")
+    if "11:00" not in log_text and "11:00" not in CLOCK.ct.strftime("%H:%M"):
+        reasons.append(f"clock stopped at {CLOCK.ct.strftime('%H:%M:%S')}")
+    if "Traceback" in log_text:
+        reasons.append("the loop traceback'd")
+    evidence = f"open at crash {names}; clock {CLOCK.ct.strftime('%H:%M:%S')} CT"
+    return not reasons, evidence if not reasons else evidence + " | " + "; ".join(reasons)
+
+
+def _grade_g2(news: Path, log_text: str) -> tuple[bool, str]:
+    rows = _trade_rows(news)
+    opens = [row for row in rows if "PAPER_BUY_OPEN" in row["notes"]]
+    late = _opens_in(rows, "11:05", "16:00")
+    by_ticker: dict[str, int] = {}
+    for row in opens:
+        by_ticker[str(row["ticker"]).upper()] = by_ticker.get(str(row["ticker"]).upper(), 0) + 1
+    boot = [row for row in rows if "BOOT_FLATTEN" in row["notes"]]
+    import tracker_agent
+    still = tracker_agent.load_active_trades()
+    reasons = []
+    if "OPEN AT BOOT" not in log_text or "2 position" not in log_text:
+        reasons.append("OPEN AT BOOT for 2 positions was not logged")
+    if by_ticker.get("SPY") != 1 or by_ticker.get("QQQ") != 1 or len(opens) != 2:
+        reasons.append(f"open rows {by_ticker}")
+    if late:
+        reasons.append(f"entries after the restart: {late}")
+    if len(boot) != 2:
+        reasons.append(f"BOOT_FLATTEN closes {len(boot)}")
+    if still:
+        reasons.append(f"{len(still)} positions still open")
+    if "Traceback" in log_text:
+        reasons.append("the loop traceback'd")
+    evidence = (
+        f"opens {by_ticker}; BOOT_FLATTEN x{len(boot)}; "
+        f"open book {len(still)}"
+    )
+    return not reasons, evidence if not reasons else evidence + " | " + "; ".join(reasons)
+
+
+def _delivery_in_order(news: Path) -> bool:
+    """Queued rows, in the flush order, appear in the posts that returned 204.
+
+    A first-try send stores created_at and delivered_at together. A flush
+    stamps delivered_at later. Later first-try criticals sort ahead of
+    older non-critical queue rows, so the order check uses only the rows
+    that actually waited.
+    """
+    if CHAOS is None:
+        return False
+    day = SESSION_DAY.isoformat()
+    rows = [
+        row for row in _rows(
+            news,
+            """SELECT body, created_at, delivered_at FROM discord_outbox
+               ORDER BY critical DESC, id ASC"""
+        )
+        if _ct(row["created_at"]).startswith(day)
+    ]
+    if not rows or any(not row["delivered_at"] for row in rows):
+        return False
+    expected = [
+        str(row["body"] or "")
+        for row in rows
+        if str(row["delivered_at"] or "") != str(row["created_at"] or "")
+    ]
+    if not expected:
+        return False
+    cursor = 0
+    for body in CHAOS.delivered:
+        if cursor < len(expected) and body == expected[cursor]:
+            cursor += 1
+    return cursor == len(expected)
+
+
+def _grade_h(news: Path, log_text: str) -> tuple[bool, str]:
+    criticals = _critical_rows(news)
+    queued = [
+        row for row in criticals
+        if "10:00" <= row["created"][11:16] < "10:30"
+    ]
+    late = [row for row in queued if row["delivered"] and row["delivered"][11:16] >= "10:30"]
+    missing = [row for row in criticals if not row["delivered"]]
+    reasons = []
+    if not queued:
+        reasons.append("no CRITICAL was queued during the 500 window")
+    if len(late) != len(queued):
+        reasons.append("a queued CRITICAL was not delivered after 10:30")
+    if missing:
+        reasons.append(f"{len(missing)} criticals missing delivered_at")
+    if not _delivery_in_order(news):
+        reasons.append("outbox rows were not delivered critical-first in id order")
+    if "Traceback" in log_text:
+        reasons.append("the loop traceback'd")
+    evidence = (
+        f"queued during 500 x{len(queued)}; delivered after x{len(late)}; "
+        f"criticals {len(criticals)}"
+    )
+    return not reasons, evidence if not reasons else evidence + " | " + "; ".join(reasons)
+
+
+def _grade_i(news: Path, log_text: str) -> tuple[bool, str]:
+    marks = _scan_marks(news)
+    dark = [when for when, fetched in marks if "10:00" <= when[11:16] < "10:20" and fetched == 0]
+    back = [when for when, fetched in marks if when[11:16] >= "10:20" and fetched == 10]
+    closed = [
+        row for row in _trade_rows(news)
+        if row["ticker"] == "SPY"
+        and "PAPER_BUY_OPEN" not in row["notes"]
+        and "10:00" <= row["when"][11:16] < "10:20"
+    ]
+    reasons = []
+    if "Traceback" in log_text:
+        reasons.append("the loop traceback'd")
+    if not dark:
+        reasons.append("no 0/10 scan mark inside the 429 window")
+    if not back:
+        reasons.append("no 10-ticker scan mark after the 429 window")
+    if closed:
+        reasons.append(f"SPY closed during the 429 window: {closed[0]['notes']}")
+    if "429" not in log_text:
+        reasons.append("the log never recorded a 429")
+    evidence = f"429 scan marks {dark[:2]}; recovery marks {back[:2]}"
+    return not reasons, evidence if not reasons else evidence + " | " + "; ".join(reasons)
+
+
+def _grade_j(news: Path, log_text: str) -> tuple[bool, str]:
+    rows = _trade_rows(news)
+    forced = [row for row in rows if "EOD_FLATTEN_ESTIMATED" in row["notes"]]
+    alerts = [row for row in _critical_rows(news) if "EOD FORCED CLOSE" in row["body"]]
+    delivered = [row for row in alerts if row["delivered"] and row["delivered"][11:16] >= "15:10"]
+    import tracker_agent
+    still = tracker_agent.load_active_trades()
+    reasons = []
+    if not forced:
+        reasons.append("no EOD_FLATTEN_ESTIMATED ledger row")
+    elif not any("14:55" <= row["when"][11:16] <= "15:05" for row in forced):
+        reasons.append(f"forced close clock {forced[0]['when']}")
+    if not alerts:
+        reasons.append("no EOD FORCED CLOSE alert")
+    if len(delivered) != len(alerts):
+        reasons.append("the forced-close alert was not delivered after 15:10")
+    if still:
+        reasons.append(f"{len(still)} positions still open")
+    if "Traceback" in log_text:
+        reasons.append("the loop traceback'd")
+    evidence = (
+        f"forced {forced[0]['when'] if forced else 'none'}; "
+        f"alert delivered {delivered[0]['delivered'] if delivered else 'no'}; "
+        f"open book {len(still)}"
+    )
+    return not reasons, evidence if not reasons else evidence + " | " + "; ".join(reasons)
+
+
+def _load_snapshot(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _run_loop(news: Path, snapshot: dict) -> str:
+    global DISCORD_PATH, LOG_PATH
     import master_bot
 
-    print("[rehearsal] taking the one Yahoo chain snapshot", file=sys.stderr)
-    base = _snapshot(list(master_bot.TICKERS))
+    if CHAOS is not None and CHAOS.start is not None:
+        CLOCK.ct = CHAOS.start
+        CLOCK._last_mark = ""
     SNAPSHOT.clear()
-    SNAPSHOT.update(base)
+    SNAPSHOT.update(snapshot)
     _install_clock()
-    _install_market(base)
+    _install_market(snapshot)
     _install_io()
     _seed_event(news)
     _watch_latch()
     _import_lazy_clocks()
     CLOCK._sweep()
+    if CHAOS is not None:
+        import circuit_breaker
+        circuit_breaker.time.time = lambda: CLOCK.ct.timestamp()
     _arm_night_stop()
 
     log_handle = open(LOG_PATH, "w", encoding="utf-8")
@@ -1271,8 +1792,120 @@ def main() -> int:
         sys.stdout = real_out
         log_handle.flush()
         log_handle.close()
-    text = Path(LOG_PATH).read_text(encoding="utf-8")
-    return _report(news, text)
+    return Path(LOG_PATH).read_text(encoding="utf-8")
+
+
+def _run_named(name: str, snapshot_path: Path, state: Path | None, state_out: Path | None) -> int:
+    global CHAOS, DISCORD_PATH, LOG_PATH
+    os.chdir(ROOT)
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    CHAOS = _chaos_for(name)
+    snapshot = _load_snapshot(snapshot_path)
+    if state is not None:
+        work = state
+        news = _point_env(work)
+    else:
+        work = Path(tempfile.mkdtemp(prefix=f"rehearsal-{name or 'base'}-"))
+        news, _hedge = _prepare_env(work)
+    _arm_chaos_env()
+    DISCORD_PATH = str(work / "discord.txt")
+    LOG_PATH = str(work / "loop.log")
+    print(f"[rehearsal] scenario {name or 'base'} temp {work}", file=sys.stderr)
+    log_text = _run_loop(news, snapshot)
+    if name in ("", "base"):
+        code = _report(news, log_text)
+        return code
+    if name == "g1":
+        ok, evidence = _grade_g1(work, log_text)
+        if state_out is not None:
+            state_out.write_text(str(work), encoding="utf-8")
+    elif name == "g2":
+        ok, evidence = _grade_g2(news, log_text)
+    elif name == "f":
+        ok, evidence = _grade_f(news, log_text)
+    elif name == "h":
+        ok, evidence = _grade_h(news, log_text)
+    elif name == "i":
+        ok, evidence = _grade_i(news, log_text)
+    elif name == "j":
+        ok, evidence = _grade_j(news, log_text)
+    else:
+        print(f"{name}. FAIL — no grader")
+        return 1
+    label = "g" if name in ("g1", "g2") else name
+    phase = f" ({name})" if name in ("g1", "g2") else ""
+    mark = "PASS" if ok else "FAIL"
+    print(f"{label}. {mark}{phase} — {evidence}")
+    if not ok:
+        print("Stopping. Stamped files were not edited.")
+        return 1
+    return 0
+
+
+def _spawn(name: str, snapshot: Path, state: Path | None = None, state_out: Path | None = None) -> int:
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--scenario",
+        name,
+        "--snapshot",
+        str(snapshot),
+    ]
+    if state is not None:
+        cmd.extend(["--state", str(state)])
+    if state_out is not None:
+        cmd.extend(["--state-out", str(state_out)])
+    proc = subprocess.run(cmd)
+    return proc.returncode
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Fast-clock rehearsal on database copies")
+    parser.add_argument("--scenario", default="")
+    parser.add_argument("--snapshot", default="")
+    parser.add_argument("--state", default="")
+    parser.add_argument("--state-out", default="")
+    args = parser.parse_args()
+    if args.scenario:
+        if not args.snapshot:
+            print("refused: a scenario run needs the shared snapshot", file=sys.stderr)
+            return 2
+        return _run_named(
+            args.scenario,
+            Path(args.snapshot),
+            Path(args.state) if args.state else None,
+            Path(args.state_out) if args.state_out else None,
+        )
+
+    os.chdir(ROOT)
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    hold = Path(tempfile.mkdtemp(prefix="rehearsal-snapshot-"))
+    _prepare_env(hold)
+    import master_bot
+    print("[rehearsal] taking the one Yahoo chain snapshot", file=sys.stderr)
+    snapshot = _snapshot(list(master_bot.TICKERS))
+    snapshot_path = hold / "snapshot.json"
+    snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
+    code = _spawn("base", snapshot_path)
+    if code != 0:
+        print("[rehearsal] base scenarios failed; chaos runs were not started")
+        return code
+    code = _spawn("f", snapshot_path)
+    if code != 0:
+        return code
+    state_out = hold / "g1-state.txt"
+    code = _spawn("g1", snapshot_path, state_out=state_out)
+    if code != 0:
+        return code
+    state = Path(state_out.read_text(encoding="utf-8").strip())
+    for name in ("g2", "h", "i", "j"):
+        code = _spawn(name, snapshot_path, state=state if name == "g2" else None)
+        if code != 0:
+            return code
+    print("[rehearsal] a–j passed on database copies. Live files were not restarted.")
+    return 0
 
 
 if __name__ == "__main__":
