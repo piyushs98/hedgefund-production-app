@@ -1,6 +1,7 @@
 # Virtual Environments
 venv/
 .venv/
+.venv-webull/
 env/
 
 # Secrets — never commit API keys / webhooks
@@ -27,6 +28,9 @@ patcher.py
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/webull_exec.halt
+webull_trade_sdk.log
+webull_data_sdk.log
 *.db
 
 # Local measurement packets. Not the version under test.

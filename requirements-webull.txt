@@ -1,0 +1,3 @@
+# Executor environment only. Install into .venv-webull.
+# The paper bot's .venv must not install this file.
+webull-openapi-python-sdk==3.1.2
