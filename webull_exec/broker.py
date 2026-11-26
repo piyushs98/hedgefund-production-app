@@ -22,6 +22,10 @@ class BrokerError(RuntimeError):
         self.status = status
 
 
+class AccountSuffixError(BrokerError):
+    """The requested account ending is missing or not unique. No order was sent."""
+
+
 def scrub(text: str) -> str:
     cleaned = _SECRET.sub(r"\1\2[redacted]", str(text))
     return cleaned[:500]
@@ -90,8 +94,22 @@ def _options_enabled(account: dict) -> bool | None:
     return None
 
 
-def choose_account(accounts: list[dict]) -> str:
-    """Pick one account id. Raise when the choice is ambiguous."""
+def choose_account(accounts: list[dict], suffix: str | None = None) -> str:
+    """Pick one account id. Raise when the choice is ambiguous.
+
+    A suffix is drill-only. It selects the one id that ends with those
+    characters. No match, or more than one, raises before any order.
+    The default path, with no suffix, is unchanged.
+    """
+    needle = (suffix or "").strip()
+    if needle:
+        matches = [
+            row for row in accounts
+            if str(row.get("account_id") or "").endswith(needle)
+        ]
+        if len(matches) != 1:
+            raise AccountSuffixError(f"account suffix matched {len(matches)} accounts")
+        return matches[0]["account_id"]
     enabled = [row for row in accounts if row.get("options") is True]
     if len(enabled) == 1:
         return enabled[0]["account_id"]
@@ -138,10 +156,18 @@ def _walk_accounts(payload: Any) -> list[dict]:
 
 
 class SdkBroker:
-    def __init__(self, app_key: str, app_secret: str, *, sandbox: bool = True):
+    def __init__(
+        self,
+        app_key: str,
+        app_secret: str,
+        *,
+        sandbox: bool = True,
+        account_suffix: str | None = None,
+    ):
         self._app_key = app_key
         self._app_secret = app_secret
         self._sandbox = sandbox
+        self.account_suffix = (account_suffix or "").strip() or None
         self._api = None
         self._trade = None
         self._data = None
@@ -178,7 +204,7 @@ class SdkBroker:
         return response
 
     def _select_account(self) -> str:
-        return choose_account(self.list_accounts())
+        return choose_account(self.list_accounts(), suffix=self.account_suffix)
 
     def list_accounts(self) -> list[dict]:
         response = self._call(lambda: self._trade.account_v2.get_account_list())

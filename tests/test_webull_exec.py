@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import contextlib
+import io
 import os
 import tempfile
 import unittest
@@ -10,7 +12,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 import session_clock
-from webull_exec.broker import BrokerError, choose_account
+from webull_exec.broker import AccountSuffixError, BrokerError, choose_account
 from webull_exec.clock import entry_block
 from webull_exec.envfile import read_mode, set_mode_off
 from webull_exec.kill import flatten, shutdown
@@ -490,6 +492,485 @@ class AccountChoice(unittest.TestCase):
                 {"account_id": "a", "account_class": "INDIVIDUAL_MARGIN", "options": None},
                 {"account_id": "b", "account_class": "INDIVIDUAL_MARGIN", "options": None},
             ])
+
+    def _book(self):
+        return [
+            {"account_id": "paper-cash-5FNA", "account_class": "INDIVIDUAL_CASH", "options": None},
+            {"account_id": "paper-margin-3I9A", "account_class": "INDIVIDUAL_MARGIN", "options": None},
+            {"account_id": "paper-fut-9ZZZ", "account_class": "FUTURES", "options": None},
+        ]
+
+    def test_default_selects_the_margin_account(self):
+        chosen = choose_account(self._book())
+        self.assertTrue(chosen.endswith("3I9A"))
+        self.assertFalse(chosen.endswith("5FNA"))
+
+    def test_suffix_selects_the_cash_account(self):
+        chosen = choose_account(self._book(), suffix="5FNA")
+        self.assertTrue(chosen.endswith("5FNA"))
+        self.assertEqual(
+            next(row["account_class"] for row in self._book() if row["account_id"] == chosen),
+            "INDIVIDUAL_CASH",
+        )
+
+    def test_bad_suffix_exits_with_no_order_call(self):
+        import webull_exec.__main__ as entry
+
+        placed: list = []
+        with self.assertRaises(AccountSuffixError):
+            choose_account(self._book(), suffix="NOPE")
+
+        class FakeBroker:
+            def __init__(self, app_key, app_secret, *, sandbox=True, account_suffix=None):
+                self.account_suffix = account_suffix
+                self.account_id = ""
+
+            def connect(self):
+                self.account_id = choose_account(AccountChoice()._book(), suffix=self.account_suffix)
+
+            def place(self, *args, **kwargs):
+                placed.append((args, kwargs))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_path = root / "drill.env"
+            db_path = root / "drill.db"
+            env_path.write_text(
+                "EXECUTION_MODE=sandbox\nWEBULL_SANDBOX_APP_KEY=drill\nWEBULL_SANDBOX_APP_SECRET=drill\n",
+                encoding="utf-8",
+            )
+            saved = dict(os.environ)
+            os.environ["WEBULL_EXEC_DB"] = str(root / "sentinel.db")
+            os.environ["DISCORD_WEBHOOK"] = ""
+            os.environ["WEBULL_HEARTBEAT_URL"] = ""
+            os.environ["WEBULL_SANDBOX_APP_KEY"] = "drill"
+            os.environ["WEBULL_SANDBOX_APP_SECRET"] = "drill"
+            os.environ["EXECUTION_MODE"] = "sandbox"
+            os.environ.pop("LIVE_TRADING_ENABLED", None)
+            real_broker = entry.SdkBroker
+            real_sleep = entry.time.sleep
+            entry.SdkBroker = FakeBroker
+
+            def _no_sleep(*_args, **_kwargs):
+                raise AssertionError("slept")
+
+            entry.time.sleep = _no_sleep
+            try:
+                with self.assertRaises(SystemExit) as ctx:
+                    entry.main([
+                        "--account-suffix", "NOPE",
+                        "--env-file", str(env_path),
+                        "--db", str(db_path),
+                    ])
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertEqual(placed, [])
+                self.assertFalse((root / "sentinel.db").exists())
+            finally:
+                entry.SdkBroker = real_broker
+                entry.time.sleep = real_sleep
+                os.environ.clear()
+                os.environ.update(saved)
+
+    def test_partial_drill_and_production_paths_exit_before_connect(self):
+        import webull_exec.__main__ as entry
+
+        def boom(*_args, **_kwargs):
+            raise AssertionError("store")
+
+        real_store = entry.Store
+        real_broker = entry.SdkBroker
+        entry.Store = boom
+        entry.SdkBroker = boom
+        prod_env = entry.PROD_ENV.read_bytes()
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                entry.main(["--account-suffix", "5FNA"])
+            self.assertEqual(ctx.exception.code, 2)
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                with self.assertRaises(SystemExit) as ctx:
+                    entry.main([
+                        "--account-suffix", "5FNA",
+                        "--env-file", str(entry.PROD_ENV),
+                        "--db", str(root / "drill.db"),
+                    ])
+                self.assertEqual(ctx.exception.code, 2)
+                with self.assertRaises(SystemExit) as ctx:
+                    entry.main([
+                        "--account-suffix", "5FNA",
+                        "--env-file", str(root / "drill.env"),
+                        "--db", str(entry.PROD_DB),
+                    ])
+                self.assertEqual(ctx.exception.code, 2)
+        finally:
+            entry.Store = real_store
+            entry.SdkBroker = real_broker
+        self.assertEqual(entry.PROD_ENV.read_bytes(), prod_env)
+
+    def test_drill_instance_uses_temp_files_and_prefixes_alerts(self):
+        import webull_exec.__main__ as entry
+        import webull_exec.notify as notify_mod
+
+        captured = {}
+        calls = []
+
+        class FakeBroker:
+            def __init__(self, app_key, app_secret, *, sandbox=True, account_suffix=None):
+                self.account_suffix = account_suffix
+                self.account_id = ""
+
+            def connect(self):
+                self.account_id = choose_account(AccountChoice()._book(), suffix=self.account_suffix)
+
+        class Stop(Exception):
+            pass
+
+        class StopEngine:
+            def __init__(self, broker, store, notify, *_args, **kwargs):
+                captured["suffix"] = broker.account_suffix
+                captured["account"] = broker.account_id
+                captured["db"] = store.path
+                captured["drill"] = notify.drill
+                captured["log"] = notify.drill_log
+                captured["env"] = kwargs.get("env_path")
+                captured["halt"] = kwargs.get("halt_path")
+                notify.critical("boot", "boot found broker positions or orders and is flattening them")
+                notify.heartbeat()
+                raise Stop()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_path = root / "drill.env"
+            db_path = root / "drill.db"
+            env_path.write_text(
+                "EXECUTION_MODE=sandbox\nWEBULL_SANDBOX_APP_KEY=drill\nWEBULL_SANDBOX_APP_SECRET=drill\n",
+                encoding="utf-8",
+            )
+            prod_env = entry.PROD_ENV.read_bytes()
+            prod_db = entry.PROD_DB
+            db_sig = (prod_db.stat().st_mtime_ns, prod_db.stat().st_size) if prod_db.exists() else None
+            saved = dict(os.environ)
+            os.environ["EXECUTION_MODE"] = "sandbox"
+            os.environ["WEBULL_SANDBOX_APP_KEY"] = "drill"
+            os.environ["WEBULL_SANDBOX_APP_SECRET"] = "drill"
+            os.environ["DISCORD_WEBHOOK"] = "http://127.0.0.1:9/not-a-webhook"
+            os.environ["WEBULL_HEARTBEAT_URL"] = "http://127.0.0.1:9/not-a-heartbeat"
+            os.environ["WEBULL_EXEC_DB"] = str(root / "sentinel.db")
+            os.environ.pop("LIVE_TRADING_ENABLED", None)
+            real_broker = entry.SdkBroker
+            real_engine = entry.Engine
+            real_open = notify_mod.urllib.request.urlopen
+            entry.SdkBroker = FakeBroker
+            entry.Engine = StopEngine
+            notify_mod.urllib.request.urlopen = lambda *_a, **_k: calls.append("open")
+            try:
+                with self.assertRaises(Stop):
+                    entry.main([
+                        "--account-suffix", "5FNA",
+                        "--env-file", str(env_path),
+                        "--db", str(db_path),
+                    ])
+            finally:
+                entry.SdkBroker = real_broker
+                entry.Engine = real_engine
+                notify_mod.urllib.request.urlopen = real_open
+                os.environ.clear()
+                os.environ.update(saved)
+            self.assertEqual(captured["suffix"], "5FNA")
+            self.assertTrue(str(captured["account"]).endswith("5FNA"))
+            self.assertEqual(Path(captured["db"]).resolve(), db_path.resolve())
+            self.assertTrue(captured["drill"])
+            self.assertEqual(Path(captured["log"]).resolve(), db_path.with_name("drill-notify.log").resolve())
+            self.assertEqual(Path(captured["env"]).resolve(), env_path.resolve())
+            self.assertEqual(Path(captured["halt"]).resolve(), db_path.with_name("webull_exec.halt").resolve())
+            self.assertNotEqual(Path(captured["halt"]).resolve(), entry.PROD_HALT.resolve())
+            text = Path(captured["log"]).read_text(encoding="utf-8")
+            self.assertIn("[DRILL] CRITICAL webull: boot found broker positions", text)
+            self.assertIn("[DRILL] heartbeat", text)
+            self.assertNotIn("\nCRITICAL webull:", "\n" + text)
+            self.assertEqual(calls, [])
+            self.assertFalse((root / "sentinel.db").exists())
+            self.assertEqual(entry.PROD_ENV.read_bytes(), prod_env)
+            if db_sig is None:
+                self.assertFalse(prod_db.exists())
+            else:
+                self.assertEqual((prod_db.stat().st_mtime_ns, prod_db.stat().st_size), db_sig)
+
+    def test_launchd_job_passes_no_suffix(self):
+        script = (ROOT / "run_webull_exec.sh").read_text(encoding="utf-8")
+        plist = (ROOT / "launchd" / "com.hedgefund.webullexec.plist").read_text(encoding="utf-8")
+        self.assertIn("-m webull_exec", script)
+        for flag in ("--account-suffix", "--env-file", "--db"):
+            self.assertNotIn(flag, script)
+            self.assertNotIn(flag, plist)
+
+
+class KillSwitch(unittest.TestCase):
+    def _prod_sig(self):
+        import webull_exec.kill as kill
+
+        env = kill.PROD_ENV.read_bytes()
+        db = kill.ROOT / "data" / "webull_exec.db"
+        halt = kill.ROOT / "data" / "webull_exec.halt"
+        db_sig = (db.stat().st_mtime_ns, db.stat().st_size) if db.exists() else None
+        halt_sig = halt.read_bytes() if halt.exists() else None
+        return kill, env, db, db_sig, halt, halt_sig
+
+    def _assert_prod_unchanged(self, kill, env, db, db_sig, halt, halt_sig):
+        self.assertEqual(kill.PROD_ENV.read_bytes(), env)
+        if db_sig is None:
+            self.assertFalse(db.exists())
+        else:
+            self.assertEqual((db.stat().st_mtime_ns, db.stat().st_size), db_sig)
+        if halt_sig is None:
+            self.assertFalse(halt.exists())
+        else:
+            self.assertEqual(halt.read_bytes(), halt_sig)
+
+    def test_default_kill_uses_production_paths_and_no_suffix(self):
+        kill, env, db, db_sig, halt, halt_sig = self._prod_sig()
+        seen = {}
+
+        class FakeStore:
+            def __init__(self, path=None):
+                seen["store_path"] = path
+
+        class FakeBroker:
+            def __init__(self, app_key, app_secret, *, sandbox=True, account_suffix=None):
+                seen["suffix"] = account_suffix
+                seen["sandbox"] = sandbox
+                self.account_id = ""
+
+            def connect(self):
+                seen["connected"] = True
+
+            def open_orders(self):
+                return []
+
+            def positions(self):
+                return []
+
+        def fake_shutdown(store, env_path, halt_path):
+            seen["shutdown_env"] = env_path
+            seen["shutdown_halt"] = halt_path
+
+        def fake_flatten(broker, store, now, *, drill=False, drill_log=None):
+            seen["drill"] = drill
+            seen["drill_log"] = drill_log
+            return (0, 0)
+
+        saved = dict(os.environ)
+        cwd = os.getcwd()
+        os.environ["WEBULL_SANDBOX_APP_KEY"] = "unit"
+        os.environ["WEBULL_SANDBOX_APP_SECRET"] = "unit"
+        os.environ["EXECUTION_MODE"] = "sandbox"
+        os.environ.pop("LIVE_TRADING_ENABLED", None)
+        real = (kill.Store, kill.SdkBroker, kill.shutdown, kill.flatten)
+        kill.Store = FakeStore
+        kill.SdkBroker = FakeBroker
+        kill.shutdown = fake_shutdown
+        kill.flatten = fake_flatten
+        try:
+            code = kill.main([])
+        finally:
+            kill.Store, kill.SdkBroker, kill.shutdown, kill.flatten = real
+            os.chdir(cwd)
+            os.environ.clear()
+            os.environ.update(saved)
+        self.assertEqual(code, 0)
+        self.assertIsNone(seen["store_path"])
+        self.assertIsNone(seen["suffix"])
+        self.assertTrue(seen["sandbox"])
+        self.assertFalse(seen["drill"])
+        self.assertIsNone(seen["drill_log"])
+        self.assertEqual(seen["shutdown_env"], kill.PROD_ENV)
+        self.assertEqual(seen["shutdown_halt"], kill.ROOT / "data" / "webull_exec.halt")
+        self._assert_prod_unchanged(kill, env, db, db_sig, halt, halt_sig)
+
+    def test_suffix_and_temp_env_touch_only_those(self):
+        kill, env, db, db_sig, halt, halt_sig = self._prod_sig()
+        book = AccountChoice()._book()
+
+        class ScopedBroker:
+            def __init__(self, app_key, app_secret, *, sandbox=True, account_suffix=None):
+                self.account_suffix = account_suffix
+                self.account_id = ""
+                self.orders = [{"client_order_id": "resting", "status": "WORKING"}]
+                self.holdings = [{
+                    "ticker": "SPY", "option_type": "CALL", "strike": 500.0,
+                    "expiration": "2026-12-18", "qty": 1, "symbol": "",
+                }]
+                self.cancelled = []
+                self.placed = []
+
+            def connect(self):
+                self.account_id = choose_account(book, suffix=self.account_suffix)
+
+            def open_orders(self):
+                return list(self.orders)
+
+            def positions(self):
+                return list(self.holdings)
+
+            def cancel(self, client_order_id):
+                self.cancelled.append(client_order_id)
+                self.orders = []
+                return {"ok": True}
+
+            def place(self, orders, combo_id=None):
+                self.placed.append(orders)
+                self.holdings = []
+                return {"ok": True, "status": 200}
+
+            def snapshot_bid(self, *_args):
+                return 1.25
+
+        def refuse_shutdown(*_args, **_kwargs):
+            raise AssertionError("production shutdown")
+
+        real_set = kill.set_mode_off
+
+        def guarded_set(path):
+            if Path(path).resolve() == kill.PROD_ENV.resolve():
+                raise AssertionError("production env")
+            real_set(path)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / "drill.env"
+            env_path.write_text(
+                "EXECUTION_MODE=sandbox\nOTHER=keep\n"
+                "WEBULL_SANDBOX_APP_KEY=unit\nWEBULL_SANDBOX_APP_SECRET=unit\n",
+                encoding="utf-8",
+            )
+            saved = dict(os.environ)
+            cwd = os.getcwd()
+            os.environ["WEBULL_SANDBOX_APP_KEY"] = "unit"
+            os.environ["WEBULL_SANDBOX_APP_SECRET"] = "unit"
+            os.environ["EXECUTION_MODE"] = "sandbox"
+            os.environ.pop("LIVE_TRADING_ENABLED", None)
+            real_broker = kill.SdkBroker
+            real_shutdown = kill.shutdown
+            broker = {}
+
+            class Remember(ScopedBroker):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    broker["self"] = self
+
+            kill.SdkBroker = Remember
+            kill.shutdown = refuse_shutdown
+            kill.set_mode_off = guarded_set
+            try:
+                code = kill.main(["--account-suffix", "5FNA", "--env-file", str(env_path)])
+            finally:
+                kill.SdkBroker = real_broker
+                kill.shutdown = real_shutdown
+                kill.set_mode_off = real_set
+                os.chdir(cwd)
+                os.environ.clear()
+                os.environ.update(saved)
+            self.assertEqual(code, 0)
+            text = env_path.read_text(encoding="utf-8")
+            self.assertIn("EXECUTION_MODE=off", text)
+            self.assertIn("OTHER=keep", text)
+            self.assertTrue(str(broker["self"].account_id).endswith("5FNA"))
+            self.assertIn("resting", broker["self"].cancelled)
+            self.assertEqual(broker["self"].placed[0][0]["side"], "SELL")
+            side_db = env_path.with_name(env_path.name + ".kill.db")
+            self.assertTrue(side_db.exists())
+            self.assertNotEqual(side_db.resolve(), (kill.ROOT / "data" / "webull_exec.db").resolve())
+            self._assert_prod_unchanged(kill, env, db, db_sig, halt, halt_sig)
+
+    def test_bad_suffix_exits_before_any_api_call(self):
+        kill, env, db, db_sig, halt, halt_sig = self._prod_sig()
+        api = []
+
+        class FakeBroker:
+            def __init__(self, app_key, app_secret, *, sandbox=True, account_suffix=None):
+                self.account_suffix = account_suffix
+
+            def connect(self):
+                choose_account(AccountChoice()._book(), suffix=self.account_suffix)
+
+            def place(self, *_args, **_kwargs):
+                api.append("place")
+
+            def cancel(self, *_args, **_kwargs):
+                api.append("cancel")
+
+            def open_orders(self):
+                api.append("open_orders")
+                return []
+
+            def positions(self):
+                api.append("positions")
+                return []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / "drill.env"
+            env_path.write_text(
+                "EXECUTION_MODE=sandbox\nOTHER=keep\n"
+                "WEBULL_SANDBOX_APP_KEY=unit\nWEBULL_SANDBOX_APP_SECRET=unit\n",
+                encoding="utf-8",
+            )
+            saved = dict(os.environ)
+            cwd = os.getcwd()
+            os.environ["WEBULL_SANDBOX_APP_KEY"] = "unit"
+            os.environ["WEBULL_SANDBOX_APP_SECRET"] = "unit"
+            os.environ["EXECUTION_MODE"] = "sandbox"
+            os.environ.pop("LIVE_TRADING_ENABLED", None)
+            real_broker = kill.SdkBroker
+            kill.SdkBroker = FakeBroker
+            try:
+                with contextlib.redirect_stdout(io.StringIO()) as buf:
+                    code = kill.main(["--account-suffix", "NOPE", "--env-file", str(env_path)])
+            finally:
+                kill.SdkBroker = real_broker
+                os.chdir(cwd)
+                os.environ.clear()
+                os.environ.update(saved)
+            self.assertEqual(code, 2)
+            self.assertEqual(api, [])
+            self.assertIn("account suffix matched 0 accounts", buf.getvalue())
+            self.assertNotIn("paper-", buf.getvalue())
+            self.assertEqual(read_mode(env_path), "sandbox")
+            self.assertFalse(env_path.with_name(env_path.name + ".kill.db").exists())
+            self._assert_prod_unchanged(kill, env, db, db_sig, halt, halt_sig)
+
+    def test_drill_critical_is_prefixed_and_stays_off_discord(self):
+        calls = []
+        saved = dict(os.environ)
+        os.environ["DISCORD_WEBHOOK"] = "http://127.0.0.1:9/not-a-webhook"
+        os.environ["WEBULL_HEARTBEAT_URL"] = "http://127.0.0.1:9/not-a-heartbeat"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                store = Store(root / "exec.db")
+                log = root / "drill-notify.log"
+                drill = Notifier(
+                    store,
+                    opener=lambda *_a, **_k: calls.append("drill"),
+                    drill=True,
+                    drill_log=log,
+                )
+                drill.critical("boot", "boot found broker positions")
+                drill.heartbeat()
+                plain_calls = []
+                plain = Notifier(Store(root / "plain.db"), opener=lambda *_a, **_k: plain_calls.append("plain"))
+                plain.critical("boot", "boot found broker positions")
+                text = log.read_text(encoding="utf-8")
+                row = store.conn.execute("SELECT message FROM alerts").fetchone()
+                plain_row = plain.store.conn.execute("SELECT message FROM alerts").fetchone()
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+        self.assertEqual(calls, [])
+        self.assertIn("[DRILL] CRITICAL webull: boot found broker positions", text)
+        self.assertIn("[DRILL] heartbeat", text)
+        self.assertTrue(row["message"].startswith("[DRILL] CRITICAL webull:"))
+        self.assertEqual(plain_calls, ["plain"])
+        self.assertEqual(plain_row["message"], "CRITICAL webull: boot found broker positions")
+        self.assertFalse(plain_row["message"].startswith("[DRILL]"))
 
 
 class OrderShape(unittest.TestCase):
