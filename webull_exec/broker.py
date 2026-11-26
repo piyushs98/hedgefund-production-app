@@ -264,12 +264,15 @@ class SdkBroker:
             return {"ok": False, "error": str(exc), "status": exc.status}
         return {"ok": True, "status": _status(response)}
 
-    def snapshot_bid(self, ticker: str, expiration: str, option_type: str, strike: float) -> float | None:
+    def snapshot_option(
+        self, ticker: str, expiration: str, option_type: str, strike: float
+    ) -> dict:
         from webull_exec.ids import occ_symbol
 
-        symbol = occ_symbol(ticker, expiration, option_type, strike)
-        snap = self.snapshot(symbol)
-        return snap.get("bid")
+        return self.snapshot(occ_symbol(ticker, expiration, option_type, strike))
+
+    def snapshot_bid(self, ticker: str, expiration: str, option_type: str, strike: float) -> float | None:
+        return self.snapshot_option(ticker, expiration, option_type, strike).get("bid")
 
     def list_option_contracts(
         self,

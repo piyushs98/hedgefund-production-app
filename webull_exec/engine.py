@@ -201,6 +201,13 @@ class Engine:
             stop_limit=limit,
         )
         combo_id = self.store.next_id(day, "c")
+        self._save_quote(
+            paper.trade_id,
+            "entry",
+            getattr(paper, "entry_bid", None),
+            paper.entry_ask,
+            self._option_quote(paper),
+        )
         row = self._row(paper, now)
         row["entry_client_order_id"] = buy_id
         row["stop_client_order_id"] = stop_id
@@ -363,14 +370,45 @@ class Engine:
             fresh = self.store.intent(row["trade_id"]) or row
             self._start_exit(fresh, now, "paper_close")
 
+    def _option_quote(self, paper_or_row) -> dict:
+        fn = getattr(self.broker, "snapshot_option", None)
+        if fn is None:
+            return {}
+        try:
+            snap = fn(
+                paper_or_row.ticker if hasattr(paper_or_row, "ticker") else paper_or_row["ticker"],
+                paper_or_row.expiration if hasattr(paper_or_row, "expiration") else paper_or_row["expiration"],
+                paper_or_row.option_type if hasattr(paper_or_row, "option_type") else paper_or_row["option_type"],
+                float(paper_or_row.strike if hasattr(paper_or_row, "strike") else paper_or_row["strike"]),
+            )
+        except Exception:
+            return {}
+        return snap if isinstance(snap, dict) else {}
+
+    def _save_quote(self, trade_id: str, side: str, yahoo_bid, yahoo_ask, snap: dict) -> None:
+        """Store the two quotes. The order price is chosen by the caller."""
+        self.store.add_quote(
+            trade_id,
+            side,
+            yahoo_bid,
+            yahoo_ask,
+            snap.get("bid"),
+            snap.get("ask"),
+            snap.get("quote_time"),
+            snap.get("symbol"),
+        )
+
     def _start_exit(self, row: dict, now: datetime, why: str) -> None:
         if row.get("stop_client_order_id"):
             self.broker.cancel(row["stop_client_order_id"])
             self.store.mark_order(row["stop_client_order_id"], "CANCELLED", cancelled=True)
         close = self.paper_close(row["trade_id"])
-        bid = None if close is None else close.exit_bid
+        yahoo_bid = None if close is None else close.exit_bid
+        snap = self._option_quote(row)
+        self._save_quote(row["trade_id"], "exit", yahoo_bid, None, snap)
+        bid = yahoo_bid
         if bid is None or bid <= 0:
-            bid = self.broker.snapshot_bid(row["ticker"], row["expiration"], row["option_type"], float(row["strike"]))
+            bid = snap.get("bid")
         if bid is None or bid <= 0:
             self.notify.critical(f"nobid-{row['trade_id']}", f"no exit bid for {row['ticker']} {row['trade_id']} ({why})")
             row["state"] = "exiting"
@@ -419,7 +457,9 @@ class Engine:
         if not row.get("repriced") and age_order >= EXIT_REPRICE_S and row.get("exit_client_order_id"):
             self.broker.cancel(row["exit_client_order_id"])
             self.store.mark_order(row["exit_client_order_id"], "CANCELLED", cancelled=True)
-            fresh = self.broker.snapshot_bid(row["ticker"], row["expiration"], row["option_type"], float(row["strike"]))
+            snap = self._option_quote(row)
+            self._save_quote(row["trade_id"], "exit", row.get("paper_exit_bid"), None, snap)
+            fresh = snap.get("bid")
             limit = fresh if fresh and fresh > 0 else row.get("paper_exit_bid") or row.get("exit_limit")
             row["repriced"] = 1
             self.store.upsert_intent(row)

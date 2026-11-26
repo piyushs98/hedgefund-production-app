@@ -74,6 +74,8 @@ class FakeBroker:
         self.reject_stops = False
         self.reject_all = False
         self.bid = 1.25
+        self.ask = 2.55
+        self.quote_time = "2026-12-02T16:00:00Z"
         self.autofill = False
 
     def positions(self):
@@ -136,8 +138,16 @@ class FakeBroker:
             self.orders[client_order_id]["status"] = "CANCELLED"
         return {"ok": True}
 
+    def snapshot_option(self, *_args):
+        return {
+            "bid": self.bid,
+            "ask": self.ask,
+            "quote_time": self.quote_time,
+            "symbol": "SPY261218C00500000",
+        }
+
     def snapshot_bid(self, *_args):
-        return self.bid
+        return self.snapshot_option()["bid"]
 
 
 class EngineCase(unittest.TestCase):
@@ -180,6 +190,43 @@ class EngineCase(unittest.TestCase):
         self.assertIsNone(entry_block(ct(self.day, 10, 0)))
         self.assertEqual(entry_block(ct(self.day, 13, 45)), "after_1345")
         self.assertEqual(entry_block(ct(date(2026, 11, 27), 10, 0)), "early_close")
+
+    def test_quote_compare_is_logged_and_the_limit_stays_the_paper_price(self):
+        self.engine.boot(ct(self.day, 9, 0))
+        self.broker.autofill = True
+        self.broker.bid = 1.70
+        self.broker.ask = 2.55
+        self.paper.append(paper(entry_bid=1.80))
+        self.engine.tick(ct(self.day, 10, 0))
+        buy = self.broker.placed[0][0][0]
+        self.assertEqual(buy["limit_price"], "2.00")
+        self.paper.clear()
+        self.closes["t1"] = type("C", (), {"exit_bid": 2.40, "reason": "TIME_STOP"})()
+        self.engine.tick(ct(self.day, 10, 5))
+        sells = [
+            call[0][0]
+            for call in self.broker.placed
+            if call[0][0]["side"] == "SELL" and call[0][0]["order_type"] == "LIMIT"
+        ]
+        self.assertEqual(sells[-1]["limit_price"], "2.40")
+        rows = self.store.conn.execute(
+            """
+            SELECT side, yahoo_bid, yahoo_ask, webull_bid, webull_ask, quote_time
+            FROM quote_compares
+            ORDER BY id
+            """
+        ).fetchall()
+        self.assertEqual(rows[0]["side"], "entry")
+        self.assertEqual(rows[0]["yahoo_bid"], 1.80)
+        self.assertEqual(rows[0]["yahoo_ask"], 2.0)
+        self.assertEqual(rows[0]["webull_bid"], 1.70)
+        self.assertEqual(rows[0]["webull_ask"], 2.55)
+        self.assertEqual(rows[0]["quote_time"], "2026-12-02T16:00:00Z")
+        self.assertEqual(rows[1]["side"], "exit")
+        self.assertEqual(rows[1]["yahoo_bid"], 2.40)
+        self.assertIsNone(rows[1]["yahoo_ask"])
+        self.assertEqual(rows[1]["webull_bid"], 1.70)
+        self.assertEqual(rows[1]["webull_ask"], 2.55)
 
     def test_combo_entry_uses_paper_ask_and_does_not_duplicate(self):
         self.engine.boot(ct(self.day, 9, 0))

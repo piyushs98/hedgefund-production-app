@@ -5,8 +5,9 @@ headline month-over-month print only. Core month-over-month is recorded
 beside it and is not added. would_flip tests a cross of 70.
 would_flip_80 tests a cross of 80. would_block is true only when the
 entry sits inside a tier-1 release window, including a release still
-ahead of the entry. Nothing here writes trade_history, the gate, or
-the score.
+ahead of the entry. A tag uses an event only when that release falls
+on the same Chicago day as the trade. Nothing here writes
+trade_history, the gate, or the score.
 """
 
 from __future__ import annotations
@@ -126,12 +127,22 @@ def _tier(event: dict) -> int | None:
         return None
 
 
+def _chicago_date(moment: datetime):
+    """Calendar day in Chicago. A tag does not use another day's event."""
+    return moment.astimezone(ZoneInfo("America/Chicago")).date()
+
+
+def _on_chicago_day(release: datetime, moment: datetime) -> bool:
+    return _chicago_date(release) == _chicago_date(moment)
+
+
 def would_block(entry_at: datetime | None, events: list[dict]) -> bool | None:
     """True inside [release−30, release+15] for a tier-1 release.
 
     A release still in the future counts when the entry sits in that
-    window. Tier 2 is searched and does not block. A missing entry time
-    stays null. This flag is not a live gate.
+    window. Tier 2 is searched and does not block. A release on another
+    Chicago day does not block. A missing entry time stays null. This
+    flag is not a live gate.
     """
     if entry_at is None or entry_at.tzinfo is None:
         return None
@@ -142,6 +153,8 @@ def would_block(entry_at: datetime | None, events: list[dict]) -> bool | None:
             continue
         release = event.get("release_at")
         if not isinstance(release, datetime) or release.tzinfo is None:
+            continue
+        if not _on_chicago_day(release, moment):
             continue
         start = release - timedelta(minutes=30)
         end = release + timedelta(minutes=15)
@@ -160,7 +173,8 @@ def _next_event(entry_at: datetime | None, events: list[dict]) -> tuple[str | No
     """Soonest tier-1 release at or after the entry, and the minutes until it.
 
     A release after the entry is included. Past releases are not the next
-    event. The name stays null when nothing is still ahead.
+    event. A release on another Chicago day is not the next event. The
+    name stays null when nothing is still ahead that day.
     """
     if entry_at is None or entry_at.tzinfo is None:
         return None, None
@@ -171,6 +185,8 @@ def _next_event(entry_at: datetime | None, events: list[dict]) -> tuple[str | No
             continue
         release = event.get("release_at")
         if not isinstance(release, datetime) or release.tzinfo is None:
+            continue
+        if not _on_chicago_day(release, moment):
             continue
         rel = release.astimezone(timezone.utc)
         if rel < moment:
@@ -189,12 +205,14 @@ def _next_event(entry_at: datetime | None, events: list[dict]) -> tuple[str | No
 
 
 def _pick_event(entry_at: datetime, events: list[dict]) -> dict | None:
-    """Latest print at or before the entry. An inflation print wins a tie."""
+    """Latest same-day print at or before the entry. Inflation wins a tie."""
     moment = entry_at.astimezone(timezone.utc)
     known = []
     for event in events:
         release = event.get("release_at")
         if not isinstance(release, datetime) or release.tzinfo is None:
+            continue
+        if not _on_chicago_day(release, moment):
             continue
         if release.astimezone(timezone.utc) <= moment:
             known.append(event)
@@ -461,10 +479,11 @@ def _reaction_moves(conn) -> dict[tuple[str, str], float | None]:
 
 
 def record_close_tags(session_day, db_path=None) -> list[dict]:
-    """One shadow row per closed trade and calendar event released while it was open.
+    """One shadow row per closed trade and same-day event released while it was open.
 
-    A second call for the same trade and event updates that row. It does
-    not insert another. A failure is the caller's to catch.
+    The event's Chicago day has to be the session day. A second call for
+    the same trade and event updates that row. It does not insert
+    another. A failure is the caller's to catch.
     """
     import reliability
 
@@ -527,6 +546,8 @@ def record_close_tags(session_day, db_path=None) -> list[dict]:
                 if not isinstance(release, datetime) or release.tzinfo is None:
                     continue
                 rel = release.astimezone(timezone.utc)
+                if _chicago_date(rel).isoformat() != day:
+                    continue
                 if not (entry_at.astimezone(timezone.utc) <= rel <= exit_at.astimezone(timezone.utc)):
                     continue
                 event_id = str(event.get("event_id") or "")

@@ -106,6 +106,18 @@ class Store:
                 message TEXT,
                 created_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS quote_compares (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id TEXT,
+                side TEXT,
+                yahoo_bid REAL,
+                yahoo_ask REAL,
+                webull_bid REAL,
+                webull_ask REAL,
+                quote_time TEXT,
+                symbol TEXT,
+                recorded_at TEXT
+            );
             """
         )
         self.conn.commit()
@@ -219,6 +231,39 @@ class Store:
     def known_ids(self) -> set[str]:
         rows = self.conn.execute("SELECT trade_id FROM intents").fetchall()
         return {str(row["trade_id"]) for row in rows}
+
+    def add_quote(
+        self,
+        trade_id: str,
+        side: str,
+        yahoo_bid,
+        yahoo_ask,
+        webull_bid,
+        webull_ask,
+        quote_time,
+        symbol,
+    ) -> None:
+        """Report-only. The row is not an order price."""
+        self.conn.execute(
+            """
+            INSERT INTO quote_compares (
+                trade_id, side, yahoo_bid, yahoo_ask, webull_bid, webull_ask,
+                quote_time, symbol, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                trade_id,
+                side,
+                yahoo_bid,
+                yahoo_ask,
+                webull_bid,
+                webull_ask,
+                None if quote_time is None else str(quote_time),
+                symbol,
+                _now(),
+            ),
+        )
+        self.conn.commit()
 
     def add_slippage(self, client_order_id: str, trade_id: str, side: str, paper_fill: float, webull_fill: float) -> None:
         if side == "buy":

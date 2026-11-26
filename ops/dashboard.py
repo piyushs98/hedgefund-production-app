@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from datetime import datetime
 
 from flask import Flask, Response
@@ -39,6 +40,7 @@ from ops.store import connect_ro, default_paths, reset_ledger_flag, tail_lines
 HOST = "127.0.0.1"
 PORT = 8050
 REFRESH_SECONDS = 20
+_URL_RE = re.compile(r"https?://\S+|webhooks/\S+")
 
 app = Flask(__name__)
 
@@ -661,6 +663,7 @@ def build_snapshot(paths=None, now: datetime | None = None) -> dict:
         "today": today,
         "equity": equity,
         "tail": tail,
+        "replay": _replay_lines(text),
         "news_db": paths.news_db,
         "hedge_db": paths.hedge_db,
         "reset_ledger": reset_ledger_flag(paths.env_file),
@@ -669,6 +672,69 @@ def build_snapshot(paths=None, now: datetime | None = None) -> dict:
 
 def _e(val) -> str:
     return html.escape(str(val), quote=True)
+
+
+def _redact_log(text: str) -> str:
+    """Log lines can carry a webhook URL. The page shows the words, not the secret."""
+    return _URL_RE.sub("[url]", str(text))
+
+
+def _critical_key(line: str) -> str:
+    text = line.strip()
+    if text.startswith("[Exits] "):
+        text = text[len("[Exits] "):]
+    return text
+
+
+def _unique_criticals(lines: list[str]) -> list[str]:
+    """The process prints each alert twice. Keep the first copy."""
+    seen = set()
+    out = []
+    for line in lines:
+        clean = _redact_log(line).strip()
+        key = _critical_key(clean)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(clean)
+    return out
+
+
+def _collapse_tail(lines: list[str]) -> list[str]:
+    """Drop repeated retries so the last distinct lines stay on the page."""
+    folded = []
+    previous = None
+    count = 0
+
+    def flush() -> None:
+        if previous is None:
+            return
+        if count > 1:
+            folded.append(f"{previous}  (repeated {count} times)")
+        else:
+            folded.append(previous)
+
+    for line in lines:
+        clean = _redact_log(line).strip()
+        if clean == previous:
+            count += 1
+            continue
+        flush()
+        previous = clean
+        count = 1
+    flush()
+    return folded
+
+
+def _replay_lines(text: str) -> list[str]:
+    found = []
+    for line in text.splitlines():
+        if "[replay]" not in line:
+            continue
+        clean = _redact_log(line).strip()
+        if clean and clean not in found:
+            found.append(clean)
+    return found
 
 
 def _sample_breakdown(summary: dict) -> str:
@@ -1645,7 +1711,7 @@ def render_page(snap: dict) -> str:
     if status["stale"]:
         stale = "<div class='stale'>" + _e(status["stale_text"]) + "</div>"
 
-    crit_rows = status["criticals"]
+    crit_rows = _unique_criticals(status.get("criticals") or [])
     if crit_rows:
         crit_html = (
             "<ul class='crit'>"
@@ -1655,9 +1721,22 @@ def render_page(snap: dict) -> str:
     else:
         crit_html = "<p class='empty'>None in this log.</p>"
 
-    gate = status["gate"] or "none in the current log"
+    gate = _redact_log(status["gate"] or "none in the current log")
     log_name = snap["log_path"].name if snap["log_path"] else "no bot log"
-    tail = "\n".join(snap["tail"]) if snap["tail"] else "(log empty)"
+    tail_lines_clean = _collapse_tail(snap.get("tail") or [])
+    tail = "\n".join(tail_lines_clean) if tail_lines_clean else "(log empty)"
+    replay_rows = snap.get("replay") or []
+    if replay_rows:
+        replay_html = (
+            "<h3 class='kicker section-label'>Replay</h3>"
+            "<ul class='crit'>"
+            + "".join(f"<li>{_e(line)}</li>" for line in replay_rows)
+            + "</ul>"
+            "<p class='note'>This is the measured fill. Alerts below are what the "
+            "process logged while the router was down, including the $0.01 floor.</p>"
+        )
+    else:
+        replay_html = ""
     day = now.date()
     date_line = f"{now.strftime('%A')} {now.day} {now.strftime('%B %Y')}"
     clock_line = now.strftime("%H:%M:%S")
@@ -1778,6 +1857,7 @@ def render_page(snap: dict) -> str:
         Spread cost {_fmt_money(today["spread_cost"])}.</p>
         <h3 class="kicker section-label">Closed today</h3>
         {_closed_html(today["closed"])}
+        {replay_html}
       </article>
       <article class="panel">
         <p class="kicker">CRITICAL lines in this log</p>
@@ -1813,6 +1893,7 @@ def render_page(snap: dict) -> str:
   {desk}
   <h3 class="kicker section-label">Latest gate</h3>
   <blockquote>{_e(gate)}</blockquote>
+  <p class="note">Last GATE line in the log. Open positions are the book above.</p>
 </section>
 <section class="block" id="tape">
   <div class="block-head">

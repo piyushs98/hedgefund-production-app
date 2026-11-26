@@ -14,7 +14,9 @@ lands on 08:45, 09:15, 13:45, 14:15, 14:45, and 14:55 CT.
 One harness-only monotonic shift inserts a full scan at 11:30 CT and
 puts the later scans back on 12:15. The clock then runs into night mode
 so the reconciliation can write SESSION_FINAL. The 14:45 SESSION line
-is left as the live exit code wrote it.
+is left as the live exit code wrote it. Copied rows for this session
+day are removed first, so that line is the simulated book and not the
+live SESSION already stored in the database.
 """
 
 from __future__ import annotations
@@ -173,7 +175,63 @@ def _prepare_env(tmp: Path) -> tuple[Path, Path]:
     os.environ.pop("BYPASS_MARKET_HOURS", None)
     os.environ["RESET_LEDGER_ON_BOOT"] = "false"
     os.environ.pop("PYTEST_CURRENT_TEST", None)
+    _forget_session_day(news)
     return news, hedge
+
+
+def _forget_session_day(news: Path) -> None:
+    """Drop this session's live rows from the copy.
+
+    The 14:45 writer leaves an existing session row alone, and night
+    reconciliation leaves a complete SESSION_FINAL alone. The copied
+    database already has both for 2026-11-16, plus that day's trades,
+    so the report would grade the live book. The live files are not
+    opened here.
+    """
+    day = SESSION_DAY.isoformat()
+    conn = sqlite3.connect(news)
+    try:
+        names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "session_lines" in names:
+            conn.execute(
+                "DELETE FROM session_lines WHERE session_date = ?",
+                (day,),
+            )
+        if "shadow_close_tags" in names:
+            conn.execute(
+                "DELETE FROM shadow_close_tags WHERE session_date = ?",
+                (day,),
+            )
+        if "session_marks" in names:
+            conn.execute(
+                "DELETE FROM session_marks WHERE session_date = ?",
+                (day,),
+            )
+        dropped = 0
+        if "trade_history" in names:
+            rows = conn.execute(
+                "SELECT id, closed_at FROM trade_history"
+            ).fetchall()
+            drop = [row[0] for row in rows if _ct(row[1]).startswith(day)]
+            dropped = len(drop)
+            if drop:
+                conn.executemany(
+                    "DELETE FROM trade_history WHERE id = ?",
+                    [(item,) for item in drop],
+                )
+        conn.commit()
+    finally:
+        conn.close()
+    print(
+        f"[rehearsal] cleared {dropped} copied trades and the stored "
+        f"session rows for {day}",
+        file=sys.stderr,
+    )
 
 
 def _install_clock() -> None:

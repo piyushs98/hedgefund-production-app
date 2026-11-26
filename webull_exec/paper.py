@@ -22,6 +22,7 @@ class PaperOpen:
     entry_score: float | None
     quantity: int
     entry_mid: float | None
+    entry_bid: float | None = None
 
 
 @dataclass
@@ -82,6 +83,9 @@ def opens(path: Path | None = None) -> list[PaperOpen]:
         entry_ask = _f(row.get("entry_ask"))
         if entry_ask is None:
             entry_ask = _f(row.get("ask"))
+        entry_bid = _f(row.get("bid"))
+        if entry_bid is None:
+            entry_bid = _f(row.get("last_bid"))
         out.append(
             PaperOpen(
                 trade_id=str(row["trade_id"]),
@@ -94,6 +98,7 @@ def opens(path: Path | None = None) -> list[PaperOpen]:
                 entry_score=_f(row.get("entry_score")),
                 quantity=qty_i,
                 entry_mid=_f(row.get("entry_mid")),
+                entry_bid=entry_bid,
             )
         )
     return out

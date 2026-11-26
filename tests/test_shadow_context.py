@@ -357,6 +357,138 @@ class TagTests(unittest.TestCase):
         self.assertEqual(tag["next_event_name"], "Producer Price Index for October 2026")
         self.assertEqual(tag["minutes_to_next_event"], 5)
 
+    def test_a_prior_day_print_is_not_the_open_tag(self):
+        entry = _at(2026, 11, 18, 15, 0)
+        events = [
+            {
+                "event_id": "bls-mxp-2026-11-17",
+                "name": "U.S. Import and Export Price Indexes for October 2026",
+                "release_at": _at(2026, 11, 17, 13, 30),
+                "kind": "macro",
+                "tier": 2,
+            },
+            {
+                "event_id": "fed-minutes-2026-11-18",
+                "name": "Minutes of the October 27-28 meeting",
+                "release_at": _at(2026, 11, 18, 19, 0),
+                "kind": "fed",
+                "tier": 1,
+            },
+            {
+                "event_id": "bea-gdp-2026-11-25",
+                "name": "GDP (Second Estimate) and Corporate Profits, 3rd Quarter 2026",
+                "release_at": _at(2026, 11, 25, 13, 30),
+                "kind": "macro",
+                "tier": 1,
+            },
+        ]
+        items = [
+            {
+                "event_id": "bls-mxp-2026-11-17",
+                "actual": "0.1%",
+                "forecast": "0.1%",
+                "prior": "0.2%",
+                "published_at": "2026-11-17T13:31:00Z",
+            }
+        ]
+        tag = shadow_context.tag_trade(
+            direction="CALL",
+            score=85,
+            entry_at=entry,
+            events=events,
+            items=items,
+        )
+        self.assertIsNone(tag["event_id"])
+        self.assertIsNone(tag["label"])
+        self.assertEqual(tag["next_event_name"], "Minutes of the October 27-28 meeting")
+        self.assertEqual(tag["minutes_to_next_event"], 240)
+        self.assertFalse(tag["would_block"])
+
+    def test_block_window_does_not_cross_the_chicago_date(self):
+        release = _at(2026, 11, 18, 6, 10)
+        events = [
+            {
+                "event_id": "edge",
+                "name": "Edge print",
+                "release_at": release,
+                "kind": "macro",
+                "tier": 1,
+            }
+        ]
+        previous_evening = _at(2026, 11, 18, 5, 50)
+        self.assertFalse(shadow_context.would_block(previous_evening, events))
+        self.assertIsNone(shadow_context._next_event(previous_evening, events)[0])
+        same_morning = _at(2026, 11, 18, 6, 0)
+        self.assertTrue(shadow_context.would_block(same_morning, events))
+        self.assertEqual(shadow_context._next_event(same_morning, events)[0], "Edge print")
+
+    def test_close_tag_keeps_the_session_day_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "news.db")
+            shadow_news.ensure_schema(path)
+            conn = shadow_news.connect(path)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO calendar_events
+                        (event_id, name, release_at, keywords, kind, ticker, tier)
+                    VALUES
+                        ('bls-mxp-2026-11-17', 'Import prices',
+                         '2026-11-17T13:30:00+00:00', '["import prices"]',
+                         'macro', NULL, 2),
+                        ('fed-minutes-2026-11-18', 'Minutes',
+                         '2026-11-18T19:00:00+00:00', '["minutes"]',
+                         'fed', NULL, 1)
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO shadow_items
+                        (source, ticker, event_id, title, url, published_at,
+                         fetched_at, raw_text, content_hash, actual, forecast,
+                         prior, component)
+                    VALUES
+                        ('firstsquawk', NULL, 'fed-minutes-2026-11-18', 'm',
+                         'https://x.com/FirstSquawk/status/1',
+                         '2026-11-18T19:01:00+00:00',
+                         '2026-11-18T19:01:00+00:00',
+                         'minutes', 'hash-minutes', NULL, NULL, NULL, NULL)
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE trade_history (
+                        id INTEGER PRIMARY KEY,
+                        closed_at TEXT,
+                        ticker TEXT,
+                        direction TEXT,
+                        strike REAL,
+                        expiration TEXT,
+                        notes TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO trade_history
+                        (closed_at, ticker, direction, strike, expiration, notes)
+                    VALUES
+                        ('2026-11-18T15:00:00+00:00', 'QQQ', 'CALL', 500, '2026-11-20',
+                         'PAPER_BUY_OPEN'),
+                        ('2026-11-18T21:00:00+00:00', 'QQQ', 'CALL', 500, '2026-11-20',
+                         'EXIT:TIME_STOP')
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            written = shadow_context.record_close_tags(
+                datetime(2026, 11, 18).date(), db_path=path
+            )
+            ids = {row["event_id"] for row in written}
+            self.assertEqual(ids, {"fed-minutes-2026-11-18"})
+            self.assertNotIn("bls-mxp-2026-11-17", ids)
+
 
 class ReactionStoreTests(unittest.TestCase):
     def test_spy_close_is_stored_once(self):
