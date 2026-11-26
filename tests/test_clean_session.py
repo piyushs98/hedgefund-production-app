@@ -69,24 +69,73 @@ class CleanSessionTests(unittest.TestCase):
     def test_a_short_scan_count_fails(self):
         _mark_day(scans=11)
         text = reliability.clean_field(DAY)
-        self.assertEqual(text, "CLEAN no missing 14:15")
+        self.assertEqual(text, "CLEAN no scans 11/12")
         self.assertNotIn("exit gap", text)
 
     def test_an_extra_scan_does_not_fail(self):
         _mark_day(extra=[(11, 30), (14, 45)])
         self.assertEqual(reliability.clean_field(DAY), "CLEAN yes")
 
-    def test_eleven_thirty_does_not_cover_eleven_forty_five(self):
+    def test_a_forty_five_minute_scan_gap_passes(self):
         _mark_day(skip_slots={11 * 60 + 45}, extra=[(11, 30)])
-        self.assertEqual(reliability.clean_field(DAY), "CLEAN no missing 11:45")
+        self.assertEqual(reliability.clean_field(DAY), "CLEAN yes")
 
-    def test_the_next_slot_does_not_cover_the_previous(self):
+    def test_a_gap_over_forty_five_minutes_fails(self):
+        _mark_day(skip_slots={11 * 60 + 15}, extra=[(11, 31)])
+        self.assertEqual(reliability.clean_field(DAY), "CLEAN no gap 46 min 10:45-11:31")
+
+    def test_skipping_one_scan_reports_the_count_and_the_gap(self):
         _mark_day(skip_slots={11 * 60 + 15})
-        self.assertEqual(reliability.clean_field(DAY), "CLEAN no missing 11:15")
+        self.assertEqual(
+            reliability.clean_field(DAY),
+            "CLEAN no scans 11/12; gap 60 min 10:45-11:45",
+        )
 
-    def test_fourteen_forty_five_does_not_cover_fourteen_fifteen(self):
+    def test_a_sixty_minute_tail_gap_fails(self):
         _mark_day(skip_slots={14 * 60 + 15}, extra=[(14, 45)])
-        self.assertEqual(reliability.clean_field(DAY), "CLEAN no missing 14:15")
+        self.assertEqual(reliability.clean_field(DAY), "CLEAN no gap 60 min 13:45-14:45")
+
+    def test_a_first_scan_after_nine_fails(self):
+        _mark_day(skip_slots={8 * 60 + 45}, extra=[(9, 1)])
+        self.assertEqual(reliability.clean_field(DAY), "CLEAN no first scan 09:01")
+
+    def test_a_first_scan_at_nine_passes(self):
+        _mark_day(skip_slots={8 * 60 + 45}, extra=[(9, 0)])
+        self.assertEqual(reliability.clean_field(DAY), "CLEAN yes")
+
+    def test_scans_outside_the_window_do_not_count(self):
+        _mark_day(scans=11, extra=[(8, 30), (15, 10)])
+        text = reliability.clean_field(DAY)
+        self.assertEqual(text, "CLEAN no scans 11/12")
+        self.assertNotIn("15:10", text)
+        self.assertNotIn("08:30", text)
+
+    def test_fourteen_fifty_five_counts_inside_the_window(self):
+        _mark_day(skip_slots={14 * 60 + 15}, extra=[(14, 55)])
+        self.assertEqual(
+            reliability.clean_field(DAY),
+            "CLEAN no gap 70 min 13:45-14:55",
+        )
+
+    def test_fourteen_fifty_six_is_outside_the_window(self):
+        _mark_day(scans=11, extra=[(14, 56)])
+        text = reliability.clean_field(DAY)
+        self.assertEqual(text, "CLEAN no scans 11/12")
+        self.assertNotIn("14:56", text)
+
+    def test_november_16_drift_passes(self):
+        _mark_day(scans=0, extra=[
+            (8, 45), (9, 17), (9, 50), (10, 22), (10, 54), (11, 31),
+            (12, 3), (12, 36), (13, 9), (13, 42), (14, 14), (14, 50),
+        ])
+        self.assertEqual(reliability.clean_field(DAY), "CLEAN yes")
+
+    def test_november_23_drift_passes(self):
+        _mark_day(scans=0, extra=[
+            (8, 45), (9, 17), (9, 50), (10, 23), (10, 55), (11, 31),
+            (12, 3), (12, 35), (13, 8), (13, 40), (14, 13), (14, 45),
+        ])
+        self.assertEqual(reliability.clean_field(DAY), "CLEAN yes")
 
     def test_an_exit_gap_over_fifteen_minutes_fails(self):
         _mark_day(skip_exits={10 * 60, 10 * 60 + 5, 10 * 60 + 10})
@@ -120,11 +169,7 @@ class CleanSessionTests(unittest.TestCase):
 
     def test_a_missing_day_is_not_clean(self):
         text = reliability.clean_field(DAY)
-        self.assertIn(
-            "missing 08:45, 09:15, 09:45, 10:15, 10:45, 11:15, 11:45, "
-            "12:15, 12:45, 13:15, 13:45, 14:15",
-            text,
-        )
+        self.assertIn("scans 0/12", text)
         self.assertIn("exit gap 385 min 08:30-14:55", text)
         self.assertIn("no bot seal", text)
 

@@ -3,11 +3,12 @@
 Heartbeat pings, the Discord outbox, the SESSION row, and the battery
 warning all log and continue. A missing URL, a down network, or a
 database error is not a halt. A confirmed Discord send keeps the outbox
-row and sets delivered_at. SESSION_FINAL's CLEAN field reads the twelve
-scheduled scan slots (08:45 through 14:15 CT), exit-pass gaps, any
-CRITICAL from that Chicago day that still has no delivered_at, and the
-ledger seal. An extra scan does not fail the day. None of that decides
-a trade.
+row and sets delivered_at. SESSION_FINAL's CLEAN field reads completed
+full scans from 08:45 through 14:55 CT (at least 12, first by 09:00,
+no gap over 45 minutes), exit-pass gaps, any CRITICAL from that
+Chicago day that still has no delivered_at, and the ledger seal. The
+scheduler is interval-based and drifts, so a scan is not required to
+land on a fixed minute. None of that decides a trade.
 """
 
 from __future__ import annotations
@@ -16,13 +17,17 @@ import hashlib
 import os
 import sqlite3
 import sys
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timezone
 from zoneinfo import ZoneInfo
 
 import config
 
 _CT = ZoneInfo("America/Chicago")
 EXPECTED_SCANS = 12
+_SCAN_START = time(8, 45)
+_SCAN_END = time(14, 55)
+_FIRST_SCAN_BY = time(9, 0)
+_SCAN_GAP_S = 45 * 60
 _EXIT_START = time(8, 30)
 _EXIT_END = time(14, 55)
 _EXIT_GAP_S = 15 * 60
@@ -421,9 +426,7 @@ def _clean_reasons(day: date) -> list[str]:
             conn.close()
     else:
         reasons.append("no bot seal")
-    missing = _missing_scan_slots(scans, day)
-    if missing:
-        reasons.append(missing)
+    reasons.extend(_scan_rule_reasons(scans, day))
     gap = _exit_gap_reason(exits, day)
     if gap:
         reasons.append(gap)
@@ -440,23 +443,46 @@ def _clean_reasons(day: date) -> list[str]:
     return reasons
 
 
-def _scheduled_slots(day: date) -> list[datetime]:
-    """08:45, 09:15, ... 14:15 CT. Twelve slots, thirty minutes apart."""
-    start = datetime.combine(day, time(8, 45), tzinfo=_CT)
-    return [start + timedelta(minutes=30 * index) for index in range(EXPECTED_SCANS)]
+def _scan_rule_reasons(moments: list[datetime], day: date) -> list[str]:
+    """Count and spacing of completed full scans, not a fixed minute grid.
+
+    A scan counts when it finished between 08:45 and 14:55 CT. The first
+    of those must be at or before 09:00. Consecutive counted scans may
+    not be more than 45 minutes apart. Extra scans do not fail the day.
+    """
+    start = datetime.combine(day, _SCAN_START, tzinfo=_CT)
+    end = datetime.combine(day, _SCAN_END, tzinfo=_CT)
+    inside = sorted(moment for moment in moments if start <= moment <= end)
+    reasons = []
+    if len(inside) < EXPECTED_SCANS:
+        reasons.append(f"scans {len(inside)}/{EXPECTED_SCANS}")
+    if inside:
+        cutoff = datetime.combine(day, _FIRST_SCAN_BY, tzinfo=_CT)
+        if inside[0] > cutoff:
+            reasons.append(f"first scan {inside[0].strftime('%H:%M')}")
+    gap = _scan_gap_reason(inside)
+    if gap:
+        reasons.append(gap)
+    return reasons
 
 
-def _missing_scan_slots(moments: list[datetime], day: date) -> str | None:
-    """A slot is covered by a scan in [slot, next slot). Extras do not count."""
-    slots = _scheduled_slots(day)
-    missing = []
-    for index, slot in enumerate(slots):
-        end = slots[index + 1] if index + 1 < len(slots) else slot + timedelta(minutes=30)
-        if not any(slot <= moment < end for moment in moments):
-            missing.append(slot.strftime("%H:%M"))
-    if not missing:
+def _scan_gap_reason(moments: list[datetime]) -> str | None:
+    if len(moments) < 2:
         return None
-    return "missing " + ", ".join(missing)
+    worst = None
+    worst_s = _SCAN_GAP_S
+    for left, right in zip(moments, moments[1:]):
+        gap = (right - left).total_seconds()
+        if gap > worst_s:
+            worst_s = gap
+            worst = (left, right, gap)
+    if worst is None:
+        return None
+    left, right, gap = worst
+    return (
+        f"gap {_minutes(gap)} min "
+        f"{left.strftime('%H:%M')}-{right.strftime('%H:%M')}"
+    )
 
 
 def _marks_for(conn: sqlite3.Connection, day: date):

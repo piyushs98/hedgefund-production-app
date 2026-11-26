@@ -239,6 +239,7 @@ stops, exits, the universe, or cadence.
   exit passes 08:30–14:55 CT; no scan with 0/10 tickers fetched; ledger
   and SESSION_FINAL written only by the bot; no manual or simulated
   edits to production databases.
+- 2026-11-25. Clarification before the extension starts: 'all 12 scheduled scans ran' is measured as >= 12 completed full scans 08:45–14:55 CT with no gap > 45 min, because the scheduler is interval-based and drifts.
 - Strategy criteria unchanged, scored on all clean sessions together
   (6 from Nov 16–25 + the 8 new): fill P&L > −$1,000, 80+ bucket mean
   R_fill > 0, no overnight holds, every CRITICAL delivered with a
