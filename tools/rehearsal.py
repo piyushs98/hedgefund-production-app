@@ -11,8 +11,9 @@ exit quotes do not move it: those exist to pace Yahoo, and this run has
 no second Yahoo call. With that, the live 5-minute / 30-minute math
 lands on 08:45, 09:15, 13:45, 14:15, 14:45, and 14:55 CT.
 
-One harness-only monotonic shift inserts a full scan at 11:30 CT and
-puts the later scans back on 12:15. The clock then runs into night mode
+One harness-only monotonic shift inserts a full scan at 11:30 CT.
+A second shift inserts the scheduled 11:45 CT scan, and the later
+scans stay on 12:15. The clock then runs into night mode
 so the reconciliation can write SESSION_FINAL. The 14:45 SESSION line
 is left as the live exit code wrote it. Copied rows for this session
 day are removed first, so that line is the simulated book and not the
@@ -56,10 +57,10 @@ HIGH_SLOTS = {
     },
     "AAPL": {(13, 15), (13, 45), (14, 15), (14, 45)},
     "MSFT": {(13, 45), (14, 15)},
-    # 11:15 is the first print. 11:30 admits. 12:15 keeps the score at or
-    # above 80 so the live time-stop exempt still applies. The quote
-    # crash at 12:30 is the close.
-    "META": {(11, 15), (11, 30), (12, 15)},
+    # 11:15 is the first print. 11:30 admits. 11:45 and 12:15 keep the
+    # score at or above 80 so the live time-stop exempt still applies.
+    # The quote crash at 12:30 is the close.
+    "META": {(11, 15), (11, 30), (11, 45), (12, 15)},
 }
 
 PPI_POSTS = (
@@ -184,9 +185,9 @@ def _forget_session_day(news: Path) -> None:
 
     The 14:45 writer leaves an existing session row alone, and night
     reconciliation leaves a complete SESSION_FINAL alone. The copied
-    database already has both for 2026-11-16, plus that day's trades,
-    so the report would grade the live book. The live files are not
-    opened here.
+    database already has both for 2026-11-16, plus that day's trades
+    and any CRITICAL outbox rows, so the report would grade the live
+    book. The live files are not opened here.
     """
     day = SESSION_DAY.isoformat()
     conn = sqlite3.connect(news)
@@ -222,6 +223,16 @@ def _forget_session_day(news: Path) -> None:
             if drop:
                 conn.executemany(
                     "DELETE FROM trade_history WHERE id = ?",
+                    [(item,) for item in drop],
+                )
+        if "discord_outbox" in names:
+            rows = conn.execute(
+                "SELECT id, created_at FROM discord_outbox"
+            ).fetchall()
+            drop = [row[0] for row in rows if _ct(row[1]).startswith(day)]
+            if drop:
+                conn.executemany(
+                    "DELETE FROM discord_outbox WHERE id = ?",
                     [(item,) for item in drop],
                 )
         conn.commit()
@@ -303,6 +314,11 @@ def _install_clock() -> None:
             return
         local = CLOCK.ct.astimezone(CHICAGO)
         on_minute = local.second == 0 and local.microsecond == 0
+        # +900 at 11:15 pulls the next full scan forward to 11:30.
+        # +900 at 11:30 runs after that scan has stamped its mono time,
+        # so the following full scan lands on 11:45. That stamp already
+        # includes the nudge, and the next interval is a normal 30 minutes
+        # back on 12:15. No later subtract.
         if on_minute and local.hour == 11 and local.minute == 15 and not CLOCK.nudged_forward:
             CLOCK.mono += 900.0
             CLOCK.nudged_forward = True
@@ -314,9 +330,9 @@ def _install_clock() -> None:
             and CLOCK.nudged_forward
             and not CLOCK.nudged_back
         ):
-            CLOCK.mono -= 900.0
+            CLOCK.mono += 900.0
             CLOCK.nudged_back = True
-            print("[rehearsal] mono -900 at 11:30 CT", file=sys.stderr)
+            print("[rehearsal] mono +900 at 11:30 CT", file=sys.stderr)
         left = span
         while left > 1e-9:
             step = min(20.0, left)
@@ -523,6 +539,13 @@ def _install_io() -> None:
                 f"----- {stamp} critical={bool(critical)} -----\n"
                 f"{message}\n"
             )
+        # The file stands in for HTTP 200/204. A CRITICAL records the
+        # same delivered_at the live sender writes after Discord accepts.
+        if critical and message and str(message).strip():
+            import fill_accounting
+            import reliability
+            fill_accounting.note_critical()
+            reliability.note_delivered_critical(str(message))
         return True
 
     def search(params, _token, timeout_s=10):
@@ -749,6 +772,8 @@ def _report(news: Path, log_text: str) -> int:
 
     conn = sqlite3.connect(f"file:{news}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    scan_marks = []
+    critical_rows = []
     try:
         cols = [row[1] for row in conn.execute("PRAGMA table_info(trade_history)")]
         has_fill = "fill_est" in cols
@@ -815,6 +840,29 @@ def _report(news: Path, log_text: str) -> int:
                 """,
                 (SESSION_DAY.isoformat(),),
             ).fetchall()
+        if "session_marks" in names:
+            scan_marks = conn.execute(
+                """
+                SELECT at_ct FROM session_marks
+                WHERE session_date = ? AND kind = 'scan'
+                ORDER BY at_ct
+                """,
+                (SESSION_DAY.isoformat(),),
+            ).fetchall()
+        if "discord_outbox" in names:
+            crit_cols = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(discord_outbox)")
+            }
+            if {"body", "delivered_at", "critical"} <= crit_cols:
+                critical_rows = conn.execute(
+                    """
+                    SELECT body, created_at, delivered_at
+                    FROM discord_outbox
+                    WHERE critical = 1
+                    ORDER BY id
+                    """
+                ).fetchall()
     finally:
         conn.close()
 
@@ -1064,6 +1112,28 @@ def _report(news: Path, log_text: str) -> int:
     print(session_text or "(none)")
     print("\n--- SESSION_FINAL line ---")
     print(final_text or "(none)")
+    print("\n--- scan marks (FULL SCAN) ---")
+    if not scan_marks:
+        print("(none)")
+    else:
+        clocks = []
+        for row in scan_marks:
+            text = _ct(row["at_ct"])
+            clocks.append(text[11:16] if len(text) >= 16 else text)
+        print(" ".join(clocks))
+    print("\n--- critical outbox ---")
+    if not critical_rows:
+        print("(none)")
+    undelivered = 0
+    for row in critical_rows:
+        delivered = str(row["delivered_at"] or "").strip()
+        if not delivered:
+            undelivered += 1
+        snippet = " ".join(str(row["body"] or "").split())
+        if len(snippet) > 120:
+            snippet = snippet[:117] + "..."
+        print(f"delivered_at={delivered or '(missing)'} {snippet}")
+    print(f"critical rows: {len(critical_rows)}  missing delivered_at: {undelivered}")
     print("\n--- session latch ---")
     print(latch or "(never)")
     print(f"all latch calls: {CLOCK.latch_at or '(none)'}")

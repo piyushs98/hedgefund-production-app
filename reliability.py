@@ -3,8 +3,11 @@
 Heartbeat pings, the Discord outbox, the SESSION row, and the battery
 warning all log and continue. A missing URL, a down network, or a
 database error is not a halt. A confirmed Discord send keeps the outbox
-row and sets delivered_at. SESSION_FINAL's CLEAN field reads scan marks,
-exit-pass gaps, and the ledger seal. None of that decides a trade.
+row and sets delivered_at. SESSION_FINAL's CLEAN field reads the twelve
+scheduled scan slots (08:45 through 14:15 CT), exit-pass gaps, any
+CRITICAL from that Chicago day that still has no delivered_at, and the
+ledger seal. An extra scan does not fail the day. None of that decides
+a trade.
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ import hashlib
 import os
 import sqlite3
 import sys
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import config
@@ -401,9 +404,10 @@ def _insert_mark(kind: str, when, fetched, universe_n) -> None:
 def _clean_reasons(day: date) -> list[str]:
     reasons = []
     path = config.NEWS_DB_PATH
-    scans = 0
+    scans: list[datetime] = []
     zeros = 0
     exits: list[datetime] = []
+    undelivered: list[str] = []
     digest = None
     sealed = None
     if path and os.path.exists(path):
@@ -412,12 +416,14 @@ def _clean_reasons(day: date) -> list[str]:
         try:
             scans, zeros, exits = _marks_for(conn, day)
             sealed, digest = _seal_status(conn)
+            undelivered = _undelivered_critical_reasons(conn, day)
         finally:
             conn.close()
     else:
         reasons.append("no bot seal")
-    if scans != EXPECTED_SCANS:
-        reasons.append(f"scans {scans}/{EXPECTED_SCANS}")
+    missing = _missing_scan_slots(scans, day)
+    if missing:
+        reasons.append(missing)
     gap = _exit_gap_reason(exits, day)
     if gap:
         reasons.append(gap)
@@ -428,16 +434,36 @@ def _clean_reasons(day: date) -> list[str]:
             reasons.append("no bot seal")
         elif sealed != digest:
             reasons.append("ledger edited after the last bot mark")
+    reasons.extend(undelivered)
     if _rehearsal_hitting_live_db():
         reasons.append("simulated edit of the production database")
     return reasons
 
 
+def _scheduled_slots(day: date) -> list[datetime]:
+    """08:45, 09:15, ... 14:15 CT. Twelve slots, thirty minutes apart."""
+    start = datetime.combine(day, time(8, 45), tzinfo=_CT)
+    return [start + timedelta(minutes=30 * index) for index in range(EXPECTED_SCANS)]
+
+
+def _missing_scan_slots(moments: list[datetime], day: date) -> str | None:
+    """A slot is covered by a scan in [slot, next slot). Extras do not count."""
+    slots = _scheduled_slots(day)
+    missing = []
+    for index, slot in enumerate(slots):
+        end = slots[index + 1] if index + 1 < len(slots) else slot + timedelta(minutes=30)
+        if not any(slot <= moment < end for moment in moments):
+            missing.append(slot.strftime("%H:%M"))
+    if not missing:
+        return None
+    return "missing " + ", ".join(missing)
+
+
 def _marks_for(conn: sqlite3.Connection, day: date):
     names = _table_names(conn)
     if "session_marks" not in names:
-        return 0, 0, []
-    scans = 0
+        return [], 0, []
+    scans: list[datetime] = []
     zeros = 0
     exits: list[datetime] = []
     rows = conn.execute(
@@ -447,7 +473,9 @@ def _marks_for(conn: sqlite3.Connection, day: date):
     )
     for kind, at_ct, fetched, universe_n in rows:
         if kind == "scan":
-            scans += 1
+            moment = _parse_ct(at_ct)
+            if moment is not None:
+                scans.append(moment)
             if fetched == 0 and universe_n == 10:
                 zeros += 1
         elif kind == "exit":
@@ -455,6 +483,38 @@ def _marks_for(conn: sqlite3.Connection, day: date):
             if moment is not None:
                 exits.append(moment)
     return scans, zeros, exits
+
+
+def _undelivered_critical_reasons(conn: sqlite3.Connection, day: date) -> list[str]:
+    """CRITICAL rows for this Chicago day that Discord has not confirmed."""
+    names = _table_names(conn)
+    if "discord_outbox" not in names:
+        return []
+    cols = _columns(conn, "discord_outbox")
+    if not {"body", "created_at", "critical", "delivered_at"} <= cols:
+        return []
+    reasons = []
+    rows = conn.execute(
+        """SELECT body, created_at, delivered_at
+           FROM discord_outbox
+           WHERE critical = 1
+           ORDER BY id"""
+    )
+    for body, created_at, delivered_at in rows:
+        if str(delivered_at or "").strip():
+            continue
+        moment = _parse_ct(created_at)
+        if moment is None or moment.date() != day:
+            continue
+        reasons.append("undelivered CRITICAL: " + _critical_snippet(body))
+    return reasons
+
+
+def _critical_snippet(body: str) -> str:
+    text = " ".join(str(body or "").replace("|", " ").replace(";", ",").split())
+    if len(text) > 80:
+        text = text[:77].rstrip() + "..."
+    return text or "(empty)"
 
 
 def _seal_status(conn: sqlite3.Connection):
