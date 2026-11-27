@@ -952,6 +952,12 @@ def _finish_market_pass(kind: str) -> None:
         reliability.ping_heartbeat(kind)
     except Exception as exc:
         print(f"[heartbeat] {kind} ping warn: {exc}")
+    if kind == "scan":
+        try:
+            import shadow_regime
+            shadow_regime.mark_full_scan(datetime.now(timezone.utc))
+        except Exception as exc:
+            print(f"[Shadow] regime mark failed: {type(exc).__name__}")
     try:
         import reliability
         if kind == "exit":

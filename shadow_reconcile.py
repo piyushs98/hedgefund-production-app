@@ -131,6 +131,7 @@ def _write(now, day: date) -> None:
     final = "SESSION_FINAL|" + line[len("SESSION|"):]
     if incomplete:
         final += "|incomplete=1"
+    final += "|" + _regime_clause(day, now)
     final += "|" + reliability.clean_field(day)
     # Tags first. A stored complete row would skip a later retry, so a
     # tag failure must happen before that row exists.
@@ -140,6 +141,20 @@ def _write(now, day: date) -> None:
     reliability.seal_ledger()
     print(f"[reconcile] {final}")
     _post(final, incomplete)
+
+
+def _regime_clause(day: date, now) -> str:
+    """One field, before CLEAN. A failure still leaves a NULL regime."""
+    try:
+        import shadow_regime
+        shadow_regime.finish_day(day, now=now)
+        text = shadow_regime.session_clause(day)
+    except Exception as exc:
+        print(f"[Shadow] regime day label failed: {type(exc).__name__}")
+        text = "regime: NULL, range NULL"
+    if "|" in text or not text.startswith("regime:"):
+        return "regime: NULL, range NULL"
+    return text
 
 
 def _post(line: str, incomplete: bool) -> None:

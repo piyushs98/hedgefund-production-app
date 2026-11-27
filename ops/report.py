@@ -182,6 +182,14 @@ def render_report(paths=None) -> str:
     _emit_regimes(add, summary.get("regimes") or {})
     add("  The pre-registered bar is positive in at least 2 of 3 regimes.")
     add("")
+    try:
+        import shadow_regime
+        for line in shadow_regime.weekly_lines(paths.news_db):
+            add(line)
+    except Exception as regime_err:
+        add("SHADOW REGIME  (logged only; not a live rule; not the measured regime table)")
+        add(f"  SHADOW regime: unavailable ({type(regime_err).__name__})")
+    add("")
 
     add("CARRIED VS SAME-DAY  (fill P&L and mean R)")
     add("  Same-day means the Chicago entry date is the Chicago close date.")

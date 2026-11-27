@@ -224,6 +224,37 @@ row for every calendar event released between entry and exit, with parsed
 actual, forecast, prior, surprise, and SPY/QQQ reaction. A failure logs
 and sends one non-critical Discord note. It does not change the fill.
 
+## Shadow hypotheses, pre-registered 2026-11-26
+
+Recorded 2026-11-26, before any row in `regime_marks`. Shadow only.
+The trading stamp stays `v91c6693`. These logs do not change the live
+score, the gate, size, stops, exits, the universe, or cadence.
+
+H1 (alignment): entries with `aligned_with_spy_move` = true have higher
+mean R_fill than entries with `aligned_with_spy_move` = false.
+
+H2 (chop filter): if the SPY range by 10:00 CT is under a threshold
+chosen ONLY from the first 15 sessions of this log, then entries after
+10:00 CT that day have mean R_fill < 0. Tested on the next 15 sessions.
+The 10:00 CT range is the latest `regime_marks.spy_range_pct` whose
+`scanned_at` is at or before 10:00 CT that session. A session with no
+such row is not scored. The threshold is not chosen in code.
+
+H3 (volatility): puts entered while VIX1D is up since the open have
+higher mean R_fill than puts entered while VIX1D is down since the
+open, and the reverse for calls.
+
+Adoption bar for any rule: at least 30 logged sessions, including at
+least 3 trend_days and 3 chop_days; a day-block bootstrap 90% CI of
+the improvement excludes zero; the result holds in both halves of the
+sample; then a separate shadow-only confirmation period before any
+live change. No other hypothesis may be discovered in this data and
+adopted without the same out-of-sample step.
+
+Evaluation note, no change now: the 70–79 bucket beat 80+ in both the
+measurement and the test. Compare again at 30 sessions. This note does
+not change the gate.
+
 ## Test extension, pre-registered 2026-11-25
 
 Recorded 2026-11-25, before the Nov 30 session. The trading stamp stays

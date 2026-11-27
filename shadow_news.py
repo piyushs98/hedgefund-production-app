@@ -995,6 +995,11 @@ def run_tick(now: datetime, holidays, db_path=None, key=_ENV_KEY, fetch=None, cl
     consider_squawk(moment, db_path=db_path, key=key, client=client)
     consider_yields(moment, db_path=db_path)
     consider_reactions(moment, db_path=db_path)
+    try:
+        import shadow_regime
+        shadow_regime.ensure_reference(moment, db_path=db_path)
+    except Exception as exc:
+        print(f"[Shadow] regime reference failed: {type(exc).__name__}")
 
 
 def _latest_health(conn, source: str, since: str | None = None):

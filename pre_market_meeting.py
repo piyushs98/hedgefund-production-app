@@ -391,6 +391,14 @@ def generate_morning_briefing(api_key=None):
     except Exception as shadow_err:
         print(f"[Chief of Staff] shadow brief line skipped: {type(shadow_err).__name__}")
 
+    try:
+        import shadow_regime
+        regime_line = shadow_regime.brief_prior_line()
+        if regime_line:
+            briefing_text = (briefing_text or "").rstrip() + "\n" + regime_line
+    except Exception as regime_err:
+        print(f"[Chief of Staff] regime brief line skipped: {type(regime_err).__name__}")
+
     # 2. Broadcast to Discord (never raises; returns False on webhook failure)
     print("[Chief of Staff] 📋 CoS Agent (AI): Broadcasting morning briefing to Discord...")
     broadcaster.send_discord_alert(briefing_text)

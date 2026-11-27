@@ -413,16 +413,26 @@ def note_open(*, ticker, direction, score, entry_at, db_path=None) -> None:
         )
     except Exception as exc:
         print(f"[Shadow] context tag failed: {type(exc).__name__}")
-        return
-    print(
-        f"[Shadow] context {ticker} {direction} score={tag['score']} "
-        f"event={tag['event_id']} label={tag['label']} bias={tag['bias']} "
-        f"context_adj={tag['context_adj']} would_flip={tag['would_flip']} "
-        f"would_flip_80={tag['would_flip_80']} "
-        f"would_block={tag['would_block']} "
-        f"next_event_name={tag['next_event_name']} "
-        f"minutes_to_next_event={tag['minutes_to_next_event']}"
-    )
+    else:
+        print(
+            f"[Shadow] context {ticker} {direction} score={tag['score']} "
+            f"event={tag['event_id']} label={tag['label']} bias={tag['bias']} "
+            f"context_adj={tag['context_adj']} would_flip={tag['would_flip']} "
+            f"would_flip_80={tag['would_flip_80']} "
+            f"would_block={tag['would_block']} "
+            f"next_event_name={tag['next_event_name']} "
+            f"minutes_to_next_event={tag['minutes_to_next_event']}"
+        )
+    try:
+        import shadow_regime
+        shadow_regime.tag_entry(
+            ticker=ticker,
+            direction=direction,
+            entry_at=entry_at,
+            db_path=db_path,
+        )
+    except Exception as exc:
+        print(f"[Shadow] regime tag failed: {type(exc).__name__}")
 
 
 def _surprise_for(event_id: str, items: list[dict]) -> dict:

@@ -24,6 +24,18 @@ LLM_TIMEOUT_S = int(os.environ.get("LLM_CALL_TIMEOUT_S", "40"))
 MIN_AUDIT_TRADES = int(os.environ.get("MIN_AUDIT_TRADES", "3"))
 
 
+def _shadow_section() -> str:
+    """Weekly shadow counts. Read only. A failure does not change the audit."""
+    try:
+        import shadow_regime
+        return "\n".join(shadow_regime.weekly_lines(DB_PATH))
+    except Exception as exc:
+        return (
+            "SHADOW REGIME  (logged only; not a live rule; not the measured regime table)\n"
+            f"  SHADOW regime: unavailable ({type(exc).__name__})"
+        )
+
+
 def _is_open_marker(notes: Any) -> bool:
     return str(notes or "").strip() == "PAPER_BUY_OPEN"
 
@@ -82,6 +94,7 @@ def run_saturday_audit():
                 f"will be reported.\n"
                 f"No sample data was substituted."
             )
+            report = report.rstrip() + "\n\n" + _shadow_section()
             print(report)
             broadcaster.send_discord_alert(report)
             return
@@ -180,6 +193,7 @@ The weight JSON below is diagnostic only and does not change the engine.
 {json.dumps(weights, indent=2)}
 ```
 """
+        report = report.rstrip() + "\n\n" + _shadow_section()
         print(report)
         broadcaster.send_discord_alert(report)
 
