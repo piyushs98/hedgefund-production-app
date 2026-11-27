@@ -400,7 +400,18 @@ def tag_open_from_db(*, direction, score, entry_at, db_path=None) -> dict:
     )
 
 
-def note_open(*, ticker, direction, score, entry_at, db_path=None) -> None:
+def note_open(
+    *,
+    ticker,
+    direction,
+    score,
+    entry_at,
+    db_path=None,
+    components=None,
+    quote=None,
+    contract=None,
+    trade_id=None,
+) -> None:
     """Log one tag after a paper open. A failure does not change the open."""
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return
@@ -433,6 +444,20 @@ def note_open(*, ticker, direction, score, entry_at, db_path=None) -> None:
         )
     except Exception as exc:
         print(f"[Shadow] regime tag failed: {type(exc).__name__}")
+    try:
+        import shadow_tape
+        shadow_tape.note_entry(
+            ticker=ticker,
+            direction=direction,
+            entry_at=entry_at,
+            components=components,
+            quote=quote,
+            contract=contract,
+            db_path=db_path,
+            trade_id=trade_id,
+        )
+    except Exception as exc:
+        print(f"[Shadow] entry tape failed: {type(exc).__name__}")
 
 
 def _surprise_for(event_id: str, items: list[dict]) -> dict:

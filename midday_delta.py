@@ -967,9 +967,26 @@ def _finish_market_pass(kind: str) -> None:
         print(f"[session] {kind} mark failed: {exc}")
 
 
-def _shadow_note_open(ticker: str, direction, score) -> None:
+def _shadow_note_open(
+    ticker: str,
+    direction,
+    score,
+    card=None,
+    contract=None,
+    options_dict=None,
+) -> None:
     """Tag one paper open. A timeout or error does not change the fill."""
     entry_at = datetime.now(timezone.utc)
+    components = None
+    quote = None
+    try:
+        import shadow_tape
+        components = shadow_tape.components_from_card(card)
+        quote = shadow_tape.chain_row(options_dict, contract)
+    except Exception as exc:
+        print(f"[Shadow] entry tape failed: {type(exc).__name__}")
+        components = None
+        quote = None
     pool = None
     try:
         def _run() -> None:
@@ -979,6 +996,9 @@ def _shadow_note_open(ticker: str, direction, score) -> None:
                 direction=direction,
                 score=score,
                 entry_at=entry_at,
+                components=components,
+                quote=quote,
+                contract=contract,
             )
 
         pool = ThreadPoolExecutor(max_workers=1)
@@ -990,6 +1010,35 @@ def _shadow_note_open(ticker: str, direction, score) -> None:
     finally:
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _shadow_full_scan(scored, decisions, closed, open_before) -> None:
+    """Blocked names and exit quotes for one completed full scan. Fail-open."""
+    try:
+        import shadow_tape
+        shadow_tape.on_full_scan(
+            datetime.now(timezone.utc),
+            scored=scored,
+            decisions=decisions,
+            closed=closed,
+            open_before=open_before,
+        )
+    except Exception as exc:
+        print(f"[Shadow] tape failed: {type(exc).__name__}")
+
+
+def _shadow_exit_pass(scored=None, closed=None, open_before=None) -> None:
+    """Checkpoints that land on this exit pass. Fail-open."""
+    try:
+        import shadow_tape
+        shadow_tape.on_exit_pass(
+            datetime.now(timezone.utc),
+            scored=scored,
+            closed=closed,
+            open_before=open_before,
+        )
+    except Exception as exc:
+        print(f"[Shadow] post-exit failed: {type(exc).__name__}")
 
 
 def run_thirty_min_scan(
@@ -1201,6 +1250,7 @@ def run_thirty_min_scan(
     except Exception as mark_err:
         print(f"[session] scan exit mark failed: {mark_err}")
     exit_summary: dict[str, Any] = {}
+    open_before_exits: list = []
     try:
         import position_exits
         from tracker_agent import load_active_trades as _load_open
@@ -1428,6 +1478,9 @@ def run_thirty_min_scan(
                                 ticker,
                                 contract.get("direction"),
                                 card.total_score,
+                                card=card,
+                                contract=contract,
+                                options_dict=options_dict,
                             )
 
         snap = _card_snapshot(card, atr_abs=atr_abs)
@@ -1595,6 +1648,12 @@ def run_thirty_min_scan(
         reliability.note_completed_scan(_as_chicago(), chains_fetched, len(universe))
     except Exception as mark_err:
         print(f"[session] scan mark failed: {mark_err}")
+    _shadow_full_scan(
+        scored,
+        gate_decisions,
+        exit_summary.get("closed"),
+        open_before_exits,
+    )
     _finish_market_pass("scan")
     return result
 
@@ -1651,6 +1710,9 @@ def run_exit_only_pass(
             "still checking underlying stops via spot."
         )
         result["circuit_breaker_open"] = True
+        open_trades = []
+        scored_spot: dict[str, dict] = {}
+        exit_summary: dict[str, Any] = {}
         try:
             from data_engineer import fetch_spot as _fetch_spot
             from tracker_agent import load_active_trades as _load
@@ -1660,9 +1722,9 @@ def run_exit_only_pass(
             if not open_trades:
                 result["aborted"] = True
                 _emit_eod_book_into(result)
+                _shadow_exit_pass(scored={}, closed=[], open_before=[])
                 _finish_market_pass("exit")
                 return result
-            scored_spot: dict[str, dict] = {}
             for t in open_trades:
                 if not isinstance(t, dict) or not t.get("ticker"):
                     continue
@@ -1714,6 +1776,11 @@ def run_exit_only_pass(
             print(f"[exit-pass] breaker-open underlying pass failed: {e}")
             result["aborted"] = True
         _emit_eod_book_into(result)
+        _shadow_exit_pass(
+            scored=scored_spot,
+            closed=exit_summary.get("closed"),
+            open_before=open_trades,
+        )
         _finish_market_pass("exit")
         return result
 
@@ -1722,6 +1789,7 @@ def run_exit_only_pass(
     except Exception as e:
         print(f"[exit-pass] load_active_trades failed: {e}")
         result["error"] = str(e)
+        _shadow_exit_pass()
         _finish_market_pass("exit")
         return result
 
@@ -1729,6 +1797,7 @@ def run_exit_only_pass(
     if not open_trades:
         print(f"[exit-pass] {clock} CT — no open positions; skip mark fetches.")
         _emit_eod_book_into(result)
+        _shadow_exit_pass(scored={}, closed=[], open_before=[])
         _finish_market_pass("exit")
         return result
 
@@ -1839,6 +1908,7 @@ def run_exit_only_pass(
         f"failed={result['quote_mode_counts'].get('failed', 0)}"
     )
 
+    exit_summary: dict[str, Any] = {}
     try:
         exit_summary = position_exits.run_scan_exits(
             open_trades,
@@ -1897,6 +1967,11 @@ def run_exit_only_pass(
     print(
         f"✅ EXIT-ONLY {scan_id} complete | closed={len(result.get('closed') or [])} "
         f"open {result.get('open_before')}→{result.get('open_after')}"
+    )
+    _shadow_exit_pass(
+        scored=scored,
+        closed=exit_summary.get("closed"),
+        open_before=open_trades,
     )
     _finish_market_pass("exit")
     return result

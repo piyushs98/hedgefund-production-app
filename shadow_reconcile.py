@@ -132,6 +132,7 @@ def _write(now, day: date) -> None:
     if incomplete:
         final += "|incomplete=1"
     final += "|" + _regime_clause(day, now)
+    final += "|" + _backup_clause(day)
     final += "|" + reliability.clean_field(day)
     # Tags first. A stored complete row would skip a later retry, so a
     # tag failure must happen before that row exists.
@@ -141,6 +142,19 @@ def _write(now, day: date) -> None:
     reliability.seal_ledger()
     print(f"[reconcile] {final}")
     _post(final, incomplete)
+
+
+def _backup_clause(day: date) -> str:
+    """One field, after the regime clause and before CLEAN."""
+    try:
+        import shadow_tape
+        text = shadow_tape.backup_clause(day)
+    except Exception as exc:
+        print(f"[Shadow] backup failed: {type(exc).__name__}")
+        text = "backup FAILED"
+    if text not in ("backup ok", "backup FAILED"):
+        return "backup FAILED"
+    return text
 
 
 def _regime_clause(day: date, now) -> str:

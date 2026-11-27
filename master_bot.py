@@ -1484,11 +1484,25 @@ def run_portfolio_scan(
                             })
                             try:
                                 import shadow_context
+                                components = None
+                                quote = None
+                                try:
+                                    import shadow_tape
+                                    components = shadow_tape.components_from_card(card)
+                                    quote = shadow_tape.chain_row(options_dict, contract)
+                                except Exception as tape_err:
+                                    print(
+                                        f"[Shadow] entry tape failed: "
+                                        f"{type(tape_err).__name__}"
+                                    )
                                 shadow_context.note_open(
                                     ticker=ticker,
                                     direction=contract.get("direction"),
                                     score=card.total_score,
                                     entry_at=datetime.now(timezone.utc),
+                                    components=components,
+                                    quote=quote,
+                                    contract=contract,
                                 )
                             except Exception as tag_err:
                                 print(

@@ -190,6 +190,14 @@ def render_report(paths=None) -> str:
         add("SHADOW REGIME  (logged only; not a live rule; not the measured regime table)")
         add(f"  SHADOW regime: unavailable ({type(regime_err).__name__})")
     add("")
+    try:
+        import shadow_tape
+        for line in shadow_tape.weekly_lines(paths.news_db):
+            add(line)
+    except Exception as tape_err:
+        add("SHADOW POST-EXIT  (logged only; not a live rule)")
+        add(f"  SHADOW tape: unavailable ({type(tape_err).__name__})")
+    add("")
 
     add("CARRIED VS SAME-DAY  (fill P&L and mean R)")
     add("  Same-day means the Chicago entry date is the Chicago close date.")

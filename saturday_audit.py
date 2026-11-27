@@ -26,14 +26,22 @@ MIN_AUDIT_TRADES = int(os.environ.get("MIN_AUDIT_TRADES", "3"))
 
 def _shadow_section() -> str:
     """Weekly shadow counts. Read only. A failure does not change the audit."""
+    lines: list[str] = []
     try:
         import shadow_regime
-        return "\n".join(shadow_regime.weekly_lines(DB_PATH))
+        lines.extend(shadow_regime.weekly_lines(DB_PATH))
     except Exception as exc:
-        return (
-            "SHADOW REGIME  (logged only; not a live rule; not the measured regime table)\n"
-            f"  SHADOW regime: unavailable ({type(exc).__name__})"
+        lines.append(
+            "SHADOW REGIME  (logged only; not a live rule; not the measured regime table)"
         )
+        lines.append(f"  SHADOW regime: unavailable ({type(exc).__name__})")
+    try:
+        import shadow_tape
+        lines.extend(shadow_tape.weekly_lines(DB_PATH))
+    except Exception as exc:
+        lines.append("SHADOW POST-EXIT  (logged only; not a live rule)")
+        lines.append(f"  SHADOW tape: unavailable ({type(exc).__name__})")
+    return "\n".join(lines)
 
 
 def _is_open_marker(notes: Any) -> bool:
