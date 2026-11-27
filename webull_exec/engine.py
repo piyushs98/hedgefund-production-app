@@ -15,11 +15,12 @@ from webull_exec.limits import (
     EXIT_REPRICE_S,
     MAX_OPEN,
     MAX_PREMIUM,
-    STOP_UNPROTECTED_S,
     TICKERS,
+    configured_stop_type,
+    other_stop_type,
     stop_limit_price,
 )
-from webull_exec.orders import entry_limit, entry_with_stop, protective_stop, sell_limit
+from webull_exec.orders import entry_limit, protective_stop, sell_limit
 
 HALT_NAME = "webull_exec.halt"
 
@@ -145,14 +146,16 @@ class Engine:
         for paper in self.paper_opens():
             if paper.trade_id in self.baseline or paper.trade_id in self.store.known_ids():
                 continue
-            reason = self._skip_reason(paper, open_n)
+            reason = self._skip_reason(paper, open_n, day)
             if reason:
                 self._miss(paper, reason)
                 continue
             self._submit_entry(paper, now)
             open_n += 1
 
-    def _skip_reason(self, paper, open_n: int) -> str | None:
+    def _skip_reason(self, paper, open_n: int, session_day: str) -> str | None:
+        if str(paper.expiration or "")[:10] == session_day:
+            return "expiry-day"
         if paper.ticker not in TICKERS:
             return "ticker"
         if paper.entry_score is None or paper.entry_score < 80:
@@ -187,20 +190,14 @@ class Engine:
     def _submit_entry(self, paper, now: datetime) -> None:
         day = now_ct(now).date().strftime("%Y%m%d")
         buy_id = self.store.next_id(day, "b")
-        stop_id = self.store.next_id(day, "s")
-        limit = stop_limit_price(paper.stop_loss)
-        combo = entry_with_stop(
-            buy_id=buy_id,
-            stop_id=stop_id,
+        plain = entry_limit(
+            client_order_id=buy_id,
             ticker=paper.ticker,
             strike=paper.strike,
             expiration=paper.expiration,
             option_type=paper.option_type,
             entry_ask=paper.entry_ask,
-            stop_price=paper.stop_loss,
-            stop_limit=limit,
         )
-        combo_id = self.store.next_id(day, "c")
         self._save_quote(
             paper.trade_id,
             "entry",
@@ -210,35 +207,17 @@ class Engine:
         )
         row = self._row(paper, now)
         row["entry_client_order_id"] = buy_id
-        row["stop_client_order_id"] = stop_id
-        row["combo"] = 1
-        row["state"] = "working"
-        self.store.upsert_intent(row)
-        self._pending(buy_id, paper.trade_id, "entry", combo[0])
-        self._pending(stop_id, paper.trade_id, "stop", combo[1])
-        result = self.broker.place(combo, combo_id)
-        self.store.remember_order(buy_id, paper.trade_id, "entry", combo[0], result, "ack" if result.get("ok") else "rejected")
-        self.store.remember_order(stop_id, paper.trade_id, "stop", combo[1], result, "ack" if result.get("ok") else "rejected")
-        if result.get("ok"):
-            return
-        plain_id = self.store.next_id(day, "b")
-        plain = entry_limit(
-            client_order_id=plain_id,
-            ticker=paper.ticker,
-            strike=paper.strike,
-            expiration=paper.expiration,
-            option_type=paper.option_type,
-            entry_ask=paper.entry_ask,
-        )
-        row["entry_client_order_id"] = plain_id
         row["stop_client_order_id"] = None
         row["combo"] = 0
+        row["state"] = "working"
         self.store.upsert_intent(row)
-        self._pending(plain_id, paper.trade_id, "entry", plain[0])
-        second = self.broker.place(plain, None)
-        self.store.remember_order(plain_id, paper.trade_id, "entry", plain[0], second, "ack" if second.get("ok") else "rejected")
-        row["state"] = "working" if second.get("ok") else "rejected"
-        row["miss_reason"] = None if second.get("ok") else "rejected"
+        self._pending(buy_id, paper.trade_id, "entry", plain[0])
+        result = self.broker.place(plain, None)
+        self.store.remember_order(buy_id, paper.trade_id, "entry", plain[0], result, "ack" if result.get("ok") else "rejected")
+        if result.get("ok"):
+            return
+        row["state"] = "rejected"
+        row["miss_reason"] = "rejected"
         self.store.upsert_intent(row)
 
     def _pending(self, client_order_id: str, trade_id: str, intent: str, request: dict) -> None:
@@ -332,8 +311,21 @@ class Engine:
         return False, None
 
     def _place_stop(self, row: dict, now: datetime) -> None:
+        if row.get("miss_reason") == "no_broker_stop":
+            return
+        preferred = configured_stop_type()
+        if self._send_stop(row, now, preferred):
+            return
+        if self._send_stop(row, now, other_stop_type(preferred)):
+            return
+        row["state"] = "filled_unprotected"
+        row["miss_reason"] = "no_broker_stop"
+        self.store.upsert_intent(row)
+        self.notify.critical(f"stop-{row['trade_id']}", "POSITION WITHOUT BROKER STOP")
+
+    def _send_stop(self, row: dict, now: datetime, order_type: str) -> bool:
         day = now_ct(now).date().strftime("%Y%m%d")
-        stop_id = row.get("stop_client_order_id") or self.store.next_id(day, "s")
+        stop_id = self.store.next_id(day, "s")
         limit = stop_limit_price(float(row["stop_price"]))
         payload = protective_stop(
             client_order_id=stop_id,
@@ -343,6 +335,7 @@ class Engine:
             option_type=row["option_type"],
             stop_price=float(row["stop_price"]),
             stop_limit=limit,
+            order_type=order_type,
         )
         self._pending(stop_id, row["trade_id"], "stop", payload[0])
         result = self.broker.place(payload, None)
@@ -350,14 +343,19 @@ class Engine:
         row["stop_client_order_id"] = stop_id
         if result.get("ok"):
             row["state"] = "protected"
-        else:
-            row["state"] = "filled_unprotected"
-            age = _elapsed(now, row.get("filled_at")) or 0
-            if age >= STOP_UNPROTECTED_S:
-                self.notify.critical(f"stop-{row['trade_id']}", f"stop rejected for {row['ticker']} {row['trade_id']}")
+            row["miss_reason"] = None
+            self.store.upsert_intent(row)
+            return True
+        row["state"] = "filled_unprotected"
         self.store.upsert_intent(row)
+        return False
 
     def _manage_unprotected(self, row: dict, now: datetime, live_ids: set[str]) -> None:
+        if row.get("miss_reason") == "no_broker_stop":
+            if row["trade_id"] not in live_ids:
+                fresh = self.store.intent(row["trade_id"]) or row
+                self._start_exit(fresh, now, "paper_close")
+            return
         status = {}
         if row.get("stop_client_order_id"):
             status = self.broker.order_status(row["stop_client_order_id"])

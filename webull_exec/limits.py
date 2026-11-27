@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 TICKERS = (
     "SPY",
     "QQQ",
@@ -23,6 +25,21 @@ ENTRY_WAIT_S = 60
 EXIT_REPRICE_S = 30
 EXIT_CRITICAL_S = 120
 STOP_UNPROTECTED_S = 60
+STOP_TYPES = ("STOP_LOSS_LIMIT", "STOP_LOSS")
+
+
+def configured_stop_type() -> str:
+    """WEBULL_STOP_TYPE. Anything else, including unset, is STOP_LOSS_LIMIT."""
+    raw = (os.environ.get("WEBULL_STOP_TYPE") or "").strip().upper()
+    if raw in STOP_TYPES:
+        return raw
+    return "STOP_LOSS_LIMIT"
+
+
+def other_stop_type(kind: str) -> str:
+    if kind == "STOP_LOSS":
+        return "STOP_LOSS_LIMIT"
+    return "STOP_LOSS"
 
 
 def stop_limit_price(stop: float) -> float:

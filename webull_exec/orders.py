@@ -134,12 +134,14 @@ def protective_stop(
     option_type: str,
     stop_price: float,
     stop_limit: float,
+    order_type: str = "STOP_LOSS_LIMIT",
 ) -> list[dict]:
+    kind = order_type if order_type in ("STOP_LOSS_LIMIT", "STOP_LOSS") else "STOP_LOSS_LIMIT"
     return [
         _base(
             client_order_id=client_order_id,
             combo_type="NORMAL",
-            order_type="STOP_LOSS_LIMIT",
+            order_type=kind,
             side="SELL",
             ticker=ticker,
             qty=1,
@@ -147,7 +149,7 @@ def protective_stop(
             expiration=expiration,
             option_type=option_type,
             position_intent="SELL_TO_CLOSE",
-            limit_price=stop_limit,
+            limit_price=None if kind == "STOP_LOSS" else stop_limit,
             stop_price=stop_price,
         )
     ]

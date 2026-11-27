@@ -16,7 +16,7 @@ from webull_exec.broker import AccountSuffixError, BrokerError, choose_account
 from webull_exec.clock import entry_block
 from webull_exec.envfile import read_mode, set_mode_off
 from webull_exec.kill import flatten, shutdown
-from webull_exec.limits import stop_limit_price
+from webull_exec.limits import configured_stop_type, stop_limit_price
 from webull_exec.notify import Notifier
 from webull_exec.orders import entry_with_stop
 from webull_exec.paper import PaperOpen
@@ -74,6 +74,7 @@ class FakeBroker:
         self.cancelled = []
         self.reject_combo = False
         self.reject_stops = False
+        self.reject_types = set()
         self.reject_all = False
         self.bid = 1.25
         self.ask = 2.55
@@ -99,6 +100,8 @@ class FakeBroker:
         if self.reject_all or (self.reject_combo and any(o.get("combo_type") == "MASTER" for o in orders)):
             return {"ok": False, "error": "rejected", "status": 400}
         if self.reject_stops and any(o.get("order_type") == "STOP_LOSS_LIMIT" for o in orders):
+            return {"ok": False, "error": "stop rejected", "status": 400}
+        if any(o.get("order_type") in self.reject_types for o in orders):
             return {"ok": False, "error": "stop rejected", "status": 400}
         for order in orders:
             self.orders[order["client_order_id"]] = {
@@ -155,7 +158,9 @@ class FakeBroker:
 class EngineCase(unittest.TestCase):
     def setUp(self):
         self._old_mode = os.environ.get("EXECUTION_MODE")
+        self._old_stop = os.environ.get("WEBULL_STOP_TYPE")
         os.environ["EXECUTION_MODE"] = "sandbox"
+        os.environ.pop("WEBULL_STOP_TYPE", None)
         self.addCleanup(self._restore_mode)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -183,12 +188,21 @@ class EngineCase(unittest.TestCase):
             os.environ.pop("EXECUTION_MODE", None)
         else:
             os.environ["EXECUTION_MODE"] = self._old_mode
+        if self._old_stop is None:
+            os.environ.pop("WEBULL_STOP_TYPE", None)
+        else:
+            os.environ["WEBULL_STOP_TYPE"] = self._old_stop
 
     def alerts(self):
         return [row["message"] for row in self.store.conn.execute("SELECT message FROM alerts")]
 
     def test_limits_and_mode_defaults(self):
         self.assertEqual(stop_limit_price(1.60), 1.47)
+        self.assertEqual(configured_stop_type(), "STOP_LOSS_LIMIT")
+        os.environ["WEBULL_STOP_TYPE"] = "STOP_LOSS"
+        self.assertEqual(configured_stop_type(), "STOP_LOSS")
+        os.environ["WEBULL_STOP_TYPE"] = "MARKET"
+        self.assertEqual(configured_stop_type(), "STOP_LOSS_LIMIT")
         self.assertIsNone(entry_block(ct(self.day, 10, 0)))
         self.assertEqual(entry_block(ct(self.day, 13, 45)), "after_1345")
         self.assertEqual(entry_block(ct(date(2026, 11, 27), 10, 0)), "early_close")
@@ -230,41 +244,91 @@ class EngineCase(unittest.TestCase):
         self.assertEqual(rows[1]["webull_bid"], 1.70)
         self.assertEqual(rows[1]["webull_ask"], 2.55)
 
-    def test_combo_entry_uses_paper_ask_and_does_not_duplicate(self):
+    def test_entry_is_a_plain_limit_and_the_stop_follows_the_fill(self):
         self.engine.boot(ct(self.day, 9, 0))
         self.broker.autofill = True
         self.paper.append(paper())
         self.engine.tick(ct(self.day, 10, 0))
-        buy, stop = self.broker.placed[0][0]
-        self.assertEqual(buy["combo_type"], "MASTER")
-        self.assertEqual(buy["order_type"], "LIMIT")
-        self.assertEqual(buy["limit_price"], "2.00")
-        self.assertEqual(buy["time_in_force"], "DAY")
-        self.assertEqual(buy["quantity"], "1")
-        self.assertEqual(stop["combo_type"], "STOP_LOSS")
+        buy = self.broker.placed[0][0]
+        self.assertEqual(len(buy), 1)
+        self.assertEqual(buy[0]["combo_type"], "NORMAL")
+        self.assertEqual(buy[0]["order_type"], "LIMIT")
+        self.assertEqual(buy[0]["limit_price"], "2.00")
+        self.assertEqual(buy[0]["time_in_force"], "DAY")
+        self.assertEqual(buy[0]["quantity"], "1")
+        self.assertNotIn("MASTER", [order.get("combo_type") for call in self.broker.placed for order in call[0]])
+        stop = self.broker.placed[1][0][0]
+        self.assertEqual(stop["combo_type"], "NORMAL")
         self.assertEqual(stop["order_type"], "STOP_LOSS_LIMIT")
+        self.assertEqual(stop["side"], "SELL")
         self.assertEqual(stop["stop_price"], "1.60")
         self.assertEqual(stop["limit_price"], "1.47")
         self.assertEqual(stop["time_in_force"], "DAY")
         self.assertEqual(self.store.intent("t1")["state"], "protected")
+        self.assertEqual(self.store.intent("t1")["combo"], 0)
         placed = len(self.broker.placed)
         self.engine.tick(ct(self.day, 10, 1))
         self.assertEqual(len(self.broker.placed), placed)
 
-    def test_combo_reject_places_stop_after_fill(self):
+    def test_rejected_stop_retries_the_other_type_once(self):
         self.engine.boot(ct(self.day, 9, 0))
-        self.broker.reject_combo = True
+        self.broker.reject_stops = True
         self.broker.autofill = True
         self.paper.append(paper())
         self.engine.tick(ct(self.day, 10, 0))
-        self.assertGreaterEqual(len(self.broker.placed), 2)
-        self.assertEqual(self.broker.placed[1][0][0]["combo_type"], "NORMAL")
-        self.assertEqual(self.broker.placed[1][0][0]["order_type"], "LIMIT")
-        stop = self.broker.placed[-1][0][0]
-        self.assertEqual(stop["order_type"], "STOP_LOSS_LIMIT")
-        self.assertEqual(stop["combo_type"], "NORMAL")
-        self.assertEqual(stop["limit_price"], "1.47")
+        stops = [call[0][0] for call in self.broker.placed if call[0][0]["side"] == "SELL"]
+        self.assertEqual([order["order_type"] for order in stops], ["STOP_LOSS_LIMIT", "STOP_LOSS"])
+        self.assertEqual(stops[0]["limit_price"], "1.47")
+        self.assertNotIn("limit_price", stops[1])
+        self.assertEqual(stops[1]["stop_price"], "1.60")
         self.assertEqual(self.store.intent("t1")["state"], "protected")
+        placed = len(self.broker.placed)
+        self.engine.tick(ct(self.day, 10, 1))
+        self.assertEqual(len(self.broker.placed), placed)
+        self.assertFalse(any("POSITION WITHOUT BROKER STOP" in msg for msg in self.alerts()))
+
+    def test_both_stop_types_page_and_the_paper_exit_still_sells(self):
+        self.engine.boot(ct(self.day, 9, 0))
+        self.broker.reject_types = {"STOP_LOSS_LIMIT", "STOP_LOSS"}
+        self.broker.autofill = True
+        self.paper.append(paper())
+        self.engine.tick(ct(self.day, 10, 0))
+        self.assertEqual(self.store.intent("t1")["state"], "filled_unprotected")
+        self.assertEqual(self.store.intent("t1")["miss_reason"], "no_broker_stop")
+        self.assertTrue(any("POSITION WITHOUT BROKER STOP" in msg for msg in self.alerts()))
+        placed = len(self.broker.placed)
+        self.engine.tick(ct(self.day, 10, 1))
+        self.assertEqual(len(self.broker.placed), placed)
+        self.paper.clear()
+        self.closes["t1"] = type("C", (), {"exit_bid": 2.40, "reason": "TIME_STOP"})()
+        self.engine.tick(ct(self.day, 10, 2))
+        sells = [
+            call[0][0]
+            for call in self.broker.placed
+            if call[0][0]["side"] == "SELL" and call[0][0]["order_type"] == "LIMIT"
+        ]
+        self.assertEqual(sells[-1]["limit_price"], "2.40")
+        self.assertEqual(self.store.intent("t1")["state"], "exiting")
+
+    def test_stop_type_setting_selects_stop_loss(self):
+        os.environ["WEBULL_STOP_TYPE"] = "STOP_LOSS"
+        self.engine.boot(ct(self.day, 9, 0))
+        self.broker.autofill = True
+        self.paper.append(paper())
+        self.engine.tick(ct(self.day, 10, 0))
+        stop = self.broker.placed[1][0][0]
+        self.assertEqual(stop["order_type"], "STOP_LOSS")
+        self.assertNotIn("limit_price", stop)
+        self.assertEqual(self.store.intent("t1")["state"], "protected")
+
+    def test_expiry_day_is_a_miss_with_no_order(self):
+        self.engine.boot(ct(self.day, 9, 0))
+        self.broker.autofill = True
+        self.paper.append(paper(expiration=self.day.isoformat()))
+        self.engine.tick(ct(self.day, 10, 0))
+        self.assertEqual(self.broker.placed, [])
+        self.assertEqual(self.store.intent("t1")["state"], "miss")
+        self.assertEqual(self.store.intent("t1")["miss_reason"], "expiry-day")
 
     def test_unfilled_entry_is_a_miss_at_60s(self):
         self.engine.boot(ct(self.day, 9, 0))

@@ -102,7 +102,7 @@ Boot order, before any new order:
 
 Follow a paper admit whose score is at least 80. The signal is the new paper open (the paper ledger row for that admit), seen on a 10-second poll. The contract is the paper contract: same underlying, expiry, strike, and call/put. Quantity is 1.
 
-Send `BUY`, `order_type=LIMIT`, `time_in_force=DAY`, `option_strategy=SINGLE`, `instrument_type=OPTION`, `position_intent=BUY_TO_OPEN`. `limit_price` is the paper `entry_ask`. The first try is a combo (`combo_type=MASTER`) with the protective stop attached. If the gateway rejects the combo, one plain `NORMAL` limit is sent. A second rejection is a logged reject and is not retried.
+Send `BUY`, `order_type=LIMIT`, `time_in_force=DAY`, `combo_type=NORMAL`, `option_strategy=SINGLE`, `instrument_type=OPTION`, `position_intent=BUY_TO_OPEN`. `limit_price` is the paper `entry_ask`. The entry is that one order. A `MASTER` plus `STOP_LOSS_LIMIT` combo is not sent: the sandbox rejected it as `invalid order_type`. A rejection of the plain limit is a logged reject and is not retried. A contract whose expiration date is the Chicago session date is a miss, reason `expiry-day`, and no order is sent.
 
 Cancel the order if it is still unfilled 60 seconds after the ack. Log a miss. A miss is an executor-book state. Reconciliation then expects Webull to be flat for that intent. The paper position may stay open. That divergence is recorded as a miss, and it is not a mismatch.
 
@@ -110,9 +110,9 @@ The entry is not a bracket. A `MASTER` + `STOP_LOSS` payload would attach protec
 
 ## Protection
 
-The standing stop is attached to the entry combo when the gateway accepts it. When the combo is rejected, place one sell stop at the paper stop price immediately after the fill (the price already stored on the paper position: 20% below the paper entry premium).
+After the fill, place one separate sell stop at the paper stop price. The type is `WEBULL_STOP_TYPE`: `STOP_LOSS_LIMIT` or `STOP_LOSS`. Unset, or any other value, is `STOP_LOSS_LIMIT`. The limit on a `STOP_LOSS_LIMIT` is the stop price times `0.92`, floored at `0.01`. A `STOP_LOSS` order sends the stop price and no limit. `time_in_force` is `DAY`, `combo_type` is `NORMAL`, `side` is `SELL`, and `position_intent` is `SELL_TO_CLOSE`. Changing the env value and restarting the executor applies Monday's result. No code change is required for that switch.
 
-Recommendation: `STOP_LOSS_LIMIT`, `time_in_force=DAY`, `combo_type=NORMAL`, `side=SELL`, `position_intent=SELL_TO_CLOSE`.
+If that stop is rejected, send one order of the other type. If that is rejected too, send `CRITICAL webull: POSITION WITHOUT BROKER STOP` and do not send another stop. The position stays under the paper exit, including the flatten.
 
 Reasons, from the documents above, not from a sandbox order:
 
@@ -123,7 +123,7 @@ Reasons, from the documents above, not from a sandbox order:
 
 If the quote gaps through the limit, the stop-limit rests unfilled and the long option stays open. A dead Mac cannot reprice it. That hole is stated again under the overnight guard.
 
-If the sell stop is rejected, retry on the next 10-second poll with the same `client_order_id`. If the position is still unprotected 60 seconds after the fill, send CRITICAL. The position stays under the exit rules. The executor does not switch it to `STOP_LOSS` (market-style) unless a later sandbox test shows the FAQ is wrong and this document is revised.
+The two stop attempts use two client order ids. A later poll does not send a third stop. The position stays under the exit rules either way.
 
 Phase B sandbox, still before any live key, must record two results: whether a sell `STOP_LOSS` is accepted, and whether a sell `GTC` is accepted. Those two calls are probes inside the test plan. They are not the standing order type.
 
